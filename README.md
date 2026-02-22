@@ -1,3 +1,7 @@
+# Для тупого алдияра
+1. Чтобы запустить: в консоли пишешь cd /home/azamat/projects/watashigpt/action-middleware
+2. Потом пишешь sudo -E /home/azamat/projects/watashigpt/.venv/bin/python main.py
+
 # Action Middleware
 
 OS-level background assistant that intercepts selected text via a global hotkey, processes it by prefix, and replaces it in-place.
