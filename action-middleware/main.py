@@ -1,9 +1,9 @@
-# Action Middleware — OS-level background assistant MVP
+# Action Middleware — OS-level background assistant
 #
 # Run with: sudo -E python main.py
 #   -E preserves DISPLAY, WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS
 #
-# Dependencies: keyboard, wl-clipboard (Wayland), xclip (X11), libnotify-bin
+# Config: edit config.yaml to add commands, set hotkeys, configure LLM
 
 import os
 import sys
@@ -13,6 +13,8 @@ import subprocess
 import platform
 import keyboard
 import shutil
+import yaml
+from pathlib import Path
 from datetime import datetime
 
 if platform.system() != "Linux":
@@ -20,11 +22,69 @@ if platform.system() != "Linux":
     from plyer import notification
 
 # ============================================================
-# Constants
+# Config Loading
 # ============================================================
 
-HOTKEY: str = "ctrl+alt+x"
-UNDO_HOTKEY: str = "ctrl+alt+z"
+_SCRIPT_DIR = Path(__file__).parent
+_CONFIG_PATH = _SCRIPT_DIR / "config.yaml"
+
+_DEFAULT_CONFIG = {
+    "hotkeys": {"intercept": "ctrl+alt+x", "undo": "ctrl+alt+z"},
+    "commands": {
+        "translate": {
+            "prefixes": ["TR:"],
+            "keywords": ["translate", "polite", "rephrase"],
+            "description": "Convert rude text to professional",
+            "phrases": {
+                "fix this garbage": "Please review the code for potential improvements.",
+                "this is broken": "I've identified an issue that needs attention.",
+            },
+        },
+        "command": {
+            "prefixes": ["CMD:"],
+            "keywords": ["run", "execute", "shell"],
+            "description": "Execute a shell command",
+        },
+        "test": {
+            "prefixes": ["TEST:"],
+            "keywords": ["test", "ping", "check"],
+            "description": "Test the pipeline",
+        },
+    },
+    "llm": {"provider": "", "api_key": "", "model": ""},
+}
+
+
+def load_config() -> dict:
+    """Load config.yaml, falling back to defaults if missing or invalid."""
+    if _CONFIG_PATH.exists():
+        try:
+            with open(_CONFIG_PATH, "r") as f:
+                user_cfg = yaml.safe_load(f) or {}
+            # Merge: user config overrides defaults
+            cfg = {**_DEFAULT_CONFIG}
+            if "hotkeys" in user_cfg:
+                cfg["hotkeys"] = {**cfg["hotkeys"], **user_cfg["hotkeys"]}
+            if "commands" in user_cfg:
+                cfg["commands"] = user_cfg["commands"]
+            if "llm" in user_cfg:
+                cfg["llm"] = {**cfg["llm"], **user_cfg["llm"]}
+            return cfg
+        except Exception as exc:
+            print(f"  Warning: Failed to load config.yaml: {exc}")
+            print(f"  Falling back to defaults.")
+            return _DEFAULT_CONFIG
+    return _DEFAULT_CONFIG
+
+
+CONFIG = load_config()
+
+# ============================================================
+# Constants (from config)
+# ============================================================
+
+HOTKEY: str = CONFIG["hotkeys"]["intercept"]
+UNDO_HOTKEY: str = CONFIG["hotkeys"]["undo"]
 CLIPBOARD_DELAY: float = 0.3
 APP_NAME: str = "Action Middleware"
 
@@ -38,6 +98,110 @@ _DBUS_SESSION: str = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
 _undo_stack: list[dict] = []
 _undo_lock = threading.Lock()
 _exit_event = threading.Event()
+
+
+# ============================================================
+# LLM Integration
+# ============================================================
+
+_llm_client = None
+_llm_ready = False
+_llm_provider = ""
+_llm_model = ""
+
+
+def _init_llm() -> None:
+    """Initialize LLM client from config. Sets _llm_ready=True on success."""
+    global _llm_client, _llm_ready, _llm_provider, _llm_model
+
+    llm_cfg = CONFIG.get("llm", {})
+    provider = llm_cfg.get("provider", "").strip().lower()
+    api_key = llm_cfg.get("api_key", "").strip()
+    model = llm_cfg.get("model", "").strip()
+
+    # Allow env var override for API key
+    if not api_key:
+        api_key = os.environ.get("ACTION_MW_API_KEY", "").strip()
+
+    if not provider or not api_key:
+        _llm_ready = False
+        return
+
+    try:
+        from openai import OpenAI
+
+        if provider == "groq":
+            _llm_client = OpenAI(
+                api_key=api_key,
+                base_url="https://api.groq.com/openai/v1",
+            )
+            _llm_model = model or "llama-3.3-70b-versatile"
+        elif provider == "openai":
+            _llm_client = OpenAI(api_key=api_key)
+            _llm_model = model or "gpt-4o-mini"
+        else:
+            TUI.warn(f"Unknown LLM provider: '{provider}'. Mock mode active.")
+            return
+
+        _llm_provider = provider
+        _llm_ready = True
+
+    except ImportError:
+        TUI.warn("openai package not installed. Run: pip install openai")
+        TUI.warn("Mock mode active.")
+    except Exception as exc:
+        TUI.error(f"LLM init failed: {exc}")
+
+
+def _llm_call(prompt: str) -> str:
+    """Send prompt to configured LLM. Returns response text."""
+    if not _llm_ready or not _llm_client:
+        return _mock_llm_call(prompt)
+    try:
+        response = _llm_client.chat.completions.create(
+            model=_llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+            temperature=0.7,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as exc:
+        TUI.error(f"LLM call failed: {exc}")
+        return _mock_llm_call(prompt)
+
+
+def _mock_llm_call(prompt: str) -> str:
+    """Mock fallback — returns placeholder text without any API call."""
+    # Extract the actual user text from the prompt template
+    lines = prompt.strip().split("\n")
+    user_text = lines[-1] if lines else prompt
+    return f"[Mock Mode] {user_text[:120]}"
+
+
+def _llm_classify(text: str, commands: dict) -> dict | None:
+    """Ask LLM to classify text intent. Returns {"name": ..., "payload": ...} or None."""
+    if not _llm_ready:
+        return None
+
+    cmd_list = "\n".join(
+        f"- {name}: {cmd.get('description', '')}"
+        for name, cmd in commands.items()
+    )
+
+    prompt = (
+        f"Classify the following text into one of these commands:\n{cmd_list}\n\n"
+        f"Text: \"{text}\"\n\n"
+        f"Reply with ONLY the command name (one word, lowercase). "
+        f"If none match, reply \"unknown\"."
+    )
+
+    try:
+        result = _llm_call(prompt).strip().lower()
+        if result in commands and result != "unknown":
+            return {"name": result, "payload": text}
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================
@@ -177,6 +341,38 @@ class TUI:
             lines.append(f"  {color}{cls.BOLD}{key:<16}{cls.RESET} {cls.DIM}{desc}{cls.RESET}")
         cls.box("Keybindings", lines, cls.BLUE)
 
+    @classmethod
+    def commands_table(cls) -> None:
+        commands = CONFIG.get("commands", {})
+        lines = []
+        for name, cmd in commands.items():
+            prefixes = ", ".join(cmd.get("prefixes", []))
+            keywords = ", ".join(cmd.get("keywords", [])[:3])
+            llm_tag = f" {cls.YELLOW}[LLM]{cls.RESET}" if cmd.get("llm_required") else ""
+            desc = cmd.get("description", "")
+            lines.append(
+                f"  {cls.CYAN}{cls.BOLD}{name:<12}{cls.RESET} "
+                f"{cls.DIM}{prefixes:<20}{cls.RESET} "
+                f"{cls.DIM}{keywords}{cls.RESET}"
+                f"{llm_tag}"
+            )
+        cls.box("Commands", lines, cls.CYAN)
+
+    @classmethod
+    def llm_status_box(cls) -> None:
+        if _llm_ready:
+            lines = [
+                f"  {cls.GREEN}{cls.BOLD}LIVE{cls.RESET}    {cls.DIM}Provider: {_llm_provider}{cls.RESET}",
+                f"          {cls.DIM}Model: {_llm_model}{cls.RESET}",
+            ]
+            cls.box("LLM", lines, cls.GREEN)
+        else:
+            lines = [
+                f"  {cls.YELLOW}{cls.BOLD}MOCK MODE{cls.RESET}",
+                f"  {cls.DIM}Set provider + api_key in config.yaml for live LLM{cls.RESET}",
+            ]
+            cls.box("LLM", lines, cls.YELLOW)
+
 
 # ============================================================
 # Subprocess — Run as Original User
@@ -239,10 +435,6 @@ def clipboard_paste() -> str:
         return pyperclip.paste()
 
 
-# ============================================================
-# Primary Selection (Wayland)
-# ============================================================
-
 def _get_primary_selection() -> str:
     try:
         proc = _run_as_user(
@@ -257,15 +449,10 @@ def _get_primary_selection() -> str:
 
 
 # ============================================================
-# Auto-Replace — clipboard + uinput Ctrl+V
+# Auto-Replace
 # ============================================================
 
 def _replace_selection(new_text: str) -> None:
-    """Replace currently selected text.
-
-    Uses wl-copy/xclip to set clipboard, then keyboard lib's /dev/uinput
-    to simulate Ctrl+V. uinput is kernel-level and works on Wayland.
-    """
     clipboard_copy(new_text)
     time.sleep(CLIPBOARD_DELAY)
     keyboard.send("ctrl+v")
@@ -309,13 +496,7 @@ def _push_undo(original: str, replacement: str) -> None:
 
 
 def _do_undo() -> None:
-    """Actual undo work — runs in its own thread.
-
-    Uses native Ctrl+Z — since the replacement was done via Ctrl+V paste,
-    the app's native undo reverses it perfectly. No need to re-select text.
-    """
     try:
-        # Wait for user to release Ctrl+Alt+Z physically
         time.sleep(0.5)
 
         with _undo_lock:
@@ -327,62 +508,29 @@ def _do_undo() -> None:
 
         TUI.separator()
         TUI.action("↩", "UNDO", "Sending native Ctrl+Z")
-
-        # Native undo — reverses the Ctrl+V paste that did the replacement
         keyboard.send("ctrl+z")
 
         truncated = entry["original"][:50] + ("..." if len(entry["original"]) > 50 else "")
         TUI.success(f"Undone — original was: \"{truncated}\"")
-        notify("Undo", f"Reverted last replacement")
+        notify("Undo", "Reverted last replacement")
 
     except Exception as exc:
         TUI.error(f"Undo error: {exc}")
 
 
 def on_undo_triggered() -> None:
-    """Callback — MUST return immediately. Spawns thread for actual work."""
     threading.Thread(target=_do_undo, daemon=True).start()
 
 
 # ============================================================
-# Handlers
+# Built-in Handlers
 # ============================================================
 
-def handle_translate(text: str, full_text: str) -> None:
-    translations: dict[str, str] = {
-        # Frustration
-        "fix this garbage": "Please review the code for potential improvements.",
-        "this is broken": "I've identified an issue that needs attention.",
-        "this sucks": "There may be room for improvement here.",
-        "what a mess": "This could benefit from some restructuring.",
-        "this is trash": "I think we should consider a different approach.",
-        "terrible code": "The implementation could use some refinement.",
-        # Blame / confrontation
-        "who wrote this": "Could we discuss the approach taken here?",
-        "that's wrong": "I have a different perspective on this.",
-        "are you serious": "Could you help me understand the reasoning behind this?",
-        "are you stupid": "I think there might be a misunderstanding here.",
-        "you don't know what you're doing": "Perhaps we could pair on this together?",
-        "this is your fault": "Let's focus on finding a solution together.",
-        # Refusal / dismissal
-        "do it yourself": "I'd appreciate your help with this task.",
-        "not my problem": "I understand — let me find the right person to help.",
-        "i don't care": "I'll defer to the team's judgment on this.",
-        "whatever": "I'm open to any approach the team prefers.",
-        "figure it out": "Happy to brainstorm solutions together.",
-        # Deadline / pressure
-        "this is taking forever": "Could we discuss the timeline and priorities?",
-        "hurry up": "I'd like to understand the timeline expectations.",
-        "why isn't this done yet": "Could we review the current blockers together?",
-        "just ship it": "Let's discuss what an acceptable MVP looks like.",
-        # Meetings / process
-        "this meeting is pointless": "Could we clarify the meeting objectives?",
-        "stop wasting my time": "I want to make sure we're using everyone's time effectively.",
-        "nobody asked for this": "Could we revisit the requirements and priorities?",
-    }
-
-    normalised: str = text.strip().lower()
-    result: str = translations.get(normalised, f"Politely: {text.strip()}")
+def handle_translate(text: str, full_text: str, cmd_config: dict) -> None:
+    """Corporate Translator — uses phrases from config."""
+    phrases = cmd_config.get("phrases", {})
+    normalised = text.strip().lower()
+    result = phrases.get(normalised, f"Politely: {text.strip()}")
 
     _push_undo(full_text, result)
     _replace_selection(result)
@@ -391,12 +539,11 @@ def handle_translate(text: str, full_text: str) -> None:
     notify("Corporate Translator", f"Replaced: \"{result[:80]}\"")
 
 
-def handle_command(text: str, full_text: str) -> None:
-    command: str = text.strip()
+def handle_command(text: str, full_text: str, cmd_config: dict) -> None:
+    """Terminal Magic — execute a shell command silently."""
+    command = text.strip()
 
-    dangerous_patterns: list[str] = [
-        "rm -rf /", "format", "mkfs", ":(){", "dd if=",
-    ]
+    dangerous_patterns = ["rm -rf /", "format", "mkfs", ":(){", "dd if="]
     for pattern in dangerous_patterns:
         if pattern in command.lower():
             TUI.error(f"BLOCKED — dangerous pattern: '{pattern}'")
@@ -439,14 +586,10 @@ def handle_command(text: str, full_text: str) -> None:
         notify("Terminal Magic", f"Command failed: {exc}")
 
 
-def handle_test(text: str, full_text: str) -> None:
-    """Test prefix — verifies the full pipeline: capture → process → replace.
-
-    Wraps the input in markers so you can visually confirm the replacement
-    worked. Also reports timing and environment info.
-    """
+def handle_test(text: str, full_text: str, cmd_config: dict) -> None:
+    """Pipeline test — verifies capture → process → replace."""
     content = text.strip()
-    result = f"[TEST OK] \"{content}\" | session={_SESSION_TYPE} | wayland={_IS_WAYLAND}"
+    result = f"[TEST OK] \"{content}\" | session={_SESSION_TYPE} | wayland={_IS_WAYLAND} | llm={'live' if _llm_ready else 'mock'}"
 
     _push_undo(full_text, result)
     _replace_selection(result)
@@ -456,21 +599,107 @@ def handle_test(text: str, full_text: str) -> None:
     notify("Test", f"Pipeline OK: \"{content[:60]}\"")
 
 
+def handle_llm_command(text: str, full_text: str, cmd_config: dict) -> None:
+    """Generic handler for LLM-backed commands defined in config.yaml."""
+    prompt_template = cmd_config.get("llm_prompt", "Process this text: {text}")
+    prompt = prompt_template.format(text=text.strip())
+    cmd_name = cmd_config.get("description", "LLM")
+
+    TUI.status("🤖", f"Processing with {'LLM' if _llm_ready else 'Mock'}...", TUI.CYAN)
+    notify(APP_NAME, "Processing...")
+
+    if _llm_ready:
+        result = _llm_call(prompt)
+    else:
+        result = _mock_llm_call(prompt)
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+
+    truncated = result[:80] + ("..." if len(result) > 80 else "")
+    TUI.action("🤖", cmd_name.upper(), f"\"{truncated}\"")
+    notify(cmd_name, f"Done: \"{truncated}\"")
+
+
+# Map of built-in command names → handler functions
+_BUILTIN_HANDLERS = {
+    "translate": handle_translate,
+    "command": handle_command,
+    "test": handle_test,
+}
+
+
 # ============================================================
-# Router
+# Router — 3-tier: Prefix → Keyword → LLM → Fallback
 # ============================================================
 
-def route(text: str) -> None:
-    if text.startswith("TR:"):
-        handle_translate(text[3:], text)
-    elif text.startswith("CMD:"):
-        handle_command(text[4:], text)
-    elif text.startswith("TEST:"):
-        handle_test(text[5:], text)
+def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> None:
+    """Dispatch to the correct handler for a matched command."""
+    if cmd_name in _BUILTIN_HANDLERS:
+        _BUILTIN_HANDLERS[cmd_name](payload, full_text, cmd_config)
+    elif cmd_config.get("llm_required"):
+        handle_llm_command(payload, full_text, cmd_config)
     else:
-        truncated = text[:40] + ("..." if len(text) > 40 else "")
-        TUI.warn(f"Unknown prefix: \"{truncated}\"")
-        notify(APP_NAME, "Unknown prefix. Use TR:, CMD:, or TEST:")
+        # Unknown built-in, no LLM — treat as generic LLM command anyway
+        handle_llm_command(payload, full_text, cmd_config)
+
+
+def route(text: str) -> None:
+    commands = CONFIG.get("commands", {})
+
+    # Tier 1: Exact prefix match (fastest, backward-compatible)
+    text_upper = text.upper()
+    for name, cmd in commands.items():
+        for prefix in cmd.get("prefixes", []):
+            if text_upper.startswith(prefix.upper()):
+                payload = text[len(prefix):]
+                TUI.status("🎯", f"Prefix match: {prefix} → {name}", TUI.GREEN)
+                dispatch(name, payload, text, cmd)
+                return
+
+    # Tier 2: Keyword match (check first 3 words)
+    text_lower = text.strip().lower()
+    words = text_lower.split()
+    first_words = words[:3]
+    for name, cmd in commands.items():
+        for keyword in cmd.get("keywords", []):
+            # Match single-word keywords against first 3 words
+            # Match multi-word keywords against the full start of text
+            if " " in keyword:
+                if text_lower.startswith(keyword):
+                    payload = text_lower[len(keyword):].strip()
+                    TUI.status("🔑", f"Keyword match: \"{keyword}\" → {name}", TUI.GREEN)
+                    dispatch(name, payload, text, cmd)
+                    return
+            elif keyword in first_words:
+                # Strip the keyword from payload
+                idx = text_lower.find(keyword)
+                payload = text[idx + len(keyword):].strip()
+                TUI.status("🔑", f"Keyword match: \"{keyword}\" → {name}", TUI.GREEN)
+                dispatch(name, payload, text, cmd)
+                return
+
+    # Tier 3: LLM intent classification (if available)
+    if _llm_ready:
+        TUI.status("🤖", "No prefix/keyword match — asking LLM to classify...", TUI.CYAN)
+        intent = _llm_classify(text, commands)
+        if intent:
+            cmd = commands[intent["name"]]
+            TUI.status("🤖", f"LLM classified: → {intent['name']}", TUI.GREEN)
+            dispatch(intent["name"], intent["payload"], text, cmd)
+            return
+
+    # Tier 4: Fallback
+    truncated = text[:40] + ("..." if len(text) > 40 else "")
+    TUI.warn(f"Unknown command: \"{truncated}\"")
+
+    available = ", ".join(
+        p for cmd in commands.values() for p in cmd.get("prefixes", [])
+    )
+    keywords = ", ".join(
+        k for cmd in commands.values() for k in cmd.get("keywords", [])[:2]
+    )
+    notify(APP_NAME, f"Unknown command. Prefixes: {available}")
 
 
 # ============================================================
@@ -478,15 +707,12 @@ def route(text: str) -> None:
 # ============================================================
 
 def _do_intercept() -> None:
-    """Actual intercept work — runs in its own thread."""
     try:
-        # Wait for user to physically release Ctrl+Alt+X
         time.sleep(0.5)
 
         TUI.separator()
         TUI.status("⌨", "Hotkey triggered — reading selection...", TUI.CYAN)
 
-        # Get selected text
         if _IS_WAYLAND:
             text: str = _get_primary_selection()
         else:
@@ -514,7 +740,6 @@ def _do_intercept() -> None:
 
 
 def on_hotkey_triggered() -> None:
-    """Callback — MUST return immediately. Spawns thread for actual work."""
     threading.Thread(target=_do_intercept, daemon=True).start()
 
 
@@ -523,23 +748,32 @@ def on_hotkey_triggered() -> None:
 # ============================================================
 
 def main() -> None:
-    # Clear screen + scrollback, move cursor to top-left
     print("\033[2J\033[3J\033[H", end="", flush=True)
 
     TUI.banner()
 
+    # Environment box
     TUI.box("Environment", [
         f"  {TUI.BOLD}Session{TUI.RESET}    {_SESSION_TYPE}",
         f"  {TUI.BOLD}Display{TUI.RESET}    {_DISPLAY}",
         f"  {TUI.BOLD}Wayland{TUI.RESET}    {'Yes' if _IS_WAYLAND else 'No'}",
         f"  {TUI.BOLD}User{TUI.RESET}       {_SUDO_USER or os.environ.get('USER', '?')}",
-        f"  {TUI.BOLD}UID{TUI.RESET}        {os.geteuid()}",
+        f"  {TUI.BOLD}Config{TUI.RESET}     {_CONFIG_PATH if _CONFIG_PATH.exists() else 'defaults (no config.yaml)'}",
     ], TUI.GREEN)
 
+    print()
+
+    # Init LLM
+    _init_llm()
+    TUI.llm_status_box()
+
+    print()
+    TUI.commands_table()
     print()
     TUI.keybind_table()
     print()
 
+    # Register hotkeys
     keyboard.add_hotkey(HOTKEY, on_hotkey_triggered)
     keyboard.add_hotkey(UNDO_HOTKEY, on_undo_triggered)
 
@@ -550,7 +784,9 @@ def main() -> None:
 
     TUI.separator()
     TUI.success("Listening for hotkeys...")
-    TUI.status("", f"{TUI.DIM}Select text and press {HOTKEY.upper()} to intercept{TUI.RESET}")
+    cmd_count = len(CONFIG.get("commands", {}))
+    llm_label = f"LLM: {_llm_provider}" if _llm_ready else "Mock mode"
+    TUI.status("", f"{TUI.DIM}{cmd_count} commands loaded | {llm_label} | Select text and press {HOTKEY.upper()}{TUI.RESET}")
     print()
 
     try:
