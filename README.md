@@ -1,6 +1,6 @@
 # Для тупого алдияра
-1. Чтобы запустить: в консоли пишешь cd /home/azamat/projects/watashigpt/action-middleware
-2. Потом пишешь sudo -E /home/azamat/projects/watashigpt/.venv/bin/python main.py
+1. Чтобы запустить: в консоли пишешь cd /путь/к/watashigpt/action-middleware
+2. Потом пишешь sudo -E /путь/к/watashigpt/.venv/bin/python main.py
 
 # Action Middleware
 
