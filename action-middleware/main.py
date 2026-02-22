@@ -110,6 +110,99 @@ _llm_provider = ""
 _llm_model = ""
 
 
+def _llm_setup_prompt() -> None:
+    """Interactive terminal prompt for LLM configuration.
+
+    Asks user y/n before app starts. If y, collects provider, api_key,
+    model — saves to config.yaml so it persists across restarts.
+    """
+    c = TUI.CYAN
+    r = TUI.RESET
+    b = TUI.BOLD
+    d = TUI.DIM
+    y = TUI.YELLOW
+    g = TUI.GREEN
+
+    llm_cfg = CONFIG.get("llm", {})
+    has_config = bool(llm_cfg.get("provider", "").strip())
+
+    if has_config:
+        # Already configured in config.yaml — skip prompt
+        return
+
+    print(f"\n  {c}{b}Configure LLM?{r}")
+    print(f"  {d}LLM enables smart commands: summarize, rewrite, explain, etc.{r}")
+    print(f"  {d}Without LLM, these commands run in mock mode.{r}")
+    print()
+    print(f"  {d}Supported providers:{r}")
+    print(f"    {g}groq{r}    — Free tier, fastest (~0.3s), recommended")
+    print(f"    {g}openai{r}  — GPT-4o-mini, cheap and fast")
+    print()
+
+    try:
+        choice = input(f"  {y}{b}Enable LLM? [y/N]:{r} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        choice = "n"
+
+    if choice not in ("y", "yes"):
+        print(f"  {d}Launching in mock mode.{r}\n")
+        return
+
+    # Collect provider
+    print()
+    print(f"  {d}Enter provider name:{r}")
+    try:
+        provider = input(f"  {c}Provider (groq/openai):{r} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n  {d}Cancelled. Launching in mock mode.{r}\n")
+        return
+
+    if provider not in ("groq", "openai"):
+        print(f"  {TUI.RED}Unknown provider '{provider}'. Launching in mock mode.{r}\n")
+        return
+
+    # Collect API key
+    try:
+        api_key = input(f"  {c}API Key:{r} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n  {d}Cancelled. Launching in mock mode.{r}\n")
+        return
+
+    if not api_key:
+        print(f"  {TUI.RED}No API key provided. Launching in mock mode.{r}\n")
+        return
+
+    # Collect model (optional)
+    default_model = "llama-3.3-70b-versatile" if provider == "groq" else "gpt-4o-mini"
+    try:
+        model = input(f"  {c}Model [{d}{default_model}{r}{c}]:{r} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        model = ""
+
+    if not model:
+        model = default_model
+
+    # Save to config
+    CONFIG["llm"]["provider"] = provider
+    CONFIG["llm"]["api_key"] = api_key
+    CONFIG["llm"]["model"] = model
+
+    # Persist to config.yaml
+    try:
+        with open(_CONFIG_PATH, "r") as f:
+            raw = yaml.safe_load(f) or {}
+        raw.setdefault("llm", {})
+        raw["llm"]["provider"] = provider
+        raw["llm"]["api_key"] = api_key
+        raw["llm"]["model"] = model
+        with open(_CONFIG_PATH, "w") as f:
+            yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+        print(f"\n  {g}✓ Saved to config.yaml — won't ask again next time.{r}\n")
+    except Exception as exc:
+        print(f"\n  {y}⚠ Could not save to config.yaml: {exc}{r}")
+        print(f"  {d}Settings will be used for this session only.{r}\n")
+
+
 def _init_llm() -> None:
     """Initialize LLM client from config. Sets _llm_ready=True on success."""
     global _llm_client, _llm_ready, _llm_provider, _llm_model
@@ -762,6 +855,9 @@ def main() -> None:
     ], TUI.GREEN)
 
     print()
+
+    # Interactive LLM setup (only if not already configured)
+    _llm_setup_prompt()
 
     # Init LLM
     _init_llm()
