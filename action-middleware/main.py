@@ -13,7 +13,13 @@ import subprocess
 import platform
 import keyboard
 import shutil
+import json
+import base64
+import hashlib
 import yaml
+import tty
+import termios
+import select
 from pathlib import Path
 from datetime import datetime
 
@@ -99,6 +105,65 @@ _undo_stack: list[dict] = []
 _undo_lock = threading.Lock()
 _exit_event = threading.Event()
 
+_usage_counts: dict[str, int] = {}
+_usage_lock = threading.Lock()
+
+_activity_log: list[dict] = []
+_activity_lock = threading.Lock()
+_ACTIVITY_MAX = 5
+
+_micro_log: list[str] = []
+_micro_log_lock = threading.Lock()
+_MICRO_LOG_MAX = 3
+
+
+# ============================================================
+# Config Hot-Reload
+# ============================================================
+
+def _reload_config() -> None:
+    """Reload config.yaml and update CONFIG commands in place."""
+    try:
+        new_cfg = load_config()
+        CONFIG["commands"] = new_cfg.get("commands", CONFIG["commands"])
+        # Initialize usage counters for any new commands
+        for cmd_name in CONFIG["commands"]:
+            if cmd_name not in _usage_counts:
+                _usage_counts[cmd_name] = 0
+        cmd_count = len(CONFIG["commands"])
+        TUI.micro_log(f"{TUI.GREEN}✓{TUI.RESET} Config reloaded — {cmd_count} commands loaded")
+    except Exception as exc:
+        TUI.warn(f"Config reload failed: {exc}")
+
+
+def _start_config_watcher() -> None:
+    """Watch config.yaml for changes using watchdog."""
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+
+        class ConfigHandler(FileSystemEventHandler):
+            def __init__(self):
+                self._last_reload = 0.0
+
+            def on_modified(self, event):
+                if event.src_path.endswith("config.yaml"):
+                    # Debounce: ignore events within 1 second of last reload
+                    now = time.time()
+                    if now - self._last_reload < 1.0:
+                        return
+                    self._last_reload = now
+                    _reload_config()
+
+        observer = Observer()
+        observer.schedule(ConfigHandler(), str(_SCRIPT_DIR), recursive=False)
+        observer.daemon = True
+        observer.start()
+    except ImportError:
+        TUI.warn("watchdog not installed — config hot-reload disabled")
+    except Exception as exc:
+        TUI.warn(f"Config watcher failed to start: {exc}")
+
 
 # ============================================================
 # LLM Integration
@@ -109,61 +174,54 @@ _llm_ready = False
 _llm_provider = ""
 _llm_model = ""
 
+_llm_fallback_client = None
+_llm_fallback_ready = False
+_llm_fallback_provider = ""
+_llm_fallback_model = ""
+
 
 def _llm_setup_prompt() -> None:
-    """Interactive terminal prompt for LLM configuration.
+    """Interactive terminal prompt for LLM configuration with arrow-key selection."""
+    llm_cfg = CONFIG.get("llm", {})
+    has_config = bool(llm_cfg.get("provider", "").strip())
+    if has_config:
+        return
 
-    Asks user y/n before app starts. If y, collects provider, api_key,
-    model — saves to config.yaml so it persists across restarts.
-    """
     c = TUI.CYAN
     r = TUI.RESET
     b = TUI.BOLD
     d = TUI.DIM
-    y = TUI.YELLOW
     g = TUI.GREEN
 
-    llm_cfg = CONFIG.get("llm", {})
-    has_config = bool(llm_cfg.get("provider", "").strip())
-
-    if has_config:
-        # Already configured in config.yaml — skip prompt
-        return
-
-    print(f"\n  {c}{b}Configure LLM?{r}")
-    print(f"  {d}LLM enables smart commands: summarize, rewrite, explain, etc.{r}")
-    print(f"  {d}Without LLM, these commands run in mock mode.{r}")
     print()
-    print(f"  {d}Supported providers:{r}")
-    print(f"    {g}groq{r}    — Free tier, fastest (~0.3s), recommended")
-    print(f"    {g}openai{r}  — GPT-4o-mini, cheap and fast")
-    print()
+    TUI.box("LLM Setup", [
+        f"  {d}LLM enables smart commands: summarize, rewrite, explain{r}",
+        f"  {d}Without LLM, commands run in mock mode (instant, offline){r}",
+        f"",
+        f"  {b}Select a provider:{r}",
+    ], TUI.CYAN)
 
-    try:
-        choice = input(f"  {y}{b}Enable LLM? [y/N]:{r} ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        choice = "n"
+    options = ["groq", "openai", "skip"]
 
-    if choice not in ("y", "yes"):
+    if sys.stdin.isatty():
+        choice = TUI.selector(options)
+    else:
+        print(f"  {d}[1] groq  [2] openai  [3] skip{r}")
+        try:
+            raw = input(f"  {c}Choice (1-3):{r} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raw = "3"
+        choice = {"1": 0, "2": 1, "3": 2}.get(raw)
+
+    if choice is None or choice == 2:
         print(f"  {d}Launching in mock mode.{r}\n")
         return
 
-    # Collect provider
-    print()
-    print(f"  {d}Enter provider name:{r}")
-    try:
-        provider = input(f"  {c}Provider (groq/openai):{r} ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print(f"\n  {d}Cancelled. Launching in mock mode.{r}\n")
-        return
+    provider = options[choice]
 
-    if provider not in ("groq", "openai"):
-        print(f"  {TUI.RED}Unknown provider '{provider}'. Launching in mock mode.{r}\n")
-        return
-
-    # Collect API key
+    print(f"  {d}Enter your {provider} API key:{r}")
     try:
-        api_key = input(f"  {c}API Key:{r} ").strip()
+        api_key = input(f"  {c}{b}API Key:{r} ").strip()
     except (EOFError, KeyboardInterrupt):
         print(f"\n  {d}Cancelled. Launching in mock mode.{r}\n")
         return
@@ -172,40 +230,47 @@ def _llm_setup_prompt() -> None:
         print(f"  {TUI.RED}No API key provided. Launching in mock mode.{r}\n")
         return
 
-    # Collect model (optional)
     default_model = "llama-3.3-70b-versatile" if provider == "groq" else "gpt-4o-mini"
     try:
-        model = input(f"  {c}Model [{d}{default_model}{r}{c}]:{r} ").strip()
+        model = input(f"  {c}{b}Model{r} {d}[{default_model}]{r}{c}{b}:{r} ").strip()
     except (EOFError, KeyboardInterrupt):
         model = ""
-
     if not model:
         model = default_model
 
-    # Save to config
     CONFIG["llm"]["provider"] = provider
     CONFIG["llm"]["api_key"] = api_key
     CONFIG["llm"]["model"] = model
 
-    # Persist to config.yaml
+    print(f"\n  {g}✓ LLM configured: {provider}/{model} (session only){r}\n")
+
+
+def _init_llm_client(provider: str, api_key: str, model: str):
+    """Create an OpenAI client for the given provider. Returns (client, model) or (None, "")."""
     try:
-        with open(_CONFIG_PATH, "r") as f:
-            raw = yaml.safe_load(f) or {}
-        raw.setdefault("llm", {})
-        raw["llm"]["provider"] = provider
-        raw["llm"]["api_key"] = api_key
-        raw["llm"]["model"] = model
-        with open(_CONFIG_PATH, "w") as f:
-            yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
-        print(f"\n  {g}✓ Saved to config.yaml — won't ask again next time.{r}\n")
+        from openai import OpenAI
+
+        if provider == "groq":
+            client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+            return client, model or "llama-3.3-70b-versatile"
+        elif provider == "openai":
+            client = OpenAI(api_key=api_key)
+            return client, model or "gpt-4o-mini"
+        else:
+            TUI.warn(f"Unknown LLM provider: '{provider}'.")
+            return None, ""
+    except ImportError:
+        TUI.warn("openai package not installed. Run: pip install openai")
+        return None, ""
     except Exception as exc:
-        print(f"\n  {y}⚠ Could not save to config.yaml: {exc}{r}")
-        print(f"  {d}Settings will be used for this session only.{r}\n")
+        TUI.error(f"LLM client init failed for {provider}: {exc}")
+        return None, ""
 
 
 def _init_llm() -> None:
     """Initialize LLM client from config. Sets _llm_ready=True on success."""
     global _llm_client, _llm_ready, _llm_provider, _llm_model
+    global _llm_fallback_client, _llm_fallback_ready, _llm_fallback_provider, _llm_fallback_model
 
     llm_cfg = CONFIG.get("llm", {})
     provider = llm_cfg.get("provider", "").strip().lower()
@@ -220,46 +285,72 @@ def _init_llm() -> None:
         _llm_ready = False
         return
 
-    try:
-        from openai import OpenAI
-
-        if provider == "groq":
-            _llm_client = OpenAI(
-                api_key=api_key,
-                base_url="https://api.groq.com/openai/v1",
-            )
-            _llm_model = model or "llama-3.3-70b-versatile"
-        elif provider == "openai":
-            _llm_client = OpenAI(api_key=api_key)
-            _llm_model = model or "gpt-4o-mini"
-        else:
-            TUI.warn(f"Unknown LLM provider: '{provider}'. Mock mode active.")
-            return
-
+    client, resolved_model = _init_llm_client(provider, api_key, model)
+    if client:
+        _llm_client = client
+        _llm_model = resolved_model
         _llm_provider = provider
         _llm_ready = True
 
-    except ImportError:
-        TUI.warn("openai package not installed. Run: pip install openai")
-        TUI.warn("Mock mode active.")
-    except Exception as exc:
-        TUI.error(f"LLM init failed: {exc}")
+    # Initialize fallback provider if configured
+    fb_cfg = llm_cfg.get("fallback", {})
+    fb_provider = fb_cfg.get("provider", "").strip().lower() if isinstance(fb_cfg, dict) else ""
+    fb_api_key = fb_cfg.get("api_key", "").strip() if isinstance(fb_cfg, dict) else ""
+    fb_model = fb_cfg.get("model", "").strip() if isinstance(fb_cfg, dict) else ""
+
+    if not fb_api_key:
+        fb_api_key = api_key  # reuse primary key if not specified
+
+    if fb_provider and fb_provider != provider:
+        fb_client, fb_resolved = _init_llm_client(fb_provider, fb_api_key, fb_model)
+        if fb_client:
+            _llm_fallback_client = fb_client
+            _llm_fallback_model = fb_resolved
+            _llm_fallback_provider = fb_provider
+            _llm_fallback_ready = True
 
 
-def _llm_call(prompt: str) -> str:
-    """Send prompt to configured LLM. Returns response text."""
+_last_llm_provider_used = ""
+
+
+def _llm_call(prompt: str, model: str = "") -> str:
+    """Send prompt to configured LLM with auto-fallback. Optional model overrides the global default."""
+    global _last_llm_provider_used
+
     if not _llm_ready or not _llm_client:
+        _last_llm_provider_used = "mock"
         return _mock_llm_call(prompt)
+
+    use_model = model or _llm_model
     try:
         response = _llm_client.chat.completions.create(
-            model=_llm_model,
+            model=use_model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=500,
             temperature=0.7,
         )
+        _last_llm_provider_used = _llm_provider
         return response.choices[0].message.content.strip()
     except Exception as exc:
-        TUI.error(f"LLM call failed: {exc}")
+        TUI.warn(f"Primary LLM ({_llm_provider}) failed: {exc}")
+
+        # Auto-fallback to secondary provider
+        if _llm_fallback_ready and _llm_fallback_client:
+            fb_model = model or _llm_fallback_model
+            try:
+                TUI.status("🔄", f"Retrying with fallback ({_llm_fallback_provider})...", TUI.YELLOW)
+                response = _llm_fallback_client.chat.completions.create(
+                    model=fb_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=500,
+                    temperature=0.7,
+                )
+                _last_llm_provider_used = f"{_llm_fallback_provider} (fallback)"
+                return response.choices[0].message.content.strip()
+            except Exception as fb_exc:
+                TUI.error(f"Fallback LLM ({_llm_fallback_provider}) also failed: {fb_exc}")
+
+        _last_llm_provider_used = "mock"
         return _mock_llm_call(prompt)
 
 
@@ -348,6 +439,70 @@ class TUI:
         return f"{cls.DIM}{datetime.now().strftime('%H:%M:%S')}{cls.RESET}"
 
     @classmethod
+    def _read_key(cls) -> str:
+        """Read a single keypress in raw mode. Returns 'left', 'right', 'enter', etc."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    ch2 = sys.stdin.read(1)
+                    if ch2 == '[':
+                        ch3 = sys.stdin.read(1)
+                        if ch3 == 'D':
+                            return 'left'
+                        elif ch3 == 'C':
+                            return 'right'
+                return 'escape'
+            elif ch in ('\r', '\n'):
+                return 'enter'
+            elif ch == '\x03':
+                return 'ctrl_c'
+            else:
+                return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    @classmethod
+    def selector(cls, options: list[str]) -> int | None:
+        """Arrow-key horizontal selector. Returns index or None if cancelled."""
+        current = 0
+
+        while True:
+            parts = []
+            for i, opt in enumerate(options):
+                if i == current:
+                    parts.append(f"{cls.BG_CYAN}{cls.BLACK}{cls.BOLD} {opt} {cls.RESET}")
+                else:
+                    parts.append(f"{cls.DIM} {opt} {cls.RESET}")
+            line = "  ".join(parts)
+            hint = f"{cls.DIM}(← → to move, enter to select){cls.RESET}"
+            sys.stdout.write(f"\r  {line}   {hint}\033[K")
+            sys.stdout.flush()
+
+            key = cls._read_key()
+            if key == 'left':
+                current = (current - 1) % len(options)
+            elif key == 'right':
+                current = (current + 1) % len(options)
+            elif key == 'enter':
+                parts = []
+                for i, opt in enumerate(options):
+                    if i == current:
+                        parts.append(f"{cls.GREEN}{cls.BOLD} {opt} {cls.RESET}")
+                    else:
+                        parts.append(f"{cls.DIM} {opt} {cls.RESET}")
+                sys.stdout.write(f"\r  {'  '.join(parts)}\033[K\n")
+                sys.stdout.flush()
+                return current
+            elif key in ('ctrl_c', 'escape'):
+                sys.stdout.write(f"\r\033[K\n")
+                sys.stdout.flush()
+                return None
+
+    @classmethod
     def _print(cls, *args, **kwargs) -> None:
         with cls._print_lock:
             print(*args, **kwargs)
@@ -424,15 +579,25 @@ class TUI:
 
     @classmethod
     def keybind_table(cls) -> None:
+        with _undo_lock:
+            undo_count = len(_undo_stack)
+
+        if undo_count > 0:
+            undo_suffix = f"  {cls.GREEN}(×{undo_count} available){cls.RESET}"
+            undo_color = cls.YELLOW
+        else:
+            undo_suffix = f"  {cls.DIM}· empty{cls.RESET}"
+            undo_color = cls.DIM
+
         rows = [
-            (HOTKEY.upper(), "Intercept selected text", cls.CYAN),
-            (UNDO_HOTKEY.upper(), "Undo last replacement", cls.YELLOW),
-            ("CTRL+C", "Exit application", cls.RED),
+            (HOTKEY.upper(), "Intercept selected text", cls.CYAN, ""),
+            (UNDO_HOTKEY.upper(), "Undo last replacement", undo_color, undo_suffix),
+            ("CTRL+C", "Exit application", cls.RED, ""),
         ]
         lines = []
-        for key, desc, color in rows:
-            lines.append(f"  {color}{cls.BOLD}{key:<16}{cls.RESET} {cls.DIM}{desc}{cls.RESET}")
-        cls.box("Keybindings", lines, cls.BLUE)
+        for key, desc, color, suffix in rows:
+            lines.append(f"  {color}{cls.BOLD}{key:<16}{cls.RESET} {cls.DIM}{desc}{cls.RESET}{suffix}")
+        cls.box("Keybindings", lines, cls.CYAN)
 
     @classmethod
     def commands_table(cls) -> None:
@@ -441,13 +606,20 @@ class TUI:
         for name, cmd in commands.items():
             prefixes = ", ".join(cmd.get("prefixes", []))
             keywords = ", ".join(cmd.get("keywords", [])[:3])
-            llm_tag = f" {cls.YELLOW}[LLM]{cls.RESET}" if cmd.get("llm_required") else ""
-            desc = cmd.get("description", "")
+
+            if cmd.get("llm_required"):
+                badge = f" {cls.MAGENTA}{cls.BOLD}[LLM]{cls.RESET}"
+            else:
+                badge = f" {cls.CYAN}{cls.BOLD}[FAST]{cls.RESET}"
+
+            count = _usage_counts.get(name, 0)
+            counter = f" {cls.DIM}×{count}{cls.RESET}"
+
             lines.append(
                 f"  {cls.CYAN}{cls.BOLD}{name:<12}{cls.RESET} "
                 f"{cls.DIM}{prefixes:<20}{cls.RESET} "
                 f"{cls.DIM}{keywords}{cls.RESET}"
-                f"{llm_tag}"
+                f"{badge}{counter}"
             )
         cls.box("Commands", lines, cls.CYAN)
 
@@ -458,6 +630,10 @@ class TUI:
                 f"  {cls.GREEN}{cls.BOLD}LIVE{cls.RESET}    {cls.DIM}Provider: {_llm_provider}{cls.RESET}",
                 f"          {cls.DIM}Model: {_llm_model}{cls.RESET}",
             ]
+            if _llm_fallback_ready:
+                lines.append(
+                    f"          {cls.DIM}Fallback: {_llm_fallback_provider} / {_llm_fallback_model}{cls.RESET}"
+                )
             cls.box("LLM", lines, cls.GREEN)
         else:
             lines = [
@@ -465,6 +641,51 @@ class TUI:
                 f"  {cls.DIM}Set provider + api_key in config.yaml for live LLM{cls.RESET}",
             ]
             cls.box("LLM", lines, cls.YELLOW)
+
+    @classmethod
+    def activity_entry(cls, cmd_name: str, input_text: str, output_text: str,
+                       duration: float, is_llm: bool = False, is_error: bool = False) -> None:
+        """Print a single activity feed line."""
+        ts = datetime.now().strftime('%H:%M:%S')
+
+        if is_error:
+            color = cls.RED
+        elif is_llm:
+            color = cls.MAGENTA
+        else:
+            color = cls.CYAN
+
+        max_len: int = max(20, (cls._width() - 50) // 2)
+        inp = input_text[:max_len] + ("..." if len(input_text) > max_len else "")
+        out = output_text[:max_len] + ("..." if len(output_text) > max_len else "")
+
+        check = f"{cls.GREEN}✓{cls.RESET}" if not is_error else f"{cls.RED}✗{cls.RESET}"
+
+        line = (
+            f"  {cls.DIM}{ts}{cls.RESET}  "
+            f"{color}{cls.BOLD}{cmd_name.upper():<10}{cls.RESET}  "
+            f"{cls.DIM}\"{inp}\" → \"{out}\"{cls.RESET}   "
+            f"{check} {cls.DIM}{duration:.1f}s{cls.RESET}"
+        )
+        cls._print(line)
+
+    @classmethod
+    def activity_placeholder(cls) -> None:
+        """Show empty activity feed at startup."""
+        cls.box("Activity", [
+            f"  {cls.DIM}No activity yet. Select text and press {HOTKEY.upper()}{cls.RESET}",
+        ], cls.CYAN)
+
+    @classmethod
+    def micro_log(cls, message: str) -> None:
+        """Append a timestamped message to the rolling 3-line micro-log."""
+        ts = datetime.now().strftime('%H:%M:%S')
+        entry = f"  {cls.DIM}{ts}{cls.RESET}  {message}"
+        with _micro_log_lock:
+            _micro_log.append(entry)
+            if len(_micro_log) > _MICRO_LOG_MAX:
+                _micro_log.pop(0)
+        cls._print(entry)
 
 
 # ============================================================
@@ -546,6 +767,10 @@ def _get_primary_selection() -> str:
 # ============================================================
 
 def _replace_selection(new_text: str) -> None:
+    if _chain_suppress_paste:
+        # Intermediate chain step — store result but don't paste
+        TUI.success("Chain step complete (output passed to next step)")
+        return
     clipboard_copy(new_text)
     time.sleep(CLIPBOARD_DELAY)
     keyboard.send("ctrl+v")
@@ -586,6 +811,8 @@ def _push_undo(original: str, replacement: str) -> None:
         _undo_stack.append({"original": original, "replacement": replacement})
         if len(_undo_stack) > 20:
             _undo_stack.pop(0)
+        count = len(_undo_stack)
+    TUI.micro_log(f"Undo stack: {TUI.YELLOW}×{count}{TUI.RESET} available")
 
 
 def _do_undo() -> None:
@@ -605,10 +832,17 @@ def _do_undo() -> None:
 
         truncated = entry["original"][:50] + ("..." if len(entry["original"]) > 50 else "")
         TUI.success(f"Undone — original was: \"{truncated}\"")
+        with _undo_lock:
+            remaining = len(_undo_stack)
+        if remaining == 0:
+            TUI.micro_log(f"Undo applied — stack {TUI.DIM}empty{TUI.RESET}")
+        else:
+            TUI.micro_log(f"Undo applied — stack {TUI.YELLOW}×{remaining}{TUI.RESET} remaining")
         notify("Undo", "Reverted last replacement")
 
     except Exception as exc:
         TUI.error(f"Undo error: {exc}")
+        TUI.micro_log(f"{TUI.RED}Undo error: {exc}{TUI.RESET}")
 
 
 def on_undo_triggered() -> None:
@@ -697,12 +931,13 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict) -> None:
     prompt_template = cmd_config.get("llm_prompt", "Process this text: {text}")
     prompt = prompt_template.format(text=text.strip())
     cmd_name = cmd_config.get("description", "LLM")
+    cmd_model = cmd_config.get("model", "")
 
     TUI.status("🤖", f"Processing with {'LLM' if _llm_ready else 'Mock'}...", TUI.CYAN)
     notify(APP_NAME, "Processing...")
 
     if _llm_ready:
-        result = _llm_call(prompt)
+        result = _llm_call(prompt, model=cmd_model)
     else:
         result = _mock_llm_call(prompt)
 
@@ -710,8 +945,92 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict) -> None:
     _replace_selection(result)
 
     truncated = result[:80] + ("..." if len(result) > 80 else "")
-    TUI.action("🤖", cmd_name.upper(), f"\"{truncated}\"")
+    provider_tag = f" [{_last_llm_provider_used}]" if _last_llm_provider_used else ""
+    TUI.action("🤖", cmd_name.upper(), f"\"{truncated}\"{provider_tag}")
     notify(cmd_name, f"Done: \"{truncated}\"")
+
+
+def handle_fmt(text: str, full_text: str, cmd_config: dict) -> None:
+    """Auto-format JSON text with indentation."""
+    content = text.strip()
+    try:
+        parsed = json.loads(content)
+        result = json.dumps(parsed, indent=2, ensure_ascii=False)
+
+        _push_undo(full_text, result)
+        _replace_selection(result)
+
+        TUI.action("🔧", "FMT", f"Formatted JSON ({len(content)} → {len(result)} chars)")
+        notify("Format", "JSON formatted successfully")
+    except json.JSONDecodeError as exc:
+        TUI.error(f"FMT: invalid JSON — {exc}")
+        notify("Format Error", f"FMT: invalid JSON — {exc}")
+
+
+def handle_count(text: str, full_text: str, cmd_config: dict) -> None:
+    """Word/char/line stats — notification only, no clipboard replacement."""
+    content = text.strip()
+    words = len(content.split())
+    chars = len(content)
+    lines = content.count('\n') + 1
+
+    stats = f"Words: {words} | Chars: {chars} | Lines: {lines}"
+    TUI.action("📊", "COUNT", stats)
+    notify("Text Stats", stats)
+
+
+def handle_mock(text: str, full_text: str, cmd_config: dict) -> None:
+    """Spongebob alternating caps."""
+    result = "".join(
+        ch.upper() if i % 2 == 0 else ch.lower()
+        for i, ch in enumerate(text.strip())
+    )
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+
+    TUI.action("🧽", "MOCK", f"\"{text.strip()[:40]}\" → \"{result[:40]}\"")
+    notify("Spongebob", f"{result[:80]}")
+
+
+def handle_b64(text: str, full_text: str, cmd_config: dict) -> None:
+    """Base64 encode selected text."""
+    content = text.strip()
+    result = base64.b64encode(content.encode()).decode()
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+
+    TUI.action("🔐", "B64", f"Encoded {len(content)} chars → {len(result)} chars")
+    notify("Base64 Encode", f"{result[:80]}")
+
+
+def handle_decode(text: str, full_text: str, cmd_config: dict) -> None:
+    """Base64 decode selected text."""
+    content = text.strip()
+    try:
+        result = base64.b64decode(content).decode()
+
+        _push_undo(full_text, result)
+        _replace_selection(result)
+
+        TUI.action("🔓", "DECODE", f"Decoded {len(content)} chars → {len(result)} chars")
+        notify("Base64 Decode", f"{result[:80]}")
+    except Exception as exc:
+        TUI.error(f"DECODE: invalid base64 — {exc}")
+        notify("Decode Error", f"Invalid base64 input: {exc}")
+
+
+def handle_hash(text: str, full_text: str, cmd_config: dict) -> None:
+    """SHA256 digest of selected text."""
+    content = text.strip()
+    digest = hashlib.sha256(content.encode()).hexdigest()
+
+    _push_undo(full_text, digest)
+    _replace_selection(digest)
+
+    TUI.action("🔑", "HASH", f"SHA256: {digest[:32]}...")
+    notify("SHA256", digest)
 
 
 # Map of built-in command names → handler functions
@@ -719,7 +1038,36 @@ _BUILTIN_HANDLERS = {
     "translate": handle_translate,
     "command": handle_command,
     "test": handle_test,
+    "fmt": handle_fmt,
+    "count": handle_count,
+    "mock": handle_mock,
+    "b64": handle_b64,
+    "decode": handle_decode,
+    "hash": handle_hash,
 }
+
+
+# ============================================================
+# History Log
+# ============================================================
+
+_HISTORY_PATH = Path.home() / ".watashigpt_history.jsonl"
+
+
+def _log_history(command: str, input_text: str, output_text: str, duration_ms: int) -> None:
+    """Append a JSON line to ~/.watashigpt_history.jsonl."""
+    try:
+        entry = json.dumps({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "command": command,
+            "input": input_text[:500],
+            "output": output_text[:500],
+            "duration_ms": duration_ms,
+        }, ensure_ascii=False)
+        with open(_HISTORY_PATH, "a") as f:
+            f.write(entry + "\n")
+    except Exception as exc:
+        TUI.warn(f"History log write failed: {exc}")
 
 
 # ============================================================
@@ -728,17 +1076,140 @@ _BUILTIN_HANDLERS = {
 
 def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> None:
     """Dispatch to the correct handler for a matched command."""
-    if cmd_name in _BUILTIN_HANDLERS:
-        _BUILTIN_HANDLERS[cmd_name](payload, full_text, cmd_config)
-    elif cmd_config.get("llm_required"):
-        handle_llm_command(payload, full_text, cmd_config)
-    else:
-        # Unknown built-in, no LLM — treat as generic LLM command anyway
-        handle_llm_command(payload, full_text, cmd_config)
+    with _usage_lock:
+        _usage_counts[cmd_name] = _usage_counts.get(cmd_name, 0) + 1
+
+    is_llm = cmd_config.get("llm_required", False) or cmd_name not in _BUILTIN_HANDLERS
+    start_time = time.time()
+
+    try:
+        if cmd_name in _BUILTIN_HANDLERS:
+            _BUILTIN_HANDLERS[cmd_name](payload, full_text, cmd_config)
+        elif cmd_config.get("llm_required"):
+            handle_llm_command(payload, full_text, cmd_config)
+        else:
+            handle_llm_command(payload, full_text, cmd_config)
+
+        duration = time.time() - start_time
+        with _undo_lock:
+            output = _undo_stack[-1]["replacement"] if _undo_stack else "(done)"
+        TUI.activity_entry(cmd_name, payload, output, duration, is_llm=is_llm)
+        _log_history(cmd_name, payload, output, int(duration * 1000))
+
+    except Exception as exc:
+        duration = time.time() - start_time
+        TUI.activity_entry(cmd_name, payload, str(exc), duration, is_error=True)
+        _log_history(cmd_name, payload, f"ERROR: {exc}", int(duration * 1000))
+        raise
+
+
+_chain_suppress_paste = False
+
+
+def _resolve_prefix(text: str, commands: dict) -> tuple[str, str, dict] | None:
+    """Match a prefix at the start of text. Returns (cmd_name, payload, cmd_config) or None."""
+    text_upper = text.upper()
+    for name, cmd in commands.items():
+        for prefix in cmd.get("prefixes", []):
+            if text_upper.startswith(prefix.upper()):
+                return name, text[len(prefix):], cmd
+    return None
+
+
+def _parse_chain(text: str, commands: dict) -> list[tuple[str, dict]] | None:
+    """Parse pipe-separated prefix chain like 'TR:|SUM: payload'.
+
+    Returns list of (cmd_name, cmd_config) for each step, or None if not a chain.
+    """
+    # Quick check: must contain | between prefix-like tokens
+    if "|" not in text:
+        return None
+
+    # Split on | but only the prefix portion (everything before the actual payload)
+    # Strategy: greedily match PREFIX:| sequences from the left
+    steps = []
+    remaining = text
+    while True:
+        pipe_pos = remaining.find("|")
+        if pipe_pos == -1:
+            break
+        candidate = remaining[:pipe_pos]
+        match = _resolve_prefix(candidate, commands)
+        if match:
+            cmd_name, _, cmd_config = match
+            steps.append((cmd_name, cmd_config))
+            remaining = remaining[pipe_pos + 1:]
+        else:
+            break
+
+    if len(steps) < 1:
+        return None
+
+    # The remaining text must start with a valid prefix too (the final command)
+    final_match = _resolve_prefix(remaining, commands)
+    if not final_match:
+        return None
+
+    steps.append((final_match[0], final_match[2]))
+    # Store the actual payload (text after the last prefix)
+    return steps
+
+
+def _extract_chain_payload(text: str, commands: dict) -> str:
+    """Extract the payload text from a chain like 'TR:|SUM: the actual text'."""
+    remaining = text
+    while True:
+        pipe_pos = remaining.find("|")
+        if pipe_pos == -1:
+            break
+        candidate = remaining[:pipe_pos]
+        if _resolve_prefix(candidate, commands):
+            remaining = remaining[pipe_pos + 1:]
+        else:
+            break
+    # remaining is now "SUM: the actual text" — strip the last prefix
+    match = _resolve_prefix(remaining, commands)
+    if match:
+        return match[1]  # payload after prefix
+    return remaining
 
 
 def route(text: str) -> None:
     commands = CONFIG.get("commands", {})
+    global _chain_suppress_paste
+
+    # Check for pipe chain syntax first
+    chain = _parse_chain(text, commands)
+    if chain and len(chain) >= 2:
+        payload = _extract_chain_payload(text, commands)
+        step_names = " → ".join(name for name, _ in chain)
+        TUI.status("⛓", f"Chain: {step_names}", TUI.CYAN)
+
+        current_input = payload
+        for i, (cmd_name, cmd_config) in enumerate(chain):
+            is_last = (i == len(chain) - 1)
+            step_label = f"[{i+1}/{len(chain)}] {cmd_name}"
+
+            if not is_last:
+                # Suppress clipboard paste for intermediate steps
+                _chain_suppress_paste = True
+
+            try:
+                TUI.status("⛓", f"Step {step_label}...", TUI.CYAN)
+                dispatch(cmd_name, current_input, text, cmd_config)
+
+                # Get output from undo stack for next step
+                if not is_last:
+                    with _undo_lock:
+                        current_input = _undo_stack[-1]["replacement"] if _undo_stack else current_input
+            except Exception as exc:
+                TUI.error(f"Chain failed at step {step_label}: {exc}")
+                notify(APP_NAME, f"Chain failed at step {step_label}")
+                return
+            finally:
+                _chain_suppress_paste = False
+
+        return
 
     # Tier 1: Exact prefix match (fastest, backward-compatible)
     text_upper = text.upper()
@@ -789,9 +1260,6 @@ def route(text: str) -> None:
     available = ", ".join(
         p for cmd in commands.values() for p in cmd.get("prefixes", [])
     )
-    keywords = ", ".join(
-        k for cmd in commands.values() for k in cmd.get("keywords", [])[:2]
-    )
     notify(APP_NAME, f"Unknown command. Prefixes: {available}")
 
 
@@ -805,6 +1273,7 @@ def _do_intercept() -> None:
 
         TUI.separator()
         TUI.status("⌨", "Hotkey triggered — reading selection...", TUI.CYAN)
+        TUI.micro_log(f"Hotkey triggered — reading selection...")
 
         if _IS_WAYLAND:
             text: str = _get_primary_selection()
@@ -829,6 +1298,7 @@ def _do_intercept() -> None:
 
     except Exception as exc:
         TUI.error(f"Interceptor error: {exc}")
+        TUI.micro_log(f"{TUI.RED}Error: {exc}{TUI.RESET}")
         notify(APP_NAME, f"Error: {exc}")
 
 
@@ -852,9 +1322,13 @@ def main() -> None:
         f"  {TUI.BOLD}Wayland{TUI.RESET}    {'Yes' if _IS_WAYLAND else 'No'}",
         f"  {TUI.BOLD}User{TUI.RESET}       {_SUDO_USER or os.environ.get('USER', '?')}",
         f"  {TUI.BOLD}Config{TUI.RESET}     {_CONFIG_PATH if _CONFIG_PATH.exists() else 'defaults (no config.yaml)'}",
-    ], TUI.GREEN)
+    ], TUI.CYAN)
 
     print()
+
+    # Initialize usage counters
+    for cmd_name in CONFIG.get("commands", {}):
+        _usage_counts[cmd_name] = 0
 
     # Interactive LLM setup (only if not already configured)
     _llm_setup_prompt()
@@ -864,10 +1338,15 @@ def main() -> None:
     TUI.llm_status_box()
 
     print()
+    TUI.activity_placeholder()
+    print()
     TUI.commands_table()
     print()
     TUI.keybind_table()
     print()
+
+    # Start config hot-reload watcher
+    _start_config_watcher()
 
     # Register hotkeys
     keyboard.add_hotkey(HOTKEY, on_hotkey_triggered)
@@ -879,10 +1358,11 @@ def main() -> None:
     )
 
     TUI.separator()
-    TUI.success("Listening for hotkeys...")
     cmd_count = len(CONFIG.get("commands", {}))
     llm_label = f"LLM: {_llm_provider}" if _llm_ready else "Mock mode"
-    TUI.status("", f"{TUI.DIM}{cmd_count} commands loaded | {llm_label} | Select text and press {HOTKEY.upper()}{TUI.RESET}")
+    TUI.micro_log(f"{TUI.GREEN}✓{TUI.RESET} Listening for hotkeys...")
+    TUI.micro_log(f"{cmd_count} commands loaded | {llm_label} | {HOTKEY.upper()} to intercept")
+    TUI.micro_log(f"Ready.")
     print()
 
     try:

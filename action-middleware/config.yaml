@@ -1,120 +1,165 @@
-# ============================================================
-# Action Middleware — Configuration
-# ============================================================
-# Edit this file to add custom commands, change hotkeys,
-# or configure LLM integration. No code changes needed.
-#
-# Restart the app after editing: sudo -E python main.py
-# ============================================================
-
 hotkeys:
   intercept: ctrl+alt+x
   undo: ctrl+alt+z
-
-# ============================================================
-# Commands
-# ============================================================
-# Each command needs:
-#   prefixes:  list of exact prefixes (e.g. "TR:", "CMD:")
-#   keywords:  list of keywords that trigger this command
-#              (matched against the first 3 words of input)
-#   description: short description shown in TUI
-#
-# Optional (LLM-backed commands):
-#   llm_required: true
-#   llm_prompt:   prompt template — use {text} for the input
-# ============================================================
-
 commands:
-
-  # --- Built-in: Corporate Translator ---
   translate:
-    prefixes: ["TR:"]
-    keywords: ["translate", "polite", "rephrase", "professional", "corporatize"]
-    description: "Convert rude text to professional"
+    prefixes:
+    - 'TR:'
+    keywords:
+    - translate
+    - polite
+    - rephrase
+    - professional
+    - corporatize
+    description: Convert rude text to professional
     phrases:
-      # Frustration
-      "fix this garbage": "Please review the code for potential improvements."
-      "this is broken": "I've identified an issue that needs attention."
-      "this sucks": "There may be room for improvement here."
-      "what a mess": "This could benefit from some restructuring."
-      "this is trash": "I think we should consider a different approach."
-      "terrible code": "The implementation could use some refinement."
-      # Blame / confrontation
-      "who wrote this": "Could we discuss the approach taken here?"
-      "that's wrong": "I have a different perspective on this."
-      "are you serious": "Could you help me understand the reasoning behind this?"
-      "are you stupid": "I think there might be a misunderstanding here."
-      "you don't know what you're doing": "Perhaps we could pair on this together?"
-      "this is your fault": "Let's focus on finding a solution together."
-      # Refusal / dismissal
-      "do it yourself": "I'd appreciate your help with this task."
-      "not my problem": "I understand — let me find the right person to help."
-      "i don't care": "I'll defer to the team's judgment on this."
-      "whatever": "I'm open to any approach the team prefers."
-      "figure it out": "Happy to brainstorm solutions together."
-      # Deadline / pressure
-      "this is taking forever": "Could we discuss the timeline and priorities?"
-      "hurry up": "I'd like to understand the timeline expectations."
-      "why isn't this done yet": "Could we review the current blockers together?"
-      "just ship it": "Let's discuss what an acceptable MVP looks like."
-      # Meetings / process
-      "this meeting is pointless": "Could we clarify the meeting objectives?"
-      "stop wasting my time": "I want to make sure we're using everyone's time effectively."
-      "nobody asked for this": "Could we revisit the requirements and priorities?"
-
-  # --- Built-in: Terminal Command ---
+      fix this garbage: Please review the code for potential improvements.
+      this is broken: I've identified an issue that needs attention.
+      this sucks: There may be room for improvement here.
+      what a mess: This could benefit from some restructuring.
+      this is trash: I think we should consider a different approach.
+      terrible code: The implementation could use some refinement.
+      who wrote this: Could we discuss the approach taken here?
+      that's wrong: I have a different perspective on this.
+      are you serious: Could you help me understand the reasoning behind this?
+      are you stupid: I think there might be a misunderstanding here.
+      you don't know what you're doing: Perhaps we could pair on this together?
+      this is your fault: Let's focus on finding a solution together.
+      do it yourself: I'd appreciate your help with this task.
+      not my problem: "I understand \u2014 let me find the right person to help."
+      i don't care: I'll defer to the team's judgment on this.
+      whatever: I'm open to any approach the team prefers.
+      figure it out: Happy to brainstorm solutions together.
+      this is taking forever: Could we discuss the timeline and priorities?
+      hurry up: I'd like to understand the timeline expectations.
+      why isn't this done yet: Could we review the current blockers together?
+      just ship it: Let's discuss what an acceptable MVP looks like.
+      this meeting is pointless: Could we clarify the meeting objectives?
+      stop wasting my time: I want to make sure we're using everyone's time effectively.
+      nobody asked for this: Could we revisit the requirements and priorities?
   command:
-    prefixes: ["CMD:", "RUN:", "EXEC:"]
-    keywords: ["run", "execute", "shell", "terminal"]
-    description: "Execute a shell command silently"
-
-  # --- Built-in: Pipeline Test ---
+    prefixes:
+    - 'CMD:'
+    - 'RUN:'
+    - 'EXEC:'
+    keywords:
+    - run
+    - execute
+    - shell
+    - terminal
+    description: Execute a shell command silently
   test:
-    prefixes: ["TEST:", "PING:"]
-    keywords: ["test", "ping", "check"]
-    description: "Test the capture-process-replace pipeline"
-
-  # --- LLM-backed: Summarize ---
+    prefixes:
+    - 'TEST:'
+    - 'PING:'
+    keywords:
+    - test
+    - ping
+    - check
+    description: Test the capture-process-replace pipeline
   summarize:
-    prefixes: ["SUM:", "TLDR:"]
-    keywords: ["summarize", "tldr", "shorten", "brief"]
-    description: "Summarize text (LLM)"
+    prefixes:
+    - 'SUM:'
+    - 'TLDR:'
+    keywords:
+    - summarize
+    - tldr
+    - shorten
+    - brief
+    description: Summarize text (LLM)
     llm_required: true
-    llm_prompt: "Summarize the following text in 1-2 concise sentences:\n\n{text}"
+    llm_prompt: 'Summarize the following text in 1-2 concise sentences:
 
-  # --- LLM-backed: Rewrite ---
+
+      {text}'
   rewrite:
-    prefixes: ["RW:", "REWRITE:"]
-    keywords: ["rewrite", "improve", "better", "fix writing"]
-    description: "Rewrite text professionally (LLM)"
+    prefixes:
+    - 'RW:'
+    - 'REWRITE:'
+    keywords:
+    - rewrite
+    - improve
+    - better
+    - fix writing
+    description: Rewrite text professionally (LLM)
     llm_required: true
-    llm_prompt: "Rewrite the following text to be clear, professional, and well-structured. Return only the rewritten text:\n\n{text}"
+    llm_prompt: 'Rewrite the following text to be clear, professional, and well-structured.
+      Return only the rewritten text:
 
-  # --- LLM-backed: Explain ---
+
+      {text}'
   explain:
-    prefixes: ["EXP:", "EXPLAIN:"]
-    keywords: ["explain", "what does", "how does", "meaning"]
-    description: "Explain text or code (LLM)"
+    prefixes:
+    - 'EXP:'
+    - 'EXPLAIN:'
+    keywords:
+    - explain
+    - what does
+    - how does
+    - meaning
+    description: Explain text or code (LLM)
     llm_required: true
-    llm_prompt: "Explain the following in simple terms (2-3 sentences max):\n\n{text}"
+    llm_prompt: 'Explain the following in simple terms (2-3 sentences max):
 
-# ============================================================
-# LLM Configuration
-# ============================================================
-# Leave provider empty ("") to run in mock mode.
-# Mock mode: built-in commands work normally, LLM commands
-# return placeholder text. No API key needed.
-#
-# Supported providers:
-#   groq    — Free tier, fastest (~0.3s), recommended
-#   openai  — GPT-4o-mini, cheap and fast
-#
-# API key can also be set via environment variable:
-#   export ACTION_MW_API_KEY="your-key-here"
-# ============================================================
 
+      {text}'
+  fmt:
+    prefixes:
+    - 'FMT:'
+    - 'FORMAT:'
+    keywords:
+    - format
+    - prettify
+    - indent
+    description: Auto-format JSON
+  count:
+    prefixes:
+    - 'COUNT:'
+    - 'STATS:'
+    keywords:
+    - count
+    - stats
+    - words
+    description: Word/char/line stats (notification only)
+  mock:
+    prefixes:
+    - 'MOCK:'
+    - 'SPONGE:'
+    keywords:
+    - mock
+    - spongebob
+    - sarcasm
+    description: Spongebob alternating caps
+  b64:
+    prefixes:
+    - 'B64:'
+    - 'BASE64:'
+    keywords:
+    - encode
+    - base64
+    description: Base64 encode text
+  decode:
+    prefixes:
+    - 'DECODE:'
+    - 'DB64:'
+    keywords:
+    - decode
+    - unbase64
+    description: Base64 decode text
+  hash:
+    prefixes:
+    - 'HASH:'
+    - 'SHA:'
+    keywords:
+    - hash
+    - sha256
+    - digest
+    description: SHA256 hex digest
 llm:
-  provider: ""          # "groq" or "openai" — empty = mock mode
-  api_key: ""           # or use ACTION_MW_API_KEY env var
-  model: ""             # groq: "llama-3.3-70b-versatile", openai: "gpt-4o-mini"
+  provider: ""
+  api_key: ""
+  model: ""
+  fallback:
+    provider: ""
+    api_key: ""
+    model: ""
