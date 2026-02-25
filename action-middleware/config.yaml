@@ -155,6 +155,18 @@ commands:
     - sha256
     - digest
     description: SHA256 hex digest
+  trans:
+    prefixes:
+    - 'TRANS:'
+    keywords:
+    - translate to
+    description: Translate text to a target language (LLM)
+    llm_required: true
+    llm_prompt: 'Translate the following text to {lang}. Return ONLY the translated
+      text, nothing else:
+
+
+      {text}'
 llm:
   provider: ""
   api_key: ""

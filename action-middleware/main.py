@@ -20,6 +20,7 @@ import yaml
 import tty
 import termios
 import select
+import argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -1033,6 +1034,43 @@ def handle_hash(text: str, full_text: str, cmd_config: dict) -> None:
     notify("SHA256", digest)
 
 
+import re as _re
+
+_TRANS_LANG_RE = _re.compile(r"^([A-Za-z]{2,10}):\s*")
+
+def handle_trans(text: str, full_text: str, cmd_config: dict) -> None:
+    """Translate text to a target language via LLM. Expects payload like 'JP: hello world'."""
+    m = _TRANS_LANG_RE.match(text)
+    if not m:
+        TUI.error("TRANS requires a language code, e.g. TRANS:JP: hello world")
+        notify("Translation Error", "Missing language code — use TRANS:<LANG>: text")
+        return
+
+    lang_code = m.group(1).upper()
+    body = text[m.end():].strip()
+    if not body:
+        TUI.error("TRANS: no text to translate")
+        notify("Translation Error", "No text provided after language code")
+        return
+
+    prompt_template = cmd_config.get("llm_prompt", "Translate to {lang}: {text}")
+    prompt = prompt_template.format(lang=lang_code, text=body)
+    cmd_model = cmd_config.get("model", "")
+
+    TUI.status("🌐", f"Translating to {lang_code} with {'LLM' if _llm_ready else 'Mock'}...", TUI.CYAN)
+    notify(APP_NAME, f"Translating to {lang_code}...")
+
+    result = _llm_call(prompt, model=cmd_model) if _llm_ready else _mock_llm_call(prompt)
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+
+    truncated = result[:80] + ("..." if len(result) > 80 else "")
+    provider_tag = f" [{_last_llm_provider_used}]" if _last_llm_provider_used else ""
+    TUI.action("🌐", f"TRANS→{lang_code}", f"\"{truncated}\"{provider_tag}")
+    notify(f"Translated ({lang_code})", truncated)
+
+
 # Map of built-in command names → handler functions
 _BUILTIN_HANDLERS = {
     "translate": handle_translate,
@@ -1044,6 +1082,7 @@ _BUILTIN_HANDLERS = {
     "b64": handle_b64,
     "decode": handle_decode,
     "hash": handle_hash,
+    "trans": handle_trans,
 }
 
 
@@ -1377,5 +1416,59 @@ def main() -> None:
     notify(APP_NAME, "Shutting down. Goodbye!")
 
 
+def install_systemd_service() -> None:
+    """Generate and install a systemd unit file for WatashiGPT."""
+    if os.geteuid() != 0:
+        print(f"{TUI.RED}Error: --install must be run as root (sudo).{TUI.RESET}")
+        sys.exit(1)
+
+    script_path = Path(__file__).resolve()
+    working_dir = script_path.parent
+    python_bin = sys.executable
+    sudo_user = os.environ.get("SUDO_USER", "")
+
+    if not sudo_user:
+        print(f"{TUI.RED}Error: Could not determine SUDO_USER. Run with: sudo -E python main.py --install{TUI.RESET}")
+        sys.exit(1)
+
+    unit_content = f"""\
+[Unit]
+Description=WatashiGPT Action Middleware
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sudo -E {python_bin} {script_path}
+WorkingDirectory={working_dir}
+User={sudo_user}
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+PassEnvironment=WAYLAND_DISPLAY XDG_SESSION_TYPE XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+    unit_path = Path("/etc/systemd/system/watashigpt.service")
+    unit_path.write_text(unit_content)
+    print(f"{TUI.GREEN}✓{TUI.RESET} Wrote {unit_path}")
+
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "watashigpt"], check=True)
+    print(f"{TUI.GREEN}✓{TUI.RESET} Service enabled")
+    print()
+    print(f"  Start now with:  {TUI.CYAN}systemctl start watashigpt{TUI.RESET}")
+    print(f"  Check status:    {TUI.CYAN}systemctl status watashigpt{TUI.RESET}")
+    print(f"  View logs:       {TUI.CYAN}journalctl -u watashigpt -f{TUI.RESET}")
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="WatashiGPT Action Middleware")
+    parser.add_argument("--install", action="store_true", help="Install as a systemd service")
+    args = parser.parse_args()
+
+    if args.install:
+        install_systemd_service()
+    else:
+        main()
