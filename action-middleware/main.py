@@ -117,6 +117,8 @@ _micro_log: list[str] = []
 _micro_log_lock = threading.Lock()
 _MICRO_LOG_MAX = 3
 
+_start_time: float = time.time()
+
 
 # ============================================================
 # Config Hot-Reload
@@ -180,6 +182,27 @@ _llm_fallback_ready = False
 _llm_fallback_provider = ""
 _llm_fallback_model = ""
 
+LLM_MODE = "mock"  # "live" or "mock" — set during startup, never changes after
+
+
+def _save_llm_config(provider: str, api_key: str, model: str) -> None:
+    """Persist LLM provider/key/model to config.yaml."""
+    try:
+        if _CONFIG_PATH.exists():
+            with open(_CONFIG_PATH, "r") as f:
+                data = yaml.safe_load(f) or {}
+        else:
+            data = {}
+        if "llm" not in data:
+            data["llm"] = {}
+        data["llm"]["provider"] = provider
+        data["llm"]["api_key"] = api_key
+        data["llm"]["model"] = model
+        with open(_CONFIG_PATH, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+    except Exception as exc:
+        TUI.warn(f"Could not save LLM config: {exc}")
+
 
 def _llm_setup_prompt() -> None:
     """Interactive terminal prompt for LLM configuration with arrow-key selection."""
@@ -202,19 +225,21 @@ def _llm_setup_prompt() -> None:
         f"  {b}Select a provider:{r}",
     ], TUI.CYAN)
 
-    options = ["groq", "openai", "skip"]
+    options = ["groq", "openai", "gemini", "openrouter", "github", "skip → mock"]
 
     if sys.stdin.isatty():
         choice = TUI.selector(options)
     else:
-        print(f"  {d}[1] groq  [2] openai  [3] skip{r}")
+        labels = "  ".join(f"[{i+1}] {o}" for i, o in enumerate(options))
+        print(f"  {d}{labels}{r}")
         try:
-            raw = input(f"  {c}Choice (1-3):{r} ").strip()
+            raw = input(f"  {c}Choice (1-{len(options)}):{r} ").strip()
         except (EOFError, KeyboardInterrupt):
-            raw = "3"
-        choice = {"1": 0, "2": 1, "3": 2}.get(raw)
+            raw = str(len(options))
+        choice = {str(i+1): i for i in range(len(options))}.get(raw)
 
-    if choice is None or choice == 2:
+    skip_index = len(options) - 1
+    if choice is None or choice == skip_index:
         print(f"  {d}Launching in mock mode.{r}\n")
         return
 
@@ -231,7 +256,14 @@ def _llm_setup_prompt() -> None:
         print(f"  {TUI.RED}No API key provided. Launching in mock mode.{r}\n")
         return
 
-    default_model = "llama-3.3-70b-versatile" if provider == "groq" else "gpt-4o-mini"
+    _PROVIDER_DEFAULTS = {
+        "groq": "llama-3.3-70b-versatile",
+        "openai": "gpt-4o-mini",
+        "gemini": "gemini-2.0-flash",
+        "openrouter": "meta-llama/llama-3.3-70b-instruct",
+        "github": "gpt-4o-mini",
+    }
+    default_model = _PROVIDER_DEFAULTS.get(provider, "gpt-4o-mini")
     try:
         model = input(f"  {c}{b}Model{r} {d}[{default_model}]{r}{c}{b}:{r} ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -243,7 +275,26 @@ def _llm_setup_prompt() -> None:
     CONFIG["llm"]["api_key"] = api_key
     CONFIG["llm"]["model"] = model
 
-    print(f"\n  {g}✓ LLM configured: {provider}/{model} (session only){r}\n")
+    # Persist to config.yaml so subsequent runs skip the selector
+    _save_llm_config(provider, api_key, model)
+
+    print(f"\n  {g}✓ LLM configured: {provider}/{model}{r}\n")
+
+
+_PROVIDER_BASE_URLS = {
+    "groq": "https://api.groq.com/openai/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "github": "https://models.inference.ai.azure.com",
+}
+
+_PROVIDER_DEFAULT_MODELS = {
+    "groq": "llama-3.3-70b-versatile",
+    "openai": "gpt-4o-mini",
+    "gemini": "gemini-2.0-flash",
+    "openrouter": "meta-llama/llama-3.3-70b-instruct",
+    "github": "gpt-4o-mini",
+}
 
 
 def _init_llm_client(provider: str, api_key: str, model: str):
@@ -251,15 +302,18 @@ def _init_llm_client(provider: str, api_key: str, model: str):
     try:
         from openai import OpenAI
 
-        if provider == "groq":
-            client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
-            return client, model or "llama-3.3-70b-versatile"
-        elif provider == "openai":
+        default_model = _PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o-mini")
+        resolved_model = model or default_model
+
+        if provider == "openai":
             client = OpenAI(api_key=api_key)
-            return client, model or "gpt-4o-mini"
+        elif provider in _PROVIDER_BASE_URLS:
+            client = OpenAI(api_key=api_key, base_url=_PROVIDER_BASE_URLS[provider])
         else:
             TUI.warn(f"Unknown LLM provider: '{provider}'.")
             return None, ""
+
+        return client, resolved_model
     except ImportError:
         TUI.warn("openai package not installed. Run: pip install openai")
         return None, ""
@@ -269,9 +323,10 @@ def _init_llm_client(provider: str, api_key: str, model: str):
 
 
 def _init_llm() -> None:
-    """Initialize LLM client from config. Sets _llm_ready=True on success."""
+    """Initialize LLM client from config. Sets _llm_ready=True and LLM_MODE='live' on success."""
     global _llm_client, _llm_ready, _llm_provider, _llm_model
     global _llm_fallback_client, _llm_fallback_ready, _llm_fallback_provider, _llm_fallback_model
+    global LLM_MODE
 
     llm_cfg = CONFIG.get("llm", {})
     provider = llm_cfg.get("provider", "").strip().lower()
@@ -292,6 +347,7 @@ def _init_llm() -> None:
         _llm_model = resolved_model
         _llm_provider = provider
         _llm_ready = True
+        LLM_MODE = "live"
 
     # Initialize fallback provider if configured
     fb_cfg = llm_cfg.get("fallback", {})
@@ -365,7 +421,7 @@ def _mock_llm_call(prompt: str) -> str:
 
 def _llm_classify(text: str, commands: dict) -> dict | None:
     """Ask LLM to classify text intent. Returns {"name": ..., "payload": ...} or None."""
-    if not _llm_ready:
+    if LLM_MODE == "mock" or not _llm_ready:
         return None
 
     cmd_list = "\n".join(
@@ -553,6 +609,28 @@ class TUI:
             sys.stdout.flush()
 
     @classmethod
+    def header_line(cls) -> None:
+        """Compact single-line header shown after banner collapses."""
+        elapsed = int(time.time() - _start_time)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        uptime = f"{h}:{m:02d}:{s:02d}"
+
+        if LLM_MODE == "live":
+            mode_str = f"{cls.GREEN}live{cls.RESET} {cls.DIM}· {_llm_provider}/{_llm_model}{cls.RESET}"
+        else:
+            mode_str = f"{cls.YELLOW}mock{cls.RESET}"
+
+        cmd_count = len(CONFIG.get("commands", {}))
+        line = (
+            f"  {cls.MAGENTA}{cls.BOLD}▶ WATASHIGPT{cls.RESET}  "
+            f"{cls.DIM}|{cls.RESET}  {mode_str}  "
+            f"{cls.DIM}|{cls.RESET}  {cls.DIM}{cmd_count} commands{cls.RESET}  "
+            f"{cls.DIM}|{cls.RESET}  {cls.DIM}uptime: {uptime}{cls.RESET}"
+        )
+        cls._print(line)
+
+    @classmethod
     def status(cls, label: str, value: str, color: str = "") -> None:
         c = color or cls.WHITE
         cls._print(f"  {cls._timestamp()}  {c}{cls.BOLD}{label}{cls.RESET} {cls.DIM}{value}{cls.RESET}")
@@ -607,26 +685,38 @@ class TUI:
         for name, cmd in commands.items():
             prefixes = ", ".join(cmd.get("prefixes", []))
             keywords = ", ".join(cmd.get("keywords", [])[:3])
+            is_llm_cmd = cmd.get("llm_required", False)
+            dimmed = is_llm_cmd and LLM_MODE == "mock"
 
-            if cmd.get("llm_required"):
+            if is_llm_cmd:
                 badge = f" {cls.MAGENTA}{cls.BOLD}[LLM]{cls.RESET}"
+                if dimmed:
+                    badge += f" {cls.YELLOW}[MOCK]{cls.RESET}"
             else:
                 badge = f" {cls.CYAN}{cls.BOLD}[FAST]{cls.RESET}"
 
             count = _usage_counts.get(name, 0)
             counter = f" {cls.DIM}×{count}{cls.RESET}"
 
-            lines.append(
-                f"  {cls.CYAN}{cls.BOLD}{name:<12}{cls.RESET} "
-                f"{cls.DIM}{prefixes:<20}{cls.RESET} "
-                f"{cls.DIM}{keywords}{cls.RESET}"
-                f"{badge}{counter}"
-            )
+            if dimmed:
+                lines.append(
+                    f"  {cls.DIM}{name:<12} "
+                    f"{prefixes:<20} "
+                    f"{keywords}{cls.RESET}"
+                    f"{badge}{counter}"
+                )
+            else:
+                lines.append(
+                    f"  {cls.CYAN}{cls.BOLD}{name:<12}{cls.RESET} "
+                    f"{cls.DIM}{prefixes:<20}{cls.RESET} "
+                    f"{cls.DIM}{keywords}{cls.RESET}"
+                    f"{badge}{counter}"
+                )
         cls.box("Commands", lines, cls.CYAN)
 
     @classmethod
     def llm_status_box(cls) -> None:
-        if _llm_ready:
+        if LLM_MODE == "live":
             lines = [
                 f"  {cls.GREEN}{cls.BOLD}LIVE{cls.RESET}    {cls.DIM}Provider: {_llm_provider}{cls.RESET}",
                 f"          {cls.DIM}Model: {_llm_model}{cls.RESET}",
@@ -639,7 +729,7 @@ class TUI:
         else:
             lines = [
                 f"  {cls.YELLOW}{cls.BOLD}MOCK MODE{cls.RESET}",
-                f"  {cls.DIM}Set provider + api_key in config.yaml for live LLM{cls.RESET}",
+                f"  {cls.DIM}LLM commands return placeholders · no API calls{cls.RESET}",
             ]
             cls.box("LLM", lines, cls.YELLOW)
 
@@ -917,7 +1007,7 @@ def handle_command(text: str, full_text: str, cmd_config: dict) -> None:
 def handle_test(text: str, full_text: str, cmd_config: dict) -> None:
     """Pipeline test — verifies capture → process → replace."""
     content = text.strip()
-    result = f"[TEST OK] \"{content}\" | session={_SESSION_TYPE} | wayland={_IS_WAYLAND} | llm={'live' if _llm_ready else 'mock'}"
+    result = f"[TEST OK] \"{content}\" | session={_SESSION_TYPE} | wayland={_IS_WAYLAND} | llm={LLM_MODE}"
 
     _push_undo(full_text, result)
     _replace_selection(result)
@@ -929,18 +1019,25 @@ def handle_test(text: str, full_text: str, cmd_config: dict) -> None:
 
 def handle_llm_command(text: str, full_text: str, cmd_config: dict) -> None:
     """Generic handler for LLM-backed commands defined in config.yaml."""
+    cmd_name = cmd_config.get("description", "LLM")
+
+    # Mock mode: return placeholder immediately, no API call
+    if LLM_MODE == "mock":
+        result = f"[MOCK] {cmd_name}: (LLM not configured)"
+        _push_undo(full_text, result)
+        _replace_selection(result)
+        TUI.action("🤖", cmd_name.upper(), f"\"{result}\" [mock]")
+        notify(cmd_name, result)
+        return
+
     prompt_template = cmd_config.get("llm_prompt", "Process this text: {text}")
     prompt = prompt_template.format(text=text.strip())
-    cmd_name = cmd_config.get("description", "LLM")
     cmd_model = cmd_config.get("model", "")
 
-    TUI.status("🤖", f"Processing with {'LLM' if _llm_ready else 'Mock'}...", TUI.CYAN)
+    TUI.status("🤖", f"Processing with LLM...", TUI.CYAN)
     notify(APP_NAME, "Processing...")
 
-    if _llm_ready:
-        result = _llm_call(prompt, model=cmd_model)
-    else:
-        result = _mock_llm_call(prompt)
+    result = _llm_call(prompt, model=cmd_model)
 
     _push_undo(full_text, result)
     _replace_selection(result)
@@ -1053,14 +1150,23 @@ def handle_trans(text: str, full_text: str, cmd_config: dict) -> None:
         notify("Translation Error", "No text provided after language code")
         return
 
+    # Mock mode: return placeholder immediately, no API call
+    if LLM_MODE == "mock":
+        result = f"[MOCK] TRANS→{lang_code}: (LLM not configured)"
+        _push_undo(full_text, result)
+        _replace_selection(result)
+        TUI.action("🌐", f"TRANS→{lang_code}", f"\"{result}\" [mock]")
+        notify(f"Translated ({lang_code})", result)
+        return
+
     prompt_template = cmd_config.get("llm_prompt", "Translate to {lang}: {text}")
     prompt = prompt_template.format(lang=lang_code, text=body)
     cmd_model = cmd_config.get("model", "")
 
-    TUI.status("🌐", f"Translating to {lang_code} with {'LLM' if _llm_ready else 'Mock'}...", TUI.CYAN)
+    TUI.status("🌐", f"Translating to {lang_code} with LLM...", TUI.CYAN)
     notify(APP_NAME, f"Translating to {lang_code}...")
 
-    result = _llm_call(prompt, model=cmd_model) if _llm_ready else _mock_llm_call(prompt)
+    result = _llm_call(prompt, model=cmd_model)
 
     _push_undo(full_text, result)
     _replace_selection(result)
@@ -1282,8 +1388,8 @@ def route(text: str) -> None:
                 dispatch(name, payload, text, cmd)
                 return
 
-    # Tier 3: LLM intent classification (if available)
-    if _llm_ready:
+    # Tier 3: LLM intent classification (live mode only)
+    if LLM_MODE == "live" and _llm_ready:
         TUI.status("🤖", "No prefix/keyword match — asking LLM to classify...", TUI.CYAN)
         intent = _llm_classify(text, commands)
         if intent:
@@ -1346,24 +1452,137 @@ def on_hotkey_triggered() -> None:
 
 
 # ============================================================
+# Command Search
+# ============================================================
+
+def _command_search() -> None:
+    """Interactive fuzzy search over command names and keywords. Called from cbreak-mode main loop."""
+    commands = CONFIG.get("commands", {})
+    query = ""
+
+    def _find_matches(q: str) -> list[tuple[str, dict]]:
+        q_lower = q.lower()
+        matches = []
+        for name, cmd in commands.items():
+            keywords = cmd.get("keywords", [])
+            prefixes = cmd.get("prefixes", [])
+            desc = cmd.get("description", "")
+            searchable = f"{name} {' '.join(keywords)} {' '.join(prefixes)} {desc}".lower()
+            if q_lower in searchable:
+                matches.append((name, cmd))
+        return matches
+
+    while True:
+        matches = _find_matches(query) if query else list(commands.items())
+        sys.stdout.write(f"\r\033[K  {TUI.CYAN}{TUI.BOLD}/{TUI.RESET} {query}{TUI.DIM}  ({len(matches)} matches · esc to cancel){TUI.RESET}")
+        sys.stdout.flush()
+
+        if select.select([sys.stdin], [], [], 0.1)[0]:
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':  # Escape
+                sys.stdout.write(f"\r\033[K")
+                sys.stdout.flush()
+                return
+            elif ch == '\x03':  # Ctrl+C
+                sys.stdout.write(f"\r\033[K")
+                sys.stdout.flush()
+                return
+            elif ch in ('\r', '\n'):  # Enter — show results
+                sys.stdout.write(f"\r\033[K\n")
+                sys.stdout.flush()
+                if matches:
+                    lines = []
+                    for name, cmd in matches:
+                        pfx = ", ".join(cmd.get("prefixes", []))
+                        desc = cmd.get("description", "")
+                        is_llm = cmd.get("llm_required", False)
+                        badge = f"{TUI.MAGENTA}[LLM]{TUI.RESET}" if is_llm else f"{TUI.CYAN}[FAST]{TUI.RESET}"
+                        lines.append(
+                            f"  {TUI.CYAN}{TUI.BOLD}{name:<12}{TUI.RESET} "
+                            f"{TUI.DIM}{pfx:<18}{TUI.RESET} "
+                            f"{TUI.DIM}{desc}{TUI.RESET} {badge}"
+                        )
+                    TUI.box(f"Search: {query}", lines, TUI.CYAN)
+                else:
+                    TUI.warn(f"No commands matching \"{query}\"")
+                return
+            elif ch == '\x7f':  # Backspace
+                query = query[:-1]
+            elif ch.isprintable():
+                query += ch
+
+
+# ============================================================
+# Session Export
+# ============================================================
+
+def _session_export() -> None:
+    """Dump the full activity log for the current session to a markdown file."""
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    export_path = Path.home() / f"watashigpt_session_{ts}.md"
+
+    lines = [
+        f"# WatashiGPT Session Export",
+        f"",
+        f"- **Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- **Mode**: {LLM_MODE}",
+    ]
+    if LLM_MODE == "live":
+        lines.append(f"- **Provider**: {_llm_provider}/{_llm_model}")
+    lines.append("")
+    lines.append("## Activity Log")
+    lines.append("")
+
+    # Read history from the JSONL file for this session
+    session_start = datetime.fromtimestamp(_start_time).isoformat(timespec="seconds")
+    try:
+        if _HISTORY_PATH.exists():
+            with open(_HISTORY_PATH, "r") as f:
+                count = 0
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                        if entry.get("ts", "") >= session_start:
+                            count += 1
+                            lines.append(
+                                f"| {entry['ts']} | `{entry['command']}` | "
+                                f"{entry['input'][:60]} | {entry['output'][:60]} | "
+                                f"{entry['duration_ms']}ms |"
+                            )
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+                if count == 0:
+                    lines.append("_No activity recorded this session._")
+                else:
+                    # Insert table header before entries
+                    header_idx = lines.index("## Activity Log") + 2
+                    lines.insert(header_idx, "| Time | Command | Input | Output | Duration |")
+                    lines.insert(header_idx + 1, "|------|---------|-------|--------|----------|")
+        else:
+            lines.append("_No history file found._")
+    except Exception as exc:
+        lines.append(f"_Error reading history: {exc}_")
+
+    lines.append("")
+
+    try:
+        export_path.write_text("\n".join(lines))
+        TUI.micro_log(f"{TUI.GREEN}✓{TUI.RESET} Session exported → {TUI.CYAN}{export_path}{TUI.RESET}")
+    except Exception as exc:
+        TUI.error(f"Session export failed: {exc}")
+
+
+# ============================================================
 # Main Entry Point
 # ============================================================
 
-def main() -> None:
+def main(keep_banner: bool = False) -> None:
+    global _start_time
+    _start_time = time.time()
+
     print("\033[2J\033[3J\033[H", end="", flush=True)
 
     TUI.banner()
-
-    # Environment box
-    TUI.box("Environment", [
-        f"  {TUI.BOLD}Session{TUI.RESET}    {_SESSION_TYPE}",
-        f"  {TUI.BOLD}Display{TUI.RESET}    {_DISPLAY}",
-        f"  {TUI.BOLD}Wayland{TUI.RESET}    {'Yes' if _IS_WAYLAND else 'No'}",
-        f"  {TUI.BOLD}User{TUI.RESET}       {_SUDO_USER or os.environ.get('USER', '?')}",
-        f"  {TUI.BOLD}Config{TUI.RESET}     {_CONFIG_PATH if _CONFIG_PATH.exists() else 'defaults (no config.yaml)'}",
-    ], TUI.CYAN)
-
-    print()
 
     # Initialize usage counters
     for cmd_name in CONFIG.get("commands", {}):
@@ -1374,6 +1593,23 @@ def main() -> None:
 
     # Init LLM
     _init_llm()
+
+    # Environment box (rendered after LLM init so Mode is known)
+    config_val = f"{TUI.DIM}{_CONFIG_PATH if _CONFIG_PATH.exists() else 'defaults (no config.yaml)'}{TUI.RESET}"
+    if LLM_MODE == "live":
+        mode_val = f"{TUI.GREEN}LIVE ({_llm_provider}){TUI.RESET}"
+    else:
+        mode_val = f"{TUI.YELLOW}MOCK{TUI.RESET}"
+    TUI.box("Environment", [
+        f"  {TUI.DIM}Session{TUI.RESET}    {TUI.CYAN}{_SESSION_TYPE}{TUI.RESET}",
+        f"  {TUI.DIM}Display{TUI.RESET}    {TUI.CYAN}{_DISPLAY}{TUI.RESET}",
+        f"  {TUI.DIM}Wayland{TUI.RESET}    {TUI.CYAN}{'Yes' if _IS_WAYLAND else 'No'}{TUI.RESET}",
+        f"  {TUI.DIM}User{TUI.RESET}       {TUI.CYAN}{_SUDO_USER or os.environ.get('USER', '?')}{TUI.RESET}",
+        f"  {TUI.DIM}Mode{TUI.RESET}       {mode_val}",
+        f"  {TUI.DIM}Config{TUI.RESET}     {config_val}",
+    ], TUI.CYAN)
+
+    print()
     TUI.llm_status_box()
 
     print()
@@ -1383,6 +1619,21 @@ def main() -> None:
     print()
     TUI.keybind_table()
     print()
+
+    # Collapse banner after init unless --banner flag is set
+    if not keep_banner:
+        time.sleep(2)
+        print("\033[2J\033[3J\033[H", end="", flush=True)
+        TUI.header_line()
+        print()
+        TUI.llm_status_box()
+        print()
+        TUI.activity_placeholder()
+        print()
+        TUI.commands_table()
+        print()
+        TUI.keybind_table()
+        print()
 
     # Start config hot-reload watcher
     _start_config_watcher()
@@ -1398,15 +1649,28 @@ def main() -> None:
 
     TUI.separator()
     cmd_count = len(CONFIG.get("commands", {}))
-    llm_label = f"LLM: {_llm_provider}" if _llm_ready else "Mock mode"
+    llm_label = f"LLM: {_llm_provider}" if LLM_MODE == "live" else "Mock mode"
     TUI.micro_log(f"{TUI.GREEN}✓{TUI.RESET} Listening for hotkeys...")
     TUI.micro_log(f"{cmd_count} commands loaded | {llm_label} | {HOTKEY.upper()} to intercept")
-    TUI.micro_log(f"Ready.")
+    TUI.micro_log(f"{TUI.DIM}/ = search  S = export session  Ctrl+C = exit{TUI.RESET}")
     print()
 
     try:
-        while not _exit_event.is_set():
-            _exit_event.wait(timeout=1.0)
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        try:
+            while not _exit_event.is_set():
+                if select.select([sys.stdin], [], [], 1.0)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch == '\x03':  # Ctrl+C
+                        break
+                    elif ch == '/':
+                        _command_search()
+                    elif ch in ('S', 's'):
+                        _session_export()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     except KeyboardInterrupt:
         pass
 
@@ -1466,9 +1730,10 @@ WantedBy=graphical-session.target
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WatashiGPT Action Middleware")
     parser.add_argument("--install", action="store_true", help="Install as a systemd service")
+    parser.add_argument("--banner", action="store_true", help="Keep the full ASCII banner permanently")
     args = parser.parse_args()
 
     if args.install:
         install_systemd_service()
     else:
-        main()
+        main(keep_banner=args.banner)
