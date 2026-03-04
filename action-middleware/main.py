@@ -5,6 +5,8 @@
 #
 # Config: edit config.yaml to add commands, set hotkeys, configure LLM
 
+__version__ = "1.0.0"
+
 import os
 import sys
 import time
@@ -21,8 +23,24 @@ import tty
 import termios
 import select
 import argparse
+import urllib.request
+import urllib.parse
+import urllib.error
+import queue
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+import re as _re
+import math
+import ast
+import secrets
+import string
+
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+    _TKINTER_AVAILABLE = True
+except ImportError:
+    _TKINTER_AVAILABLE = False
 
 if platform.system() != "Linux":
     import pyperclip
@@ -106,6 +124,8 @@ _undo_stack: list[dict] = []
 _undo_lock = threading.Lock()
 _exit_event = threading.Event()
 
+_current_notify_level: str = "always"  # Set per-dispatch from cmd config
+
 _usage_counts: dict[str, int] = {}
 _usage_lock = threading.Lock()
 
@@ -118,6 +138,13 @@ _micro_log_lock = threading.Lock()
 _MICRO_LOG_MAX = 3
 
 _start_time: float = time.time()
+
+_last_command: dict | None = None  # For REPEAT: stores {"name": ..., "config": ...}
+_clipboard_stack: list[str] = []   # For STACK/POP
+_CLIPS_PATH = Path.home() / ".watashigpt_clips.json"
+
+_popup_queue: queue.Queue = queue.Queue()  # Hotkey thread → main thread for popup
+_popup_trigger: str = "prefix"  # Set per-dispatch: "prefix" or "popup"
 
 
 # ============================================================
@@ -420,7 +447,7 @@ def _mock_llm_call(prompt: str) -> str:
 
 
 def _llm_classify(text: str, commands: dict) -> dict | None:
-    """Ask LLM to classify text intent. Returns {"name": ..., "payload": ...} or None."""
+    """Ask LLM to classify text intent. Returns {"name": ..., "payload": ..., "confidence": float} or None."""
     if LLM_MODE == "mock" or not _llm_ready:
         return None
 
@@ -432,14 +459,26 @@ def _llm_classify(text: str, commands: dict) -> dict | None:
     prompt = (
         f"Classify the following text into one of these commands:\n{cmd_list}\n\n"
         f"Text: \"{text}\"\n\n"
-        f"Reply with ONLY the command name (one word, lowercase). "
-        f"If none match, reply \"unknown\"."
+        f"Reply with ONLY the command name and your confidence score (0.0-1.0), "
+        f"separated by a colon. Example: summarize:0.85\n"
+        f"If none match, reply \"unknown:0.0\"."
     )
 
     try:
         result = _llm_call(prompt).strip().lower()
-        if result in commands and result != "unknown":
-            return {"name": result, "payload": text}
+        # Parse "command_name:confidence" format
+        if ":" in result:
+            parts = result.split(":", 1)
+            cmd_name = parts[0].strip()
+            try:
+                confidence = float(parts[1].strip())
+            except (ValueError, IndexError):
+                confidence = 0.5
+        else:
+            cmd_name = result.strip()
+            confidence = 0.5
+        if cmd_name in commands and cmd_name != "unknown":
+            return {"name": cmd_name, "payload": text, "confidence": confidence}
     except Exception:
         pass
     return None
@@ -735,7 +774,8 @@ class TUI:
 
     @classmethod
     def activity_entry(cls, cmd_name: str, input_text: str, output_text: str,
-                       duration: float, is_llm: bool = False, is_error: bool = False) -> None:
+                       duration: float, is_llm: bool = False, is_error: bool = False,
+                       trigger: str = "") -> None:
         """Print a single activity feed line."""
         ts = datetime.now().strftime('%H:%M:%S')
 
@@ -751,12 +791,13 @@ class TUI:
         out = output_text[:max_len] + ("..." if len(output_text) > max_len else "")
 
         check = f"{cls.GREEN}✓{cls.RESET}" if not is_error else f"{cls.RED}✗{cls.RESET}"
+        trigger_tag = f"  {cls.DIM}[{trigger}]{cls.RESET}" if trigger else ""
 
         line = (
             f"  {cls.DIM}{ts}{cls.RESET}  "
             f"{color}{cls.BOLD}{cmd_name.upper():<10}{cls.RESET}  "
             f"{cls.DIM}\"{inp}\" → \"{out}\"{cls.RESET}   "
-            f"{check} {cls.DIM}{duration:.1f}s{cls.RESET}"
+            f"{check} {cls.DIM}{duration:.1f}s{cls.RESET}{trigger_tag}"
         )
         cls._print(line)
 
@@ -777,6 +818,555 @@ class TUI:
             if len(_micro_log) > _MICRO_LOG_MAX:
                 _micro_log.pop(0)
         cls._print(entry)
+
+
+# ============================================================
+# Command Picker — Tkinter Popup
+# ============================================================
+
+_TONE_STYLES = ["casual", "formal", "aggressive", "empathetic", "confident", "sarcastic", "diplomatic"]
+_TRANS_LANGS = [
+    ("Japanese", "JP", "\U0001f1ef\U0001f1f5"), ("Spanish", "ES", "\U0001f1ea\U0001f1f8"),
+    ("French", "FR", "\U0001f1eb\U0001f1f7"), ("German", "DE", "\U0001f1e9\U0001f1ea"),
+    ("Chinese", "ZH", "\U0001f1e8\U0001f1f3"), ("Arabic", "AR", "\U0001f1f8\U0001f1e6"),
+]
+
+if _TKINTER_AVAILABLE:
+
+    class CommandPicker:
+        """Frameless tkinter popup for picking a command to apply to selected text."""
+
+        BG = "#1a0a2e"
+        BG_ROW = "#1a0a2e"
+        BG_HOVER = "#2a1a4e"
+        BG_SELECTED = "#3a2a6e"
+        FG = "#e0e0e0"
+        FG_DIM = "#888888"
+        BORDER_COLOR = "#00d4aa"
+        BADGE_FAST = "#00d4aa"
+        BADGE_LLM = "#d45cff"
+        BADGE_MOCK = "#d4aa00"
+        SEARCH_BG = "#0e0620"
+        PREVIEW_FG = "#777777"
+        MIN_WIDTH = 360
+        MAX_HEIGHT = 400
+        ROW_HEIGHT = 28
+
+        def __init__(self, selected_text: str, commands: dict):
+            self._text = selected_text
+            self._commands = commands
+            self._cmd_list: list[tuple[str, dict]] = list(commands.items())
+            self._filtered: list[tuple[str, dict]] = list(self._cmd_list)
+            self._selected_idx = 0
+            self._result: tuple | None = None  # (cmd_name, cmd_config) or None
+            self._submenu: str | None = None  # "tone" or "trans" or None
+            self._sub_items: list = []
+            self._sub_selected = 0
+            self._custom_entry = None
+            self._row_widgets: list = []
+
+            self._root = tk.Tk()
+            self._root.withdraw()
+            self._root.overrideredirect(True)
+            self._root.attributes("-topmost", True)
+            self._root.configure(bg=self.BG, highlightbackground=self.BORDER_COLOR,
+                                 highlightthickness=1)
+
+            # Font
+            try:
+                self._font = tkfont.Font(family="DejaVu Sans Mono", size=10)
+                self._font_bold = tkfont.Font(family="DejaVu Sans Mono", size=10, weight="bold")
+                self._font_small = tkfont.Font(family="DejaVu Sans Mono", size=9)
+            except Exception:
+                self._font = tkfont.Font(family="Courier", size=10)
+                self._font_bold = tkfont.Font(family="Courier", size=10, weight="bold")
+                self._font_small = tkfont.Font(family="Courier", size=9)
+
+            self._build_ui()
+            self._position_window()
+            self._root.deiconify()
+            self._root.focus_force()
+            self._search_var.set("")
+            self._search_entry.focus_set()
+
+        def _position_window(self) -> None:
+            """Position popup at mouse cursor, clamped to screen edges."""
+            self._root.update_idletasks()
+            mx = self._root.winfo_pointerx()
+            my = self._root.winfo_pointery()
+            w = max(self.MIN_WIDTH, self._root.winfo_reqwidth())
+            h = min(self.MAX_HEIGHT, self._root.winfo_reqheight())
+            sw = self._root.winfo_screenwidth()
+            sh = self._root.winfo_screenheight()
+
+            x = mx + 10
+            y = my + 10
+            if x + w > sw:
+                x = mx - w - 10
+            if y + h > sh:
+                y = my - h - 10
+            x = max(0, x)
+            y = max(0, y)
+            self._root.geometry(f"{w}x{h}+{x}+{y}")
+
+        def _build_ui(self) -> None:
+            """Build the main popup layout."""
+            # Preview
+            preview = self._text[:60] + ("..." if len(self._text) > 60 else "")
+            tk.Label(self._root, text=f'"{preview}"', bg=self.BG, fg=self.PREVIEW_FG,
+                     font=self._font_small, anchor="w", padx=8, pady=4
+                     ).pack(fill="x")
+
+            # Separator
+            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
+
+            # Search
+            search_frame = tk.Frame(self._root, bg=self.SEARCH_BG)
+            search_frame.pack(fill="x")
+            tk.Label(search_frame, text="\U0001f50d", bg=self.SEARCH_BG, fg=self.FG_DIM,
+                     font=self._font_small).pack(side="left", padx=(8, 2))
+            self._search_var = tk.StringVar()
+            self._search_var.trace_add("write", lambda *_: self._on_search())
+            self._search_entry = tk.Entry(
+                search_frame, textvariable=self._search_var,
+                bg=self.SEARCH_BG, fg=self.FG, insertbackground=self.FG,
+                font=self._font, relief="flat", bd=0,
+            )
+            self._search_entry.pack(fill="x", padx=(0, 8), pady=4, expand=True, side="left")
+
+            # Separator
+            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
+
+            # Scrollable command list
+            self._canvas_frame = tk.Frame(self._root, bg=self.BG)
+            self._canvas_frame.pack(fill="both", expand=True)
+
+            self._canvas = tk.Canvas(self._canvas_frame, bg=self.BG, highlightthickness=0,
+                                     bd=0)
+            self._scrollbar = tk.Scrollbar(self._canvas_frame, orient="vertical",
+                                           command=self._canvas.yview)
+            self._inner_frame = tk.Frame(self._canvas, bg=self.BG)
+
+            self._inner_frame.bind("<Configure>",
+                                   lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+            self._canvas.create_window((0, 0), window=self._inner_frame, anchor="nw")
+            self._canvas.configure(yscrollcommand=self._scrollbar.set)
+
+            self._canvas.pack(side="left", fill="both", expand=True)
+            self._scrollbar.pack(side="right", fill="y")
+
+            self._populate_rows()
+
+            # Bindings
+            self._root.bind("<Escape>", self._on_escape)
+            self._root.bind("<Return>", self._on_enter)
+            self._root.bind("<Up>", self._on_up)
+            self._root.bind("<Down>", self._on_down)
+            self._root.bind("<FocusOut>", self._on_focus_out)
+            self._root.bind("<MouseWheel>", self._on_mousewheel)
+            self._root.bind("<Button-4>", lambda e: self._canvas.yview_scroll(-3, "units"))
+            self._root.bind("<Button-5>", lambda e: self._canvas.yview_scroll(3, "units"))
+            for i in range(1, 10):
+                self._root.bind(f"<Key-{i}>", self._on_number_key)
+
+        def _populate_rows(self) -> None:
+            """Fill the command list rows."""
+            for w in self._row_widgets:
+                w.destroy()
+            self._row_widgets.clear()
+
+            if self._submenu == "tone":
+                self._populate_tone_submenu()
+                return
+            elif self._submenu == "trans":
+                self._populate_trans_submenu()
+                return
+
+            items = self._filtered
+            for i, (name, cmd) in enumerate(items):
+                row = tk.Frame(self._inner_frame, bg=self.BG_ROW, cursor="hand2")
+                row.pack(fill="x", padx=2, pady=1)
+                self._row_widgets.append(row)
+
+                is_llm = cmd.get("llm_required", False)
+                is_mock_llm = is_llm and LLM_MODE == "mock"
+
+                # Number
+                num_label = str(i + 1) if i < 9 else " "
+                fg_main = self.FG_DIM if is_mock_llm else self.FG
+                tk.Label(row, text=num_label, bg=self.BG_ROW, fg=self.FG_DIM,
+                         font=self._font_small, width=2).pack(side="left", padx=(6, 2))
+
+                # Name
+                display_name = name.replace("_", " ").title()
+                tk.Label(row, text=display_name, bg=self.BG_ROW, fg=fg_main,
+                         font=self._font_bold, anchor="w", width=16).pack(side="left")
+
+                # Description
+                desc = cmd.get("description", "")[:30]
+                tk.Label(row, text=desc, bg=self.BG_ROW, fg=self.FG_DIM,
+                         font=self._font_small, anchor="w").pack(side="left", fill="x", expand=True)
+
+                # Badge
+                if is_mock_llm:
+                    badge_text, badge_fg = "[MOCK]", self.BADGE_MOCK
+                elif is_llm:
+                    badge_text, badge_fg = "[LLM]", self.BADGE_LLM
+                else:
+                    badge_text, badge_fg = "[FAST]", self.BADGE_FAST
+                tk.Label(row, text=badge_text, bg=self.BG_ROW, fg=badge_fg,
+                         font=self._font_small).pack(side="right", padx=(4, 8))
+
+                # Highlight
+                if i == self._selected_idx:
+                    self._set_row_bg(row, self.BG_SELECTED)
+
+                # Mouse bindings
+                idx = i
+                row.bind("<Enter>", lambda e, r=row, j=idx: self._on_row_hover(r, j))
+                row.bind("<Leave>", lambda e, r=row, j=idx: self._on_row_leave(r, j))
+                row.bind("<Button-1>", lambda e, j=idx: self._on_row_click(j))
+                for child in row.winfo_children():
+                    child.bind("<Enter>", lambda e, r=row, j=idx: self._on_row_hover(r, j))
+                    child.bind("<Leave>", lambda e, r=row, j=idx: self._on_row_leave(r, j))
+                    child.bind("<Button-1>", lambda e, j=idx: self._on_row_click(j))
+
+            self._update_scroll_height()
+
+        def _populate_tone_submenu(self) -> None:
+            """Show the tone style picker."""
+            self._sub_items = _TONE_STYLES
+            self._sub_selected = 0
+
+            # Back header
+            back = tk.Frame(self._inner_frame, bg=self.SEARCH_BG, cursor="hand2")
+            back.pack(fill="x", padx=2, pady=1)
+            self._row_widgets.append(back)
+            tk.Label(back, text="\u2190 back   Choose tone style", bg=self.SEARCH_BG,
+                     fg=self.FG, font=self._font_bold, anchor="w", padx=8, pady=4
+                     ).pack(fill="x")
+            back.bind("<Button-1>", lambda e: self._back_to_main())
+            for child in back.winfo_children():
+                child.bind("<Button-1>", lambda e: self._back_to_main())
+
+            for i, style in enumerate(self._sub_items):
+                row = tk.Frame(self._inner_frame, bg=self.BG_ROW, cursor="hand2")
+                row.pack(fill="x", padx=2, pady=1)
+                self._row_widgets.append(row)
+
+                fg = self.FG
+                tk.Label(row, text=f"  {style.title()}", bg=self.BG_ROW, fg=fg,
+                         font=self._font, anchor="w", padx=8, pady=3).pack(fill="x")
+
+                if i == self._sub_selected:
+                    self._set_row_bg(row, self.BG_SELECTED)
+
+                idx = i
+                row.bind("<Enter>", lambda e, r=row, j=idx: self._on_sub_hover(r, j))
+                row.bind("<Leave>", lambda e, r=row, j=idx: self._on_sub_leave(r, j))
+                row.bind("<Button-1>", lambda e, j=idx: self._on_sub_click(j))
+                for child in row.winfo_children():
+                    child.bind("<Enter>", lambda e, r=row, j=idx: self._on_sub_hover(r, j))
+                    child.bind("<Leave>", lambda e, r=row, j=idx: self._on_sub_leave(r, j))
+                    child.bind("<Button-1>", lambda e, j=idx: self._on_sub_click(j))
+
+            self._update_scroll_height()
+
+        def _populate_trans_submenu(self) -> None:
+            """Show the language picker."""
+            self._sub_items = _TRANS_LANGS
+            self._sub_selected = 0
+
+            # Back header
+            back = tk.Frame(self._inner_frame, bg=self.SEARCH_BG, cursor="hand2")
+            back.pack(fill="x", padx=2, pady=1)
+            self._row_widgets.append(back)
+            tk.Label(back, text="\u2190 back   Translate to...", bg=self.SEARCH_BG,
+                     fg=self.FG, font=self._font_bold, anchor="w", padx=8, pady=4
+                     ).pack(fill="x")
+            back.bind("<Button-1>", lambda e: self._back_to_main())
+            for child in back.winfo_children():
+                child.bind("<Button-1>", lambda e: self._back_to_main())
+
+            for i, (lang_name, code, flag) in enumerate(self._sub_items):
+                row = tk.Frame(self._inner_frame, bg=self.BG_ROW, cursor="hand2")
+                row.pack(fill="x", padx=2, pady=1)
+                self._row_widgets.append(row)
+
+                tk.Label(row, text=f"  {lang_name}", bg=self.BG_ROW, fg=self.FG,
+                         font=self._font, anchor="w", padx=8, pady=3).pack(side="left", fill="x", expand=True)
+                tk.Label(row, text=flag, bg=self.BG_ROW, font=self._font,
+                         padx=8).pack(side="right")
+
+                if i == self._sub_selected:
+                    self._set_row_bg(row, self.BG_SELECTED)
+
+                idx = i
+                row.bind("<Enter>", lambda e, r=row, j=idx: self._on_sub_hover(r, j))
+                row.bind("<Leave>", lambda e, r=row, j=idx: self._on_sub_leave(r, j))
+                row.bind("<Button-1>", lambda e, j=idx: self._on_sub_click(j))
+                for child in row.winfo_children():
+                    child.bind("<Enter>", lambda e, r=row, j=idx: self._on_sub_hover(r, j))
+                    child.bind("<Leave>", lambda e, r=row, j=idx: self._on_sub_leave(r, j))
+                    child.bind("<Button-1>", lambda e, j=idx: self._on_sub_click(j))
+
+            # Custom entry row
+            custom_row = tk.Frame(self._inner_frame, bg=self.BG_ROW)
+            custom_row.pack(fill="x", padx=2, pady=1)
+            self._row_widgets.append(custom_row)
+            tk.Label(custom_row, text="  + custom:", bg=self.BG_ROW, fg=self.FG_DIM,
+                     font=self._font_small, padx=8).pack(side="left")
+            self._custom_entry = tk.Entry(custom_row, bg=self.SEARCH_BG, fg=self.FG,
+                                          insertbackground=self.FG, font=self._font_small,
+                                          relief="flat", width=10)
+            self._custom_entry.pack(side="left", padx=4, pady=2)
+            self._custom_entry.bind("<Return>", self._on_custom_lang)
+
+            self._update_scroll_height()
+
+        def _update_scroll_height(self) -> None:
+            """Update canvas scroll region and window height."""
+            self._root.update_idletasks()
+            content_h = self._inner_frame.winfo_reqheight()
+            canvas_h = min(content_h, self.MAX_HEIGHT - 80)  # Leave room for preview+search
+            self._canvas.configure(height=canvas_h)
+            self._root.update_idletasks()
+            # Reposition if needed
+            w = max(self.MIN_WIDTH, self._root.winfo_reqwidth())
+            h = min(self.MAX_HEIGHT, self._root.winfo_reqheight())
+            self._root.geometry(f"{w}x{h}")
+
+        def _set_row_bg(self, row: tk.Frame, bg: str) -> None:
+            """Set background for a row and all its children."""
+            row.configure(bg=bg)
+            for child in row.winfo_children():
+                try:
+                    child.configure(bg=bg)
+                except tk.TclError:
+                    pass
+
+        # ── Search ──
+        def _on_search(self) -> None:
+            q = self._search_var.get().lower()
+            if not q:
+                self._filtered = list(self._cmd_list)
+            else:
+                self._filtered = [
+                    (name, cmd) for name, cmd in self._cmd_list
+                    if q in name.lower()
+                    or q in cmd.get("description", "").lower()
+                    or any(q in kw.lower() for kw in cmd.get("keywords", []))
+                    or any(q in p.lower() for p in cmd.get("prefixes", []))
+                ]
+            self._selected_idx = 0
+            self._populate_rows()
+
+        # ── Keyboard ──
+        def _on_escape(self, event=None) -> None:
+            if self._submenu:
+                self._back_to_main()
+            else:
+                self._result = None
+                self._root.destroy()
+
+        def _on_enter(self, event=None) -> None:
+            if self._submenu:
+                self._on_sub_click(self._sub_selected)
+            elif self._filtered:
+                self._select_command(self._selected_idx)
+
+        def _on_up(self, event=None) -> None:
+            if self._submenu:
+                count = len(self._sub_items)
+                if count > 0:
+                    self._sub_selected = (self._sub_selected - 1) % count
+                    self._populate_rows()
+            else:
+                if self._filtered:
+                    self._selected_idx = (self._selected_idx - 1) % len(self._filtered)
+                    self._populate_rows()
+                    self._ensure_visible()
+
+        def _on_down(self, event=None) -> None:
+            if self._submenu:
+                count = len(self._sub_items)
+                if count > 0:
+                    self._sub_selected = (self._sub_selected + 1) % count
+                    self._populate_rows()
+            else:
+                if self._filtered:
+                    self._selected_idx = (self._selected_idx + 1) % len(self._filtered)
+                    self._populate_rows()
+                    self._ensure_visible()
+
+        def _on_number_key(self, event) -> None:
+            if self._submenu:
+                return
+            # Only act if search entry is not focused with text
+            idx = int(event.char) - 1
+            if 0 <= idx < len(self._filtered):
+                self._select_command(idx)
+
+        def _on_mousewheel(self, event) -> None:
+            self._canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+        def _on_focus_out(self, event) -> None:
+            # Only close if focus left the root entirely
+            try:
+                if not self._root.focus_get():
+                    self._root.after(100, self._check_focus)
+            except Exception:
+                pass
+
+        def _check_focus(self) -> None:
+            try:
+                if not self._root.focus_get():
+                    self._result = None
+                    self._root.destroy()
+            except Exception:
+                pass
+
+        def _ensure_visible(self) -> None:
+            """Scroll to keep the selected row visible."""
+            if not self._row_widgets or self._selected_idx >= len(self._row_widgets):
+                return
+            widget = self._row_widgets[self._selected_idx]
+            self._canvas.update_idletasks()
+            y = widget.winfo_y()
+            h = widget.winfo_height()
+            canvas_h = self._canvas.winfo_height()
+            visible_top = self._canvas.canvasy(0)
+            visible_bot = visible_top + canvas_h
+            if y < visible_top:
+                self._canvas.yview_moveto(y / self._inner_frame.winfo_height())
+            elif y + h > visible_bot:
+                self._canvas.yview_moveto((y + h - canvas_h) / self._inner_frame.winfo_height())
+
+        # ── Mouse ──
+        def _on_row_hover(self, row, idx) -> None:
+            if idx != self._selected_idx:
+                self._set_row_bg(row, self.BG_HOVER)
+
+        def _on_row_leave(self, row, idx) -> None:
+            if idx != self._selected_idx:
+                self._set_row_bg(row, self.BG_ROW)
+
+        def _on_row_click(self, idx) -> None:
+            self._select_command(idx)
+
+        # ── Sub-menu mouse ──
+        def _on_sub_hover(self, row, idx) -> None:
+            if idx != self._sub_selected:
+                self._set_row_bg(row, self.BG_HOVER)
+
+        def _on_sub_leave(self, row, idx) -> None:
+            if idx != self._sub_selected:
+                self._set_row_bg(row, self.BG_ROW)
+
+        def _on_sub_click(self, idx) -> None:
+            if self._submenu == "tone":
+                style = self._sub_items[idx]
+                cmd_config = self._commands.get("tone", {})
+                # Store result with style prepended to payload
+                self._result = ("tone", cmd_config, f"{style}: {self._text}")
+                self._root.destroy()
+            elif self._submenu == "trans":
+                _, code, _ = self._sub_items[idx]
+                cmd_config = self._commands.get("trans", {})
+                self._result = ("trans", cmd_config, f"{code}: {self._text}")
+                self._root.destroy()
+
+        def _on_custom_lang(self, event=None) -> None:
+            lang = self._custom_entry.get().strip()
+            if lang:
+                cmd_config = self._commands.get("trans", {})
+                self._result = ("trans", cmd_config, f"{lang.upper()}: {self._text}")
+                self._root.destroy()
+
+        def _back_to_main(self) -> None:
+            self._submenu = None
+            self._sub_items = []
+            self._sub_selected = 0
+            self._custom_entry = None
+            self._populate_rows()
+            self._search_entry.focus_set()
+
+        # ── Selection ──
+        def _select_command(self, idx: int) -> None:
+            if idx >= len(self._filtered):
+                return
+            name, cmd = self._filtered[idx]
+
+            # MOCK mode: block LLM commands
+            is_llm = cmd.get("llm_required", False)
+            if is_llm and LLM_MODE == "mock":
+                self._result = None
+                self._root.destroy()
+                return
+
+            # Tone submenu
+            if name == "tone":
+                self._submenu = "tone"
+                self._populate_rows()
+                return
+
+            # Trans submenu
+            if name == "trans":
+                self._submenu = "trans"
+                self._populate_rows()
+                return
+
+            self._result = (name, cmd, self._text)
+            self._root.destroy()
+
+        def run(self) -> tuple | None:
+            """Show the popup and block until a choice is made. Returns (cmd_name, cmd_config, payload) or None."""
+            try:
+                self._root.mainloop()
+            except Exception:
+                return None
+            return self._result
+
+
+def _handle_popup(text: str) -> None:
+    """Show the command picker popup and dispatch the chosen command."""
+    global _popup_trigger
+
+    if not _TKINTER_AVAILABLE:
+        TUI.warn("tkinter not available — cannot show popup")
+        _popup_trigger = "prefix"
+        route(text)
+        return
+
+    commands = CONFIG.get("commands", {})
+    picker = CommandPicker(text, commands)
+    result = picker.run()
+
+    if result is None:
+        # Check if an LLM command was blocked in mock mode
+        TUI.micro_log(f"Command picker cancelled")
+        return
+
+    cmd_name, cmd_config, payload = result
+    is_llm = cmd_config.get("llm_required", False)
+
+    # Mock mode notification for LLM commands
+    if is_llm and LLM_MODE == "mock":
+        notify(APP_NAME, "LLM not configured — enable a provider at startup")
+        TUI.warn("LLM not configured — command not applied")
+        return
+
+    _popup_trigger = "popup"
+    TUI.status("\U0001f3af", f"Popup \u2192 {cmd_name}", TUI.GREEN)
+
+    # Dispatch in a worker thread so we don't block the main loop
+    def _run():
+        try:
+            dispatch(cmd_name, payload, text, cmd_config)
+        except Exception as exc:
+            TUI.error(f"Popup dispatch error: {exc}")
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ============================================================
@@ -872,7 +1462,19 @@ def _replace_selection(new_text: str) -> None:
 # Notification Helper
 # ============================================================
 
-def notify(title: str, message: str) -> None:
+def _should_notify(is_error: bool = False) -> bool:
+    """Check if a notification should be sent based on _current_notify_level."""
+    level = _current_notify_level
+    if level == "never":
+        return False
+    if level == "errors_only" and not is_error:
+        return False
+    return True
+
+
+def notify(title: str, message: str, is_error: bool = False) -> None:
+    if not _should_notify(is_error=is_error):
+        return
     try:
         if platform.system() == "Linux":
             _run_as_user(
@@ -918,18 +1520,20 @@ def _do_undo() -> None:
             entry = _undo_stack.pop()
 
         TUI.separator()
-        TUI.action("↩", "UNDO", "Sending native Ctrl+Z")
-        keyboard.send("ctrl+z")
+        TUI.action("↩", "UNDO", "Restoring previous clipboard")
+        clipboard_copy(entry["original"])
+        time.sleep(CLIPBOARD_DELAY)
+        keyboard.send("ctrl+v")
 
         truncated = entry["original"][:50] + ("..." if len(entry["original"]) > 50 else "")
-        TUI.success(f"Undone — original was: \"{truncated}\"")
+        TUI.success(f"Undone — restored: \"{truncated}\"")
         with _undo_lock:
             remaining = len(_undo_stack)
         if remaining == 0:
             TUI.micro_log(f"Undo applied — stack {TUI.DIM}empty{TUI.RESET}")
         else:
             TUI.micro_log(f"Undo applied — stack {TUI.YELLOW}×{remaining}{TUI.RESET} remaining")
-        notify("Undo", "Reverted last replacement")
+        notify("Undo", "Undone · restored previous text")
 
     except Exception as exc:
         TUI.error(f"Undo error: {exc}")
@@ -1049,8 +1653,9 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict) -> None:
 
 
 def handle_fmt(text: str, full_text: str, cmd_config: dict) -> None:
-    """Auto-format JSON text with indentation."""
+    """Auto-format JSON or XML text with indentation."""
     content = text.strip()
+    # Try JSON first
     try:
         parsed = json.loads(content)
         result = json.dumps(parsed, indent=2, ensure_ascii=False)
@@ -1060,9 +1665,31 @@ def handle_fmt(text: str, full_text: str, cmd_config: dict) -> None:
 
         TUI.action("🔧", "FMT", f"Formatted JSON ({len(content)} → {len(result)} chars)")
         notify("Format", "JSON formatted successfully")
-    except json.JSONDecodeError as exc:
-        TUI.error(f"FMT: invalid JSON — {exc}")
-        notify("Format Error", f"FMT: invalid JSON — {exc}")
+        return
+    except json.JSONDecodeError:
+        pass
+
+    # Try XML
+    try:
+        import xml.dom.minidom
+        dom = xml.dom.minidom.parseString(content)
+        result = dom.toprettyxml(indent="  ")
+        # Remove the XML declaration if it wasn't in the original
+        if not content.strip().startswith("<?xml"):
+            result = "\n".join(result.split("\n")[1:])
+        result = result.strip()
+
+        _push_undo(full_text, result)
+        _replace_selection(result)
+
+        TUI.action("🔧", "FMT", f"Formatted XML ({len(content)} → {len(result)} chars)")
+        notify("Format", "XML formatted successfully")
+        return
+    except Exception:
+        pass
+
+    TUI.error("FMT: could not parse as JSON or XML")
+    notify("Format Error", "FMT: could not parse as JSON or XML")
 
 
 def handle_count(text: str, full_text: str, cmd_config: dict) -> None:
@@ -1071,8 +1698,9 @@ def handle_count(text: str, full_text: str, cmd_config: dict) -> None:
     words = len(content.split())
     chars = len(content)
     lines = content.count('\n') + 1
+    reading_min = max(1, round(words / 200))
 
-    stats = f"Words: {words} | Chars: {chars} | Lines: {lines}"
+    stats = f"Words: {words} | Chars: {chars} | Lines: {lines} | Reading time: ~{reading_min} min"
     TUI.action("📊", "COUNT", stats)
     notify("Text Stats", stats)
 
@@ -1131,7 +1759,333 @@ def handle_hash(text: str, full_text: str, cmd_config: dict) -> None:
     notify("SHA256", digest)
 
 
-import re as _re
+# ── PII patterns for REDACT ──
+_PII_PATTERNS = [
+    (_re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"), "[EMAIL]"),
+    (_re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"), "[CARD]"),
+    (_re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)?\d{3,4}[-.\s]?\d{4}\b"), "[PHONE]"),
+    (_re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[IP]"),
+]
+
+
+def handle_redact(text: str, full_text: str, cmd_config: dict) -> None:
+    """PII masking — regex-based, replaces emails, phones, cards, IPs with placeholders."""
+    result = text.strip()
+    count = 0
+    for pattern, placeholder in _PII_PATTERNS:
+        matches = pattern.findall(result)
+        count += len(matches)
+        result = pattern.sub(placeholder, result)
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+
+    TUI.action("🔒", "REDACT", f"Masked {count} PII item(s)")
+    notify("Redact", f"Masked {count} PII item(s)")
+
+
+# ── Safe math patterns for CALC ──
+_CALC_NATURAL = [
+    (_re.compile(r"(\d+(?:\.\d+)?)\s*%\s*of\s*(\d+(?:\.\d+)?)"), lambda m: str(float(m.group(1)) / 100 * float(m.group(2)))),
+    (_re.compile(r"sqrt\((\d+(?:\.\d+)?)\)"), lambda m: str(math.sqrt(float(m.group(1))))),
+    (_re.compile(r"(\d+(?:\.\d+)?)\s*\*\*\s*(\d+(?:\.\d+)?)"), lambda m: str(float(m.group(1)) ** float(m.group(2)))),
+]
+
+
+def _safe_eval_math(expr: str) -> str | None:
+    """Safely evaluate a math expression using ast. Returns result string or None."""
+    # First try natural language patterns
+    for pattern, fn in _CALC_NATURAL:
+        m = pattern.search(expr)
+        if m:
+            try:
+                result = fn(m)
+                # Format: strip trailing zeros
+                f = float(result)
+                return str(int(f)) if f == int(f) else str(f)
+            except Exception:
+                pass
+
+    # Clean the expression: keep only math chars
+    cleaned = _re.sub(r"[^0-9+\-*/().%^ ]", "", expr)
+    cleaned = cleaned.replace("^", "**")
+    if not cleaned.strip():
+        return None
+
+    try:
+        # Parse as AST and validate — only allow math operations
+        tree = ast.parse(cleaned, mode='eval')
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+                                 ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow,
+                                 ast.Mod, ast.FloorDiv, ast.USub, ast.UAdd)):
+                continue
+            return None  # Unsafe node type
+        result = eval(compile(tree, "<calc>", "eval"))
+        f = float(result)
+        return str(int(f)) if f == int(f) else str(round(f, 10))
+    except Exception:
+        return None
+
+
+def handle_calc(text: str, full_text: str, cmd_config: dict) -> None:
+    """Safe math expression evaluator."""
+    content = text.strip()
+    result = _safe_eval_math(content)
+
+    if result is None:
+        TUI.error(f"CALC: could not evaluate \"{content[:60]}\"")
+        notify("Calc Error", f"Could not evaluate: {content[:60]}")
+        return
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+
+    TUI.action("🧮", "CALC", f"\"{content[:40]}\" = {result}")
+    notify("Calculator", f"{content[:40]} = {result}")
+
+
+def handle_date(text: str, full_text: str, cmd_config: dict) -> None:
+    """Natural language date parser → ISO format."""
+    content = text.strip()
+    try:
+        import dateparser
+        parsed = dateparser.parse(content)
+        if parsed is None:
+            TUI.error(f"DATE: could not parse \"{content[:60]}\"")
+            notify("Date Error", f"Could not parse: {content[:60]}")
+            return
+
+        result = parsed.strftime("%Y-%m-%d")
+        _push_undo(full_text, result)
+        _replace_selection(result)
+
+        TUI.action("📅", "DATE", f"\"{content}\" → {result}")
+        notify("Date", f"{content} → {result}")
+    except ImportError:
+        TUI.error("DATE: dateparser not installed — run: pip install dateparser")
+        notify("Date Error", "dateparser library not installed")
+
+
+def handle_escape(text: str, full_text: str, cmd_config: dict) -> None:
+    """Escape special characters. Auto-detects context or uses explicit mode prefix."""
+    content = text.strip()
+    mode = None
+
+    # Check for explicit mode prefix: html:, sql:, regex:
+    for prefix in ("html:", "sql:", "regex:"):
+        if content.lower().startswith(prefix):
+            mode = prefix[:-1]
+            content = content[len(prefix):].strip()
+            break
+
+    if mode is None:
+        # Auto-detect context
+        if "<" in content and ">" in content:
+            mode = "html"
+        elif "'" in content or ";" in content:
+            mode = "sql"
+        else:
+            mode = "regex"
+
+    if mode == "html":
+        import html
+        result = html.escape(content)
+    elif mode == "sql":
+        result = content.replace("'", "''").replace(";", "")
+    elif mode == "regex":
+        result = _re.escape(content)
+    else:
+        result = content
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+
+    TUI.action("🛡", "ESCAPE", f"[{mode}] {len(content)} chars escaped")
+    notify("Escape", f"Escaped as {mode}: {result[:80]}")
+
+
+def handle_sanitize(text: str, full_text: str, cmd_config: dict) -> None:
+    """Strip unwanted formatting: HTML tags, markdown syntax, ANSI codes."""
+    content = text.strip()
+
+    # Strip ANSI escape codes
+    result = _re.sub(r"\033\[[0-9;]*m", "", content)
+
+    # Strip HTML tags
+    if _re.search(r"<[a-zA-Z/][^>]*>", result):
+        result = _re.sub(r"<[^>]+>", "", result)
+        # Decode HTML entities
+        import html
+        result = html.unescape(result)
+
+    # Strip markdown syntax
+    result = _re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", result)  # images
+    result = _re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", result)   # links
+    result = _re.sub(r"#{1,6}\s*", "", result)                   # headings
+    result = _re.sub(r"\*\*(.+?)\*\*", r"\1", result)           # bold
+    result = _re.sub(r"\*(.+?)\*", r"\1", result)               # italic
+    result = _re.sub(r"`(.+?)`", r"\1", result)                 # inline code
+    result = _re.sub(r"^[-*+]\s+", "", result, flags=_re.MULTILINE)  # list markers
+    result = _re.sub(r"^\d+\.\s+", "", result, flags=_re.MULTILINE)  # numbered lists
+    result = _re.sub(r"^>\s*", "", result, flags=_re.MULTILINE)      # blockquotes
+
+    result = result.strip()
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+
+    TUI.action("🧹", "SANITIZE", f"Stripped formatting ({len(content)} → {len(result)} chars)")
+    notify("Sanitize", f"Stripped to plain text ({len(result)} chars)")
+
+
+def handle_password(text: str, full_text: str, cmd_config: dict) -> None:
+    """Generate a strong random password."""
+    pw_cfg = cmd_config.get("password_config", {})
+    length = pw_cfg.get("length", 20)
+    charset = string.ascii_letters + string.digits + string.punctuation
+
+    password = "".join(secrets.choice(charset) for _ in range(length))
+
+    _push_undo(full_text, password)
+    _replace_selection(password)
+
+    preview = password[:4] + "..."
+    TUI.action("🔑", "PASSWORD", f"Generated {length}-char password ({preview})")
+    notify("Password", f"Generated: {preview} ({length} chars)")
+
+
+def handle_repeat(text: str, full_text: str, cmd_config: dict) -> None:
+    """Re-run the last command on the current selection."""
+    if _last_command is None:
+        TUI.error("REPEAT: no previous command to repeat")
+        notify("Repeat Error", "No previous command to repeat")
+        return
+
+    cmd_name = _last_command["name"]
+    last_config = _last_command["config"]
+    TUI.status("🔁", f"Repeating: {cmd_name}", TUI.CYAN)
+    dispatch(cmd_name, text.strip(), full_text, last_config)
+
+
+def handle_clip(text: str, full_text: str, cmd_config: dict) -> None:
+    """Named clipboard slots: save/load/list."""
+    content = text.strip()
+
+    # Parse sub-command
+    parts = content.split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    # Load existing clips
+    clips = {}
+    if _CLIPS_PATH.exists():
+        try:
+            clips = json.loads(_CLIPS_PATH.read_text())
+        except Exception:
+            pass
+
+    if sub == "save" and arg:
+        current = clipboard_paste()
+        clips[arg] = current
+        _CLIPS_PATH.write_text(json.dumps(clips, ensure_ascii=False, indent=2))
+        TUI.action("📌", "CLIP:SAVE", f"Saved slot \"{arg}\" ({len(current)} chars)")
+        notify("Clip Save", f"Saved to slot \"{arg}\"")
+
+    elif sub == "load" and arg:
+        if arg not in clips:
+            TUI.error(f"CLIP: slot \"{arg}\" not found")
+            notify("Clip Error", f"Slot \"{arg}\" not found")
+            return
+        clipboard_copy(clips[arg])
+        TUI.action("📋", "CLIP:LOAD", f"Loaded slot \"{arg}\" ({len(clips[arg])} chars)")
+        notify("Clip Load", f"Loaded \"{arg}\": {clips[arg][:60]}")
+
+    elif sub == "list":
+        if not clips:
+            TUI.warn("CLIP: no saved slots")
+            notify("Clip List", "No saved slots")
+        else:
+            slot_list = ", ".join(f"{k} ({len(v)} chars)" for k, v in clips.items())
+            TUI.action("📋", "CLIP:LIST", slot_list)
+            notify("Clip Slots", slot_list[:200])
+
+    else:
+        TUI.error("CLIP: use save <name>, load <name>, or list")
+        notify("Clip Error", "Usage: CLIP:save <name> | CLIP:load <name> | CLIP:list")
+
+
+def handle_stack(text: str, full_text: str, cmd_config: dict) -> None:
+    """Push current clipboard onto the stack."""
+    current = clipboard_paste()
+    _clipboard_stack.append(current)
+    depth = len(_clipboard_stack)
+
+    TUI.action("📥", "STACK", f"Pushed · stack depth: {depth}")
+    notify("Stack", f"Pushed · stack depth: {depth}")
+
+
+def handle_pop(text: str, full_text: str, cmd_config: dict) -> None:
+    """Pop top item from clipboard stack and restore to clipboard."""
+    if not _clipboard_stack:
+        TUI.error("POP: clipboard stack is empty")
+        notify("Pop Error", "Clipboard stack is empty")
+        return
+
+    item = _clipboard_stack.pop()
+    clipboard_copy(item)
+    depth = len(_clipboard_stack)
+
+    preview = item[:60] + ("..." if len(item) > 60 else "")
+    TUI.action("📤", "POP", f"Restored \"{preview}\" · stack depth: {depth}")
+    notify("Pop", f"Restored · stack depth: {depth}")
+
+
+_TONE_STYLE_RE = _re.compile(r"^([a-zA-Z]+):\s*")
+
+def handle_tone(text: str, full_text: str, cmd_config: dict) -> None:
+    """Dynamic tone rewriting. Expects payload like 'casual: some text here'."""
+    m = _TONE_STYLE_RE.match(text)
+    if not m:
+        TUI.error("TONE requires a style, e.g. TONE:casual: hello world")
+        notify("Tone Error", "Missing style — use TONE:<style>: text")
+        return
+
+    style = m.group(1).lower()
+    body = text[m.end():].strip()
+    if not body:
+        TUI.error("TONE: no text to rewrite")
+        notify("Tone Error", "No text provided after style")
+        return
+
+    # Mock mode
+    if LLM_MODE == "mock":
+        result = f"[MOCK] TONE→{style}: (LLM not configured)"
+        _push_undo(full_text, result)
+        _replace_selection(result)
+        TUI.action("🎨", f"TONE→{style}", f"\"{result}\" [mock]")
+        notify(f"Tone ({style})", result)
+        return
+
+    prompt = (
+        f"Rewrite the following text in a {style} tone. "
+        f"Return ONLY the rewritten text, nothing else:\n\n{body}"
+    )
+    cmd_model = cmd_config.get("model", "")
+
+    TUI.status("🎨", f"Rewriting in {style} tone...", TUI.CYAN)
+    notify(APP_NAME, f"Rewriting in {style} tone...")
+
+    result = _llm_call(prompt, model=cmd_model)
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+
+    truncated = result[:80] + ("..." if len(result) > 80 else "")
+    provider_tag = f" [{_last_llm_provider_used}]" if _last_llm_provider_used else ""
+    TUI.action("🎨", f"TONE→{style}", f"\"{truncated}\"{provider_tag}")
+    notify(f"Tone ({style})", truncated)
+
 
 _TRANS_LANG_RE = _re.compile(r"^([A-Za-z]{2,10}):\s*")
 
@@ -1177,6 +2131,99 @@ def handle_trans(text: str, full_text: str, cmd_config: dict) -> None:
     notify(f"Translated ({lang_code})", truncated)
 
 
+# ============================================================
+# WIKI / DEFINE — Web Lookup Commands
+# ============================================================
+
+def handle_wiki(text: str, full_text: str, cmd_config: dict) -> None:
+    """Wikipedia lookup — fetches first paragraph, shows as notification only."""
+    query = text.strip()
+    if not query:
+        TUI.error("WIKI: no search term provided")
+        notify("Wiki Error", "No search term provided", is_error=True)
+        return
+
+    try:
+        encoded = urllib.parse.quote(query)
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}"
+        req = urllib.request.Request(url, headers={"User-Agent": "WatashiGPT/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        extract = data.get("extract", "")
+        title = data.get("title", query)
+
+        if not extract:
+            TUI.warn(f"WIKI: no results for \"{query}\"")
+            notify("Wikipedia", f"No results for \"{query}\"")
+            return
+
+        # Truncate for notification (max ~300 chars)
+        summary = extract[:300] + ("..." if len(extract) > 300 else "")
+        TUI.action("📖", "WIKI", f"{title}: {summary[:80]}...")
+        notify(f"Wikipedia: {title}", summary)
+
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            TUI.warn(f"WIKI: no article found for \"{query}\"")
+            notify("Wikipedia", f"No article found for \"{query}\"")
+        else:
+            TUI.error(f"WIKI: HTTP {exc.code}")
+            notify("Wiki Error", f"HTTP error: {exc.code}", is_error=True)
+    except Exception as exc:
+        TUI.error(f"WIKI: {exc}")
+        notify("Wiki Error", str(exc)[:100], is_error=True)
+
+
+def handle_define(text: str, full_text: str, cmd_config: dict) -> None:
+    """Dictionary lookup — fetches definition, shows as notification only."""
+    word = text.strip().split()[0] if text.strip() else ""
+    if not word:
+        TUI.error("DEFINE: no word provided")
+        notify("Define Error", "No word provided", is_error=True)
+        return
+
+    try:
+        encoded = urllib.parse.quote(word.lower())
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{encoded}"
+        req = urllib.request.Request(url, headers={"User-Agent": "WatashiGPT/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        if not data or not isinstance(data, list):
+            TUI.warn(f"DEFINE: no definition for \"{word}\"")
+            notify("Dictionary", f"No definition for \"{word}\"")
+            return
+
+        entry = data[0]
+        meanings = entry.get("meanings", [])
+        if not meanings:
+            TUI.warn(f"DEFINE: no meanings for \"{word}\"")
+            notify("Dictionary", f"No meanings found for \"{word}\"")
+            return
+
+        # Build definition text from first meaning
+        first = meanings[0]
+        part_of_speech = first.get("partOfSpeech", "")
+        definitions = first.get("definitions", [])
+        defn = definitions[0].get("definition", "") if definitions else "(no definition)"
+
+        result = f"({part_of_speech}) {defn}" if part_of_speech else defn
+        TUI.action("📚", "DEFINE", f"{word}: {result[:80]}")
+        notify(f"Define: {word}", result[:300])
+
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            TUI.warn(f"DEFINE: word \"{word}\" not found")
+            notify("Dictionary", f"Word \"{word}\" not found")
+        else:
+            TUI.error(f"DEFINE: HTTP {exc.code}")
+            notify("Define Error", f"HTTP error: {exc.code}", is_error=True)
+    except Exception as exc:
+        TUI.error(f"DEFINE: {exc}")
+        notify("Define Error", str(exc)[:100], is_error=True)
+
+
 # Map of built-in command names → handler functions
 _BUILTIN_HANDLERS = {
     "translate": handle_translate,
@@ -1188,7 +2235,20 @@ _BUILTIN_HANDLERS = {
     "b64": handle_b64,
     "decode": handle_decode,
     "hash": handle_hash,
+    "redact": handle_redact,
+    "calc": handle_calc,
+    "date": handle_date,
+    "escape": handle_escape,
+    "sanitize": handle_sanitize,
+    "password": handle_password,
+    "repeat": handle_repeat,
+    "clip": handle_clip,
+    "stack": handle_stack,
+    "pop": handle_pop,
+    "tone": handle_tone,
     "trans": handle_trans,
+    "wiki": handle_wiki,
+    "define": handle_define,
 }
 
 
@@ -1202,12 +2262,14 @@ _HISTORY_PATH = Path.home() / ".watashigpt_history.jsonl"
 def _log_history(command: str, input_text: str, output_text: str, duration_ms: int) -> None:
     """Append a JSON line to ~/.watashigpt_history.jsonl."""
     try:
+        provider = _last_llm_provider_used or _llm_provider or "builtin"
         entry = json.dumps({
             "ts": datetime.now().isoformat(timespec="seconds"),
             "command": command,
             "input": input_text[:500],
             "output": output_text[:500],
             "duration_ms": duration_ms,
+            "provider": provider,
         }, ensure_ascii=False)
         with open(_HISTORY_PATH, "a") as f:
             f.write(entry + "\n")
@@ -1221,8 +2283,17 @@ def _log_history(command: str, input_text: str, output_text: str, duration_ms: i
 
 def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> None:
     """Dispatch to the correct handler for a matched command."""
+    global _last_command, _current_notify_level
+
+    # Set per-command notification level (always | errors_only | never)
+    _current_notify_level = cmd_config.get("notify", "always")
+
     with _usage_lock:
         _usage_counts[cmd_name] = _usage_counts.get(cmd_name, 0) + 1
+
+    # Track for REPEAT (don't track repeat itself)
+    if cmd_name != "repeat":
+        _last_command = {"name": cmd_name, "config": cmd_config}
 
     is_llm = cmd_config.get("llm_required", False) or cmd_name not in _BUILTIN_HANDLERS
     start_time = time.time()
@@ -1238,12 +2309,14 @@ def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> N
         duration = time.time() - start_time
         with _undo_lock:
             output = _undo_stack[-1]["replacement"] if _undo_stack else "(done)"
-        TUI.activity_entry(cmd_name, payload, output, duration, is_llm=is_llm)
+        TUI.activity_entry(cmd_name, payload, output, duration, is_llm=is_llm,
+                           trigger=_popup_trigger)
         _log_history(cmd_name, payload, output, int(duration * 1000))
 
     except Exception as exc:
         duration = time.time() - start_time
-        TUI.activity_entry(cmd_name, payload, str(exc), duration, is_error=True)
+        TUI.activity_entry(cmd_name, payload, str(exc), duration, is_error=True,
+                           trigger=_popup_trigger)
         _log_history(cmd_name, payload, f"ERROR: {exc}", int(duration * 1000))
         raise
 
@@ -1393,8 +2466,21 @@ def route(text: str) -> None:
         TUI.status("🤖", "No prefix/keyword match — asking LLM to classify...", TUI.CYAN)
         intent = _llm_classify(text, commands)
         if intent:
+            confidence = intent.get("confidence", 1.0)
+            threshold = CONFIG.get("confidence_threshold", 0.7)
+            if confidence < threshold:
+                TUI.warn(
+                    f"LLM classified as '{intent['name']}' but confidence {confidence:.2f} "
+                    f"< threshold {threshold:.2f} — skipping"
+                )
+                notify(
+                    APP_NAME,
+                    f"Low confidence ({confidence:.0%}) on '{intent['name']}' — not applied. "
+                    f"Use the prefix directly to force.",
+                )
+                return
             cmd = commands[intent["name"]]
-            TUI.status("🤖", f"LLM classified: → {intent['name']}", TUI.GREEN)
+            TUI.status("🤖", f"LLM classified: → {intent['name']} (confidence {confidence:.2f})", TUI.GREEN)
             dispatch(intent["name"], intent["payload"], text, cmd)
             return
 
@@ -1439,6 +2525,29 @@ def _do_intercept() -> None:
 
         truncated = text[:60] + ("..." if len(text) > 60 else "")
         TUI.action("📋", "CAPTURED", f"\"{truncated}\"")
+
+        interaction_mode = CONFIG.get("interaction_mode", "both")
+        commands = CONFIG.get("commands", {})
+
+        # If prefix/both mode and text has a known prefix or chain → route directly
+        if interaction_mode in ("prefix", "both"):
+            if _resolve_prefix(text, commands) or _parse_chain(text, commands):
+                global _popup_trigger
+                _popup_trigger = "prefix"
+                route(text)
+                return
+
+        # If popup/both mode and tkinter available → queue for main thread popup
+        if interaction_mode in ("popup", "both"):
+            if _TKINTER_AVAILABLE:
+                _popup_queue.put(text)
+                TUI.micro_log(f"Opening command picker...")
+                return
+            else:
+                TUI.warn("tkinter unavailable — falling back to prefix routing")
+
+        # Fallback: route normally (keyword/LLM classification)
+        _popup_trigger = "prefix"
         route(text)
 
     except Exception as exc:
@@ -1638,6 +2747,9 @@ def main(keep_banner: bool = False) -> None:
     # Start config hot-reload watcher
     _start_config_watcher()
 
+    # Background auto-update check
+    threading.Thread(target=_check_for_updates, daemon=True).start()
+
     # Register hotkeys
     keyboard.add_hotkey(HOTKEY, on_hotkey_triggered)
     keyboard.add_hotkey(UNDO_HOTKEY, on_undo_triggered)
@@ -1661,7 +2773,7 @@ def main(keep_banner: bool = False) -> None:
         tty.setcbreak(fd)
         try:
             while not _exit_event.is_set():
-                if select.select([sys.stdin], [], [], 1.0)[0]:
+                if select.select([sys.stdin], [], [], 0.1)[0]:
                     ch = sys.stdin.read(1)
                     if ch == '\x03':  # Ctrl+C
                         break
@@ -1669,6 +2781,17 @@ def main(keep_banner: bool = False) -> None:
                         _command_search()
                     elif ch in ('S', 's'):
                         _session_export()
+
+                # Check popup queue
+                try:
+                    popup_text = _popup_queue.get_nowait()
+                    # Restore terminal for tkinter
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    _handle_popup(popup_text)
+                    # Restore cbreak
+                    tty.setcbreak(fd)
+                except queue.Empty:
+                    pass
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     except KeyboardInterrupt:
@@ -1678,6 +2801,111 @@ def main(keep_banner: bool = False) -> None:
     TUI.separator()
     TUI.status("👋", "Shutting down. Goodbye!", TUI.MAGENTA)
     notify(APP_NAME, "Shutting down. Goodbye!")
+
+
+# ============================================================
+# Auto-Update Checker
+# ============================================================
+
+def _check_for_updates() -> None:
+    """Silently check GitHub releases for a newer version tag. Runs in background thread."""
+    try:
+        url = "https://api.github.com/repos/azimxxd/watashigpt/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "WatashiGPT"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        latest_tag = data.get("tag_name", "").lstrip("v")
+        current = __version__.lstrip("v")
+        if latest_tag and latest_tag != current:
+            # Simple version comparison
+            try:
+                latest_parts = [int(x) for x in latest_tag.split(".")]
+                current_parts = [int(x) for x in current.split(".")]
+                if latest_parts > current_parts:
+                    TUI.micro_log(
+                        f"{TUI.YELLOW}Update available: v{current} → v{latest_tag} "
+                        f"(run git pull){TUI.RESET}"
+                    )
+            except (ValueError, TypeError):
+                pass
+    except Exception:
+        pass  # Silent on any failure
+
+
+
+
+
+# ============================================================
+# History CLI Browser
+# ============================================================
+
+def show_history(grep_filter: str | None = None) -> None:
+    """Print last 50 history entries as a formatted table. Optionally filter by command."""
+    history_path = Path.home() / ".watashigpt_history.jsonl"
+    if not history_path.exists():
+        print(f"{TUI.YELLOW}No history file found at {history_path}{TUI.RESET}")
+        return
+
+    entries = []
+    try:
+        with open(history_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if grep_filter:
+                        cmd = entry.get("command", "")
+                        if grep_filter.lower() not in cmd.lower():
+                            continue
+                    entries.append(entry)
+                except json.JSONDecodeError:
+                    continue
+    except Exception as exc:
+        print(f"{TUI.RED}Error reading history: {exc}{TUI.RESET}")
+        return
+
+    # Take last 50
+    entries = entries[-50:]
+
+    if not entries:
+        label = f" matching \"{grep_filter}\"" if grep_filter else ""
+        print(f"{TUI.YELLOW}No history entries found{label}.{TUI.RESET}")
+        return
+
+    # Print header
+    print()
+    print(f"  {TUI.BOLD}{TUI.CYAN}{'Timestamp':<22} {'Command':<12} {'Input':<30} {'Output':<30} {'ms':>6} {'Provider':<15}{TUI.RESET}")
+    print(f"  {TUI.DIM}{'─' * 115}{TUI.RESET}")
+
+    for e in entries:
+        ts = e.get("ts", "?")[:19]
+        cmd = e.get("command", "?")[:10]
+        inp = e.get("input", "")[:28]
+        out = e.get("output", "")[:28]
+        dur = e.get("duration_ms", 0)
+        prov = e.get("provider", "?")[:13]
+
+        # Color code by command type
+        is_err = out.startswith("ERROR:")
+        if is_err:
+            color = TUI.RED
+        else:
+            color = TUI.CYAN
+
+        print(
+            f"  {TUI.DIM}{ts:<22}{TUI.RESET} "
+            f"{color}{TUI.BOLD}{cmd:<12}{TUI.RESET} "
+            f"{TUI.DIM}{inp:<30} {out:<30}{TUI.RESET} "
+            f"{TUI.DIM}{dur:>6}{TUI.RESET} "
+            f"{TUI.DIM}{prov:<15}{TUI.RESET}"
+        )
+
+    print()
+    label = f" (filtered: {grep_filter})" if grep_filter else ""
+    print(f"  {TUI.DIM}{len(entries)} entries{label}{TUI.RESET}")
+    print()
 
 
 def install_systemd_service() -> None:
@@ -1731,9 +2959,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WatashiGPT Action Middleware")
     parser.add_argument("--install", action="store_true", help="Install as a systemd service")
     parser.add_argument("--banner", action="store_true", help="Keep the full ASCII banner permanently")
+    parser.add_argument("--history", action="store_true", help="Browse last 50 history entries")
+    parser.add_argument("--grep", type=str, default=None, help="Filter history by command name (use with --history)")
     args = parser.parse_args()
 
     if args.install:
         install_systemd_service()
+    elif args.history:
+        show_history(grep_filter=args.grep)
     else:
         main(keep_banner=args.banner)
