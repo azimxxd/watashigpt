@@ -34,6 +34,7 @@ import math
 import ast
 import secrets
 import string
+from dataclasses import dataclass
 
 try:
     import tkinter as tk
@@ -145,6 +146,396 @@ _CLIPS_PATH = Path.home() / ".watashigpt_clips.json"
 
 _popup_queue: queue.Queue = queue.Queue()  # Hotkey thread → main thread for popup
 _popup_trigger: str = "prefix"  # Set per-dispatch: "prefix" or "popup"
+
+_current_app_context = None   # AppContext instance, set per-intercept
+_current_text_analysis = None  # TextAnalysis instance, set per-intercept
+_pattern_learner = None       # PatternLearner instance, initialized in main()
+
+_silent_mode: bool = False
+_silent_mode_lock = threading.Lock()
+
+
+_tray_icon = None  # pystray icon, set in _start_tray()
+
+
+def _update_tray_color(color: str) -> None:
+    """Update tray icon color. No-op if tray not running."""
+    if _tray_icon is None:
+        return
+    try:
+        _tray_icon.icon = _create_tray_icon_image(color)
+    except Exception:
+        pass
+
+
+# ============================================================
+# Context — Active Window Detection
+# ============================================================
+
+class AppContext:
+    """Detected context of the active application window."""
+    TERMINAL = "terminal"
+    BROWSER  = "browser"
+    IDE      = "ide"
+    CHAT     = "chat"
+    DOCS     = "docs"
+    UNKNOWN  = "unknown"
+
+    APP_PATTERNS = {
+        "terminal": ["terminal", "konsole", "alacritty", "kitty", "wezterm",
+                      "gnome-terminal", "xterm", "foot", "tilix", "tmux"],
+        "browser":  ["firefox", "chrome", "chromium", "brave", "vivaldi",
+                      "edge", "safari", "opera", "zen browser"],
+        "ide":      ["code", "vscode", "jetbrains", "intellij", "pycharm",
+                      "webstorm", "clion", "rider", "neovim", "nvim", "vim",
+                      "emacs", "sublime", "zed", "cursor", "lapce"],
+        "chat":     ["slack", "discord", "telegram", "teams", "signal",
+                      "whatsapp", "element"],
+        "docs":     ["libreoffice", "google docs", "notion", "obsidian",
+                      "logseq", "typora", "marktext", "writer", "word"],
+    }
+
+    def __init__(self, context_type: str = "unknown", window_title: str = "",
+                 app_name: str = ""):
+        self.context_type = context_type
+        self.window_title = window_title
+        self.app_name = app_name
+
+    def __repr__(self) -> str:
+        return f"AppContext({self.context_type}, app={self.app_name})"
+
+
+def _find_focused_sway(node: dict) -> dict | None:
+    """Recursively find the focused node in a sway tree."""
+    if node.get("focused"):
+        return node
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        result = _find_focused_sway(child)
+        if result:
+            return result
+    return None
+
+
+def detect_active_window() -> AppContext:
+    """Detect the currently focused window. Uses xdotool (X11) or kdotool/swaymsg (Wayland)."""
+    title = ""
+    try:
+        if _IS_WAYLAND:
+            # Try kdotool (KDE Wayland)
+            try:
+                proc = _run_as_user(["kdotool", "getactivewindow", "getwindowname"],
+                                    capture_output=True, text=True, timeout=2)
+                if proc.returncode == 0:
+                    title = proc.stdout.strip().lower()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                # Try swaymsg (Sway)
+                try:
+                    proc = _run_as_user(["swaymsg", "-t", "get_tree"],
+                                        capture_output=True, text=True, timeout=2)
+                    if proc.returncode == 0:
+                        tree = json.loads(proc.stdout)
+                        focused = _find_focused_sway(tree)
+                        if focused:
+                            title = (focused.get("name", "") or
+                                     focused.get("app_id", "")).lower()
+                except Exception:
+                    pass
+        else:
+            # X11: xdotool
+            try:
+                proc = _run_as_user(["xdotool", "getactivewindow", "getwindowname"],
+                                    capture_output=True, text=True, timeout=2)
+                if proc.returncode == 0:
+                    title = proc.stdout.strip().lower()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+    except Exception:
+        pass
+
+    # Match against patterns
+    for ctx_type, patterns in AppContext.APP_PATTERNS.items():
+        for pattern in patterns:
+            if pattern in title:
+                return AppContext(ctx_type, title, pattern)
+
+    return AppContext(AppContext.UNKNOWN, title, "")
+
+
+# ============================================================
+# Text Analysis — Heuristic Classification
+# ============================================================
+
+try:
+    from langdetect import detect as _langdetect_detect
+    from langdetect import DetectorFactory
+    DetectorFactory.seed = 0
+    _LANGDETECT_AVAILABLE = True
+except ImportError:
+    _LANGDETECT_AVAILABLE = False
+
+
+@dataclass
+class TextAnalysis:
+    language: str = "en"
+    is_code: bool = False
+    is_formal: bool = True
+    length: int = 0
+    has_errors: bool = False
+    looks_like: str = "prose"
+    code_language: str = ""
+
+
+_CODE_INDICATORS = [
+    r'^\s*(def |class |import |from \w+ import|function |const |let |var )',
+    r'[{};]\s*$',
+    r'^\s*(public |private |protected |static |async |await )',
+    r'^\s*#include|^\s*package |^\s*using ',
+    r'[!=]=',
+    r'->\s*\w+',
+    r'^\s*<\w+[\s/>]',
+]
+
+_INFORMAL_MARKERS = frozenset([
+    "lol", "omg", "wtf", "bruh", "nah", "gonna", "wanna", "gotta",
+    "idk", "imo", "tbh", "lmao", "smh", "fr", "ngl", "asap", "pls",
+    "plz", "thx", "ty", "np",
+])
+
+
+def analyze_text(text: str) -> TextAnalysis:
+    """Analyze text using heuristics (no LLM). Fast, runs on every intercept."""
+    result = TextAnalysis()
+    stripped = text.strip()
+    result.length = len(stripped)
+
+    # --- Language detection ---
+    if _LANGDETECT_AVAILABLE:
+        try:
+            result.language = _langdetect_detect(stripped[:500])
+        except Exception:
+            result.language = "en"
+
+    # --- Code detection ---
+    code_line_count = 0
+    lines = stripped.split('\n')
+    sample = lines[:30]
+    for line in sample:
+        for pattern in _CODE_INDICATORS:
+            if _re.search(pattern, line):
+                code_line_count += 1
+                break
+    code_ratio = code_line_count / max(len(sample), 1)
+    result.is_code = code_ratio > 0.3
+
+    # Code language heuristic
+    if result.is_code:
+        if _re.search(r'\bdef\b.*:\s*$|^\s*import\s+\w+|from\s+\w+\s+import', stripped, _re.MULTILINE):
+            result.code_language = "python"
+        elif _re.search(r'\bfunction\b|\bconst\b|\blet\b|\bconsole\.', stripped):
+            result.code_language = "javascript"
+        elif _re.search(r'\bfn\b|\blet\s+mut\b|\bimpl\b', stripped):
+            result.code_language = "rust"
+        elif _re.search(r'\bfunc\b.*\{|package\s+\w+|:=', stripped):
+            result.code_language = "go"
+
+    # --- Formality ---
+    words_lower = stripped.lower().split()
+    informal_count = sum(1 for w in words_lower if w.strip('.,!?') in _INFORMAL_MARKERS)
+    result.is_formal = informal_count < 2
+
+    # --- "Looks like" classification ---
+    if result.is_code:
+        result.looks_like = "code"
+    elif stripped.startswith('{') and stripped.endswith('}'):
+        result.looks_like = "json"
+    elif _re.match(r'https?://', stripped):
+        result.looks_like = "url"
+    elif _re.search(r'^(diff --git|@@\s)', stripped, _re.MULTILINE):
+        result.looks_like = "commit_diff"
+    elif _re.search(r'^\s*[-*]\s', stripped, _re.MULTILINE) and stripped.count('\n') > 2:
+        result.looks_like = "list"
+    elif _re.search(r'(action items|next steps|attendees|agenda)', stripped.lower()):
+        result.looks_like = "meeting_notes"
+    elif _re.search(r'(traceback|error|exception|stack trace)', stripped.lower()):
+        result.looks_like = "error"
+    elif _re.search(r'^\d{4}-\d{2}-\d{2}.*\[', stripped, _re.MULTILINE):
+        result.looks_like = "log"
+    elif _re.search(r'(dear |hi |hello |subject:|re:)', stripped.lower()[:100]):
+        result.looks_like = "email_draft"
+
+    # --- Basic error detection ---
+    if not result.is_code and result.language == "en":
+        if '  ' in stripped or _re.search(r'\.\s+[a-z]', stripped):
+            result.has_errors = True
+
+    return result
+
+
+# ============================================================
+# Smart Command Suggestions
+# ============================================================
+
+_DEFAULT_CONTEXT_PRIORITIES: dict[str, list[str]] = {
+    "terminal":  ["command", "explain", "regex", "docstring", "review"],
+    "browser":   ["summarize", "translate", "rewrite", "bullets", "title"],
+    "ide":       ["docstring", "review", "explain", "gitcommit", "regex", "fmt"],
+    "chat":      ["rewrite", "tone", "translate", "tweet"],
+    "docs":      ["rewrite", "summarize", "bullets", "title", "meeting"],
+    "unknown":   ["summarize", "rewrite", "explain", "fmt", "translate"],
+}
+
+_TEXT_TYPE_PRIORITIES: dict[str, list[str]] = {
+    "code":          ["docstring", "review", "explain", "fmt", "gitcommit"],
+    "json":          ["fmt", "explain", "redact"],
+    "commit_diff":   ["gitcommit", "review", "summarize"],
+    "list":          ["bullets", "todo", "summarize"],
+    "meeting_notes": ["meeting", "todo", "summarize", "bullets"],
+    "error":         ["explain", "review"],
+    "log":           ["explain", "summarize", "redact"],
+    "email_draft":   ["email", "rewrite", "tone"],
+    "url":           ["wiki", "summarize"],
+    "prose":         ["summarize", "rewrite", "translate", "bullets", "title"],
+}
+
+
+def get_smart_suggestions(
+    app_ctx: AppContext,
+    text_analysis: TextAnalysis,
+    commands: dict,
+    pattern_scores: dict[str, float] | None = None,
+    max_starred: int = 3,
+) -> list[tuple[str, dict, bool]]:
+    """Return ordered list of (cmd_name, cmd_config, is_starred).
+    First `max_starred` entries have is_starred=True."""
+
+    scores: dict[str, float] = {}
+
+    # 1. Context-type base score
+    ctx_cmds = CONFIG.get("context_priorities", {}).get(
+        app_ctx.context_type,
+        _DEFAULT_CONTEXT_PRIORITIES.get(app_ctx.context_type, [])
+    )
+    for i, cmd_name in enumerate(ctx_cmds):
+        if cmd_name in commands:
+            scores[cmd_name] = scores.get(cmd_name, 0) + max(0, 10 - i)
+
+    # 2. Text-type score
+    text_cmds = _TEXT_TYPE_PRIORITIES.get(text_analysis.looks_like, [])
+    for i, cmd_name in enumerate(text_cmds):
+        if cmd_name in commands:
+            scores[cmd_name] = scores.get(cmd_name, 0) + max(0, 8 - i)
+
+    # 3. Language-specific boost
+    if text_analysis.language != "en":
+        if "trans" in commands:
+            scores["trans"] = scores.get("trans", 0) + 5
+
+    # 4. Code-specific boost
+    if text_analysis.is_code:
+        for cmd in ["docstring", "review", "explain", "fmt"]:
+            if cmd in commands:
+                scores[cmd] = scores.get(cmd, 0) + 3
+
+    # 5. Informality boost
+    if not text_analysis.is_formal:
+        if "translate" in commands:
+            scores["translate"] = scores.get("translate", 0) + 4
+        if "rewrite" in commands:
+            scores["rewrite"] = scores.get("rewrite", 0) + 3
+
+    # 6. PatternLearner scores
+    if pattern_scores:
+        for cmd_name, learned_score in pattern_scores.items():
+            if cmd_name in commands:
+                scores[cmd_name] = scores.get(cmd_name, 0) + learned_score
+
+    # Sort by score descending
+    sorted_cmds = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    result: list[tuple[str, dict, bool]] = []
+    starred_count = 0
+    seen: set[str] = set()
+    for cmd_name, score in sorted_cmds:
+        if cmd_name not in commands:
+            continue
+        is_starred = starred_count < max_starred and score > 0
+        if is_starred:
+            starred_count += 1
+        result.append((cmd_name, commands[cmd_name], is_starred))
+        seen.add(cmd_name)
+
+    # Append remaining commands alphabetically
+    for cmd_name in sorted(commands):
+        if cmd_name not in seen:
+            result.append((cmd_name, commands[cmd_name], False))
+
+    return result
+
+
+# ============================================================
+# Pattern Learner
+# ============================================================
+
+class PatternLearner:
+    """Learns command preferences from history. Reads JSONL, computes
+    per-context usage-frequency weights."""
+
+    MIN_SAMPLES = 20
+    DOMINATE_SAMPLES = 100
+
+    def __init__(self, history_path: Path):
+        self._history_path = history_path
+        self._samples: int = 0
+        self._context_counts: dict[str, dict[str, int]] = {}  # app_context → {cmd: count}
+        self._total_counts: dict[str, int] = {}
+
+    def load(self) -> None:
+        """Read history file and compute frequency tables."""
+        self._context_counts.clear()
+        self._total_counts.clear()
+        self._samples = 0
+        if not self._history_path.exists():
+            return
+        try:
+            with open(self._history_path, "r") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                        cmd = entry.get("command", "")
+                        if not cmd:
+                            continue
+                        ctx = entry.get("app_context", "unknown")
+                        self._samples += 1
+                        self._total_counts[cmd] = self._total_counts.get(cmd, 0) + 1
+                        if ctx not in self._context_counts:
+                            self._context_counts[ctx] = {}
+                        self._context_counts[ctx][cmd] = self._context_counts[ctx].get(cmd, 0) + 1
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+        except Exception:
+            pass
+
+    def get_scores(self, app_context: str) -> dict[str, float]:
+        """Return command → score dict based on learned patterns."""
+        if self._samples < self.MIN_SAMPLES:
+            return {}
+
+        blend = min(1.0, (self._samples - self.MIN_SAMPLES) /
+                    max(1, self.DOMINATE_SAMPLES - self.MIN_SAMPLES))
+
+        counts = self._context_counts.get(app_context, self._total_counts)
+        if not counts:
+            counts = self._total_counts
+
+        total = sum(counts.values()) or 1
+        scores: dict[str, float] = {}
+        for cmd, count in counts.items():
+            scores[cmd] = (count / total) * blend * 15
+        return scores
+
+    @property
+    def sample_count(self) -> int:
+        return self._samples
 
 
 # ============================================================
@@ -852,9 +1243,18 @@ if _TKINTER_AVAILABLE:
         MAX_HEIGHT = 400
         ROW_HEIGHT = 28
 
-        def __init__(self, selected_text: str, commands: dict):
+        BADGE_STAR = "#ffd700"
+        BADGE_PERSONAL = "#ff8c00"
+
+        def __init__(self, selected_text: str, commands: dict,
+                     suggestions: list[tuple[str, dict, bool]] | None = None,
+                     text_analysis: "TextAnalysis | None" = None,
+                     app_context: "AppContext | None" = None):
             self._text = selected_text
             self._commands = commands
+            self._suggestions = suggestions
+            self._text_analysis = text_analysis
+            self._app_context = app_context
             self._cmd_list: list[tuple[str, dict]] = list(commands.items())
             self._filtered: list[tuple[str, dict]] = list(self._cmd_list)
             self._selected_idx = 0
@@ -864,6 +1264,7 @@ if _TKINTER_AVAILABLE:
             self._sub_selected = 0
             self._custom_entry = None
             self._row_widgets: list = []
+            self._is_searching = False
 
             self._root = tk.Tk()
             self._root.withdraw()
@@ -916,6 +1317,23 @@ if _TKINTER_AVAILABLE:
             tk.Label(self._root, text=f'"{preview}"', bg=self.BG, fg=self.PREVIEW_FG,
                      font=self._font_small, anchor="w", padx=8, pady=4
                      ).pack(fill="x")
+
+            # Analysis summary line
+            if self._text_analysis:
+                ta = self._text_analysis
+                parts = []
+                if self._app_context and self._app_context.context_type != "unknown":
+                    parts.append(self._app_context.context_type)
+                parts.append(ta.language)
+                if ta.is_code:
+                    parts.append(f"code" + (f"({ta.code_language})" if ta.code_language else ""))
+                elif not ta.is_formal:
+                    parts.append("informal")
+                parts.append(f"{ta.length} chars")
+                analysis_line = " · ".join(parts)
+                tk.Label(self._root, text=analysis_line, bg=self.BG, fg="#555555",
+                         font=self._font_small, anchor="w", padx=8, pady=1
+                         ).pack(fill="x")
 
             # Separator
             tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
@@ -982,56 +1400,103 @@ if _TKINTER_AVAILABLE:
                 self._populate_trans_submenu()
                 return
 
-            items = self._filtered
-            for i, (name, cmd) in enumerate(items):
-                row = tk.Frame(self._inner_frame, bg=self.BG_ROW, cursor="hand2")
-                row.pack(fill="x", padx=2, pady=1)
-                self._row_widgets.append(row)
+            # Use smart suggestions if available and not actively searching
+            if self._suggestions and not self._is_searching:
+                starred = [(n, c) for n, c, s in self._suggestions if s]
+                rest = [(n, c) for n, c, s in self._suggestions if not s]
 
-                is_llm = cmd.get("llm_required", False)
-                is_mock_llm = is_llm and LLM_MODE == "mock"
+                if starred:
+                    # "For You" header
+                    header = tk.Frame(self._inner_frame, bg=self.SEARCH_BG)
+                    header.pack(fill="x", padx=2, pady=(2, 0))
+                    self._row_widgets.append(header)
+                    tk.Label(header, text="  \u2605 For You", bg=self.SEARCH_BG,
+                             fg=self.BADGE_STAR, font=self._font_bold, anchor="w",
+                             padx=6, pady=3).pack(fill="x")
 
-                # Number
-                num_label = str(i + 1) if i < 9 else " "
-                fg_main = self.FG_DIM if is_mock_llm else self.FG
-                tk.Label(row, text=num_label, bg=self.BG_ROW, fg=self.FG_DIM,
-                         font=self._font_small, width=2).pack(side="left", padx=(6, 2))
+                    for i, (name, cmd) in enumerate(starred):
+                        self._add_command_row(name, cmd, i, starred=True)
 
-                # Name
-                display_name = name.replace("_", " ").title()
-                tk.Label(row, text=display_name, bg=self.BG_ROW, fg=fg_main,
-                         font=self._font_bold, anchor="w", width=16).pack(side="left")
+                    # "All Commands" header
+                    header2 = tk.Frame(self._inner_frame, bg=self.SEARCH_BG)
+                    header2.pack(fill="x", padx=2, pady=(4, 0))
+                    self._row_widgets.append(header2)
+                    tk.Label(header2, text="  All Commands", bg=self.SEARCH_BG,
+                             fg=self.FG_DIM, font=self._font_bold, anchor="w",
+                             padx=6, pady=3).pack(fill="x")
 
-                # Description
-                desc = cmd.get("description", "")[:30]
-                tk.Label(row, text=desc, bg=self.BG_ROW, fg=self.FG_DIM,
-                         font=self._font_small, anchor="w").pack(side="left", fill="x", expand=True)
-
-                # Badge
-                if is_mock_llm:
-                    badge_text, badge_fg = "[MOCK]", self.BADGE_MOCK
-                elif is_llm:
-                    badge_text, badge_fg = "[LLM]", self.BADGE_LLM
+                    items = rest
+                    offset = len(starred)
                 else:
-                    badge_text, badge_fg = "[FAST]", self.BADGE_FAST
-                tk.Label(row, text=badge_text, bg=self.BG_ROW, fg=badge_fg,
-                         font=self._font_small).pack(side="right", padx=(4, 8))
+                    items = starred + rest
+                    offset = 0
+            else:
+                items = self._filtered
+                offset = 0
 
-                # Highlight
-                if i == self._selected_idx:
-                    self._set_row_bg(row, self.BG_SELECTED)
-
-                # Mouse bindings
-                idx = i
-                row.bind("<Enter>", lambda e, r=row, j=idx: self._on_row_hover(r, j))
-                row.bind("<Leave>", lambda e, r=row, j=idx: self._on_row_leave(r, j))
-                row.bind("<Button-1>", lambda e, j=idx: self._on_row_click(j))
-                for child in row.winfo_children():
-                    child.bind("<Enter>", lambda e, r=row, j=idx: self._on_row_hover(r, j))
-                    child.bind("<Leave>", lambda e, r=row, j=idx: self._on_row_leave(r, j))
-                    child.bind("<Button-1>", lambda e, j=idx: self._on_row_click(j))
+            for i, (name, cmd) in enumerate(items):
+                self._add_command_row(name, cmd, i + offset)
 
             self._update_scroll_height()
+
+        def _add_command_row(self, name: str, cmd: dict, idx: int,
+                             starred: bool = False) -> None:
+            """Add a single command row to the popup."""
+            row = tk.Frame(self._inner_frame, bg=self.BG_ROW, cursor="hand2")
+            row.pack(fill="x", padx=2, pady=1)
+            self._row_widgets.append(row)
+
+            is_llm = cmd.get("llm_required", False)
+            is_mock_llm = is_llm and LLM_MODE == "mock"
+            is_personal = cmd.get("_personal", False)
+
+            # Number
+            num_label = str(idx + 1) if idx < 9 else " "
+            fg_main = self.FG_DIM if is_mock_llm else self.FG
+            tk.Label(row, text=num_label, bg=self.BG_ROW, fg=self.FG_DIM,
+                     font=self._font_small, width=2).pack(side="left", padx=(6, 2))
+
+            # Star indicator
+            if starred:
+                tk.Label(row, text="\u2605", bg=self.BG_ROW, fg=self.BADGE_STAR,
+                         font=self._font_small).pack(side="left", padx=(0, 2))
+
+            # Name
+            display_name = name.replace("_", " ").title()
+            if is_personal:
+                display_name = name.replace("personal_", "").replace("_", " ").title()
+            tk.Label(row, text=display_name, bg=self.BG_ROW, fg=fg_main,
+                     font=self._font_bold, anchor="w", width=16).pack(side="left")
+
+            # Description
+            desc = cmd.get("description", "")[:30]
+            tk.Label(row, text=desc, bg=self.BG_ROW, fg=self.FG_DIM,
+                     font=self._font_small, anchor="w").pack(side="left", fill="x", expand=True)
+
+            # Badge
+            if is_personal:
+                badge_text, badge_fg = "[ME]", self.BADGE_PERSONAL
+            elif is_mock_llm:
+                badge_text, badge_fg = "[MOCK]", self.BADGE_MOCK
+            elif is_llm:
+                badge_text, badge_fg = "[LLM]", self.BADGE_LLM
+            else:
+                badge_text, badge_fg = "[FAST]", self.BADGE_FAST
+            tk.Label(row, text=badge_text, bg=self.BG_ROW, fg=badge_fg,
+                     font=self._font_small).pack(side="right", padx=(4, 8))
+
+            # Highlight
+            if idx == self._selected_idx:
+                self._set_row_bg(row, self.BG_SELECTED)
+
+            # Mouse bindings
+            row.bind("<Enter>", lambda e, r=row, j=idx: self._on_row_hover(r, j))
+            row.bind("<Leave>", lambda e, r=row, j=idx: self._on_row_leave(r, j))
+            row.bind("<Button-1>", lambda e, j=idx: self._on_row_click(j))
+            for child in row.winfo_children():
+                child.bind("<Enter>", lambda e, r=row, j=idx: self._on_row_hover(r, j))
+                child.bind("<Leave>", lambda e, r=row, j=idx: self._on_row_leave(r, j))
+                child.bind("<Button-1>", lambda e, j=idx: self._on_row_click(j))
 
         def _populate_tone_submenu(self) -> None:
             """Show the tone style picker."""
@@ -1148,6 +1613,7 @@ if _TKINTER_AVAILABLE:
         # ── Search ──
         def _on_search(self) -> None:
             q = self._search_var.get().lower()
+            self._is_searching = bool(q)
             if not q:
                 self._filtered = list(self._cmd_list)
             else:
@@ -1293,9 +1759,16 @@ if _TKINTER_AVAILABLE:
 
         # ── Selection ──
         def _select_command(self, idx: int) -> None:
-            if idx >= len(self._filtered):
-                return
-            name, cmd = self._filtered[idx]
+            # Resolve name/cmd from suggestions or filtered list
+            if self._suggestions and not self._is_searching:
+                all_items = [(n, c) for n, c, _s in self._suggestions]
+                if idx >= len(all_items):
+                    return
+                name, cmd = all_items[idx]
+            else:
+                if idx >= len(self._filtered):
+                    return
+                name, cmd = self._filtered[idx]
 
             # MOCK mode: block LLM commands
             is_llm = cmd.get("llm_required", False)
@@ -1328,6 +1801,161 @@ if _TKINTER_AVAILABLE:
             return self._result
 
 
+if _TKINTER_AVAILABLE:
+    class RefinementDialog:
+        """Post-LLM-command dialog for iterative refinement. Max 3 iterations."""
+        BG = "#1a0a2e"
+        FG = "#e0e0e0"
+        FG_DIM = "#888888"
+        BORDER_COLOR = "#d45cff"
+        SEARCH_BG = "#0e0620"
+        MAX_ITERATIONS = 3
+
+        def __init__(self, original: str, result: str, cmd_name: str, duration: float):
+            self._original = original
+            self._result = result
+            self._cmd_name = cmd_name
+            self._duration = duration
+            self._iterations = 0
+            self._accepted = False
+            self._final_result = result
+
+            self._root = tk.Tk()
+            self._root.withdraw()
+            self._root.overrideredirect(True)
+            self._root.attributes("-topmost", True)
+            self._root.configure(bg=self.BG, highlightbackground=self.BORDER_COLOR,
+                                 highlightthickness=1)
+
+            try:
+                self._font = tkfont.Font(family="DejaVu Sans Mono", size=10)
+                self._font_bold = tkfont.Font(family="DejaVu Sans Mono", size=10, weight="bold")
+                self._font_small = tkfont.Font(family="DejaVu Sans Mono", size=9)
+            except Exception:
+                self._font = tkfont.Font(family="Courier", size=10)
+                self._font_bold = tkfont.Font(family="Courier", size=10, weight="bold")
+                self._font_small = tkfont.Font(family="Courier", size=9)
+
+            self._build_ui()
+
+            # Position at screen center
+            self._root.update_idletasks()
+            w = 450
+            h = 280
+            sw = self._root.winfo_screenwidth()
+            sh = self._root.winfo_screenheight()
+            self._root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+            self._root.deiconify()
+            self._root.focus_force()
+            self._refine_entry.focus_set()
+
+        def _build_ui(self) -> None:
+            # Header
+            header_text = f"\u2713 {self._cmd_name.title()} applied  ({self._duration:.1f}s)"
+            tk.Label(self._root, text=header_text, bg=self.BG, fg="#00d4aa",
+                     font=self._font_bold, anchor="w", padx=8, pady=4).pack(fill="x")
+            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
+
+            # Result preview
+            tk.Label(self._root, text="Result:", bg=self.BG, fg=self.FG_DIM,
+                     font=self._font_small, anchor="w", padx=8, pady=(4, 0)).pack(fill="x")
+            preview_frame = tk.Frame(self._root, bg=self.SEARCH_BG)
+            preview_frame.pack(fill="both", expand=True, padx=8, pady=4)
+            self._preview = tk.Text(preview_frame, bg=self.SEARCH_BG, fg=self.FG,
+                                    font=self._font_small, wrap="word", height=5,
+                                    relief="flat", bd=0, state="normal")
+            self._preview.pack(fill="both", expand=True, padx=4, pady=4)
+            self._preview.insert("1.0", self._result[:500])
+            self._preview.config(state="disabled")
+
+            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
+
+            # Refine input
+            tk.Label(self._root, text="Refine or press Enter to accept:",
+                     bg=self.BG, fg=self.FG_DIM, font=self._font_small,
+                     anchor="w", padx=8, pady=(4, 0)).pack(fill="x")
+            entry_frame = tk.Frame(self._root, bg=self.SEARCH_BG)
+            entry_frame.pack(fill="x", padx=8, pady=4)
+            self._refine_entry = tk.Entry(
+                entry_frame, bg=self.SEARCH_BG, fg=self.FG,
+                insertbackground=self.FG, font=self._font, relief="flat", bd=0,
+            )
+            self._refine_entry.pack(fill="x", padx=4, pady=4)
+
+            # Status line
+            self._status_label = tk.Label(
+                self._root, text=f"Enter: accept \u00b7 Type + Enter: refine "
+                f"({self.MAX_ITERATIONS} left) \u00b7 Esc: undo",
+                bg=self.BG, fg=self.FG_DIM, font=self._font_small,
+                anchor="w", padx=8, pady=4)
+            self._status_label.pack(fill="x")
+
+            # Bindings
+            self._root.bind("<Return>", self._on_enter)
+            self._root.bind("<Escape>", self._on_escape)
+            self._root.bind("<FocusOut>", lambda e: None)
+
+        def _on_enter(self, event=None) -> None:
+            instruction = self._refine_entry.get().strip()
+            if not instruction:
+                # Accept result
+                self._accepted = True
+                self._root.destroy()
+                return
+
+            if self._iterations >= self.MAX_ITERATIONS:
+                self._status_label.config(text="Max refinements reached — press Enter to accept")
+                self._refine_entry.delete(0, "end")
+                return
+
+            self._iterations += 1
+            self._refine_entry.delete(0, "end")
+            remaining = self.MAX_ITERATIONS - self._iterations
+            self._status_label.config(text=f"Refining... ({remaining} left)")
+
+            threading.Thread(target=self._do_refine, args=(instruction,), daemon=True).start()
+
+        def _do_refine(self, instruction: str) -> None:
+            prompt = (
+                f"Original text:\n{self._original[:300]}\n\n"
+                f"Current result:\n{self._result[:500]}\n\n"
+                f"Refinement instruction: {instruction}\n\n"
+                f"Apply the refinement and return ONLY the updated text."
+            )
+            try:
+                result = _llm_call(prompt)
+                self._result = result
+                self._final_result = result
+                self._root.after(0, self._update_preview)
+            except Exception as exc:
+                self._root.after(0, lambda: self._status_label.config(
+                    text=f"Error: {str(exc)[:60]}"))
+
+        def _update_preview(self) -> None:
+            self._preview.config(state="normal")
+            self._preview.delete("1.0", "end")
+            self._preview.insert("1.0", self._result[:500])
+            self._preview.config(state="disabled")
+            remaining = self.MAX_ITERATIONS - self._iterations
+            if remaining > 0:
+                self._status_label.config(
+                    text=f"Enter: accept \u00b7 Type + Enter: refine ({remaining} left) \u00b7 Esc: undo")
+            else:
+                self._status_label.config(text="Max refinements reached — press Enter to accept")
+
+        def _on_escape(self, event=None) -> None:
+            self._accepted = False
+            self._root.destroy()
+
+        def run(self) -> tuple[str, bool, int]:
+            """Returns (final_text, accepted, iteration_count)."""
+            try:
+                self._root.mainloop()
+            except Exception:
+                return (self._result, False, self._iterations)
+            return (self._final_result, self._accepted, self._iterations)
+
+
 def _handle_popup(text: str) -> None:
     """Show the command picker popup and dispatch the chosen command."""
     global _popup_trigger
@@ -1339,7 +1967,21 @@ def _handle_popup(text: str) -> None:
         return
 
     commands = CONFIG.get("commands", {})
-    picker = CommandPicker(text, commands)
+
+    # Compute smart suggestions
+    suggestions = None
+    if _current_app_context and _current_text_analysis:
+        pattern_scores = _pattern_learner.get_scores(
+            _current_app_context.context_type
+        ) if _pattern_learner else {}
+        suggestions = get_smart_suggestions(
+            _current_app_context, _current_text_analysis, commands,
+            pattern_scores=pattern_scores
+        )
+
+    picker = CommandPicker(text, commands, suggestions=suggestions,
+                           text_analysis=_current_text_analysis,
+                           app_context=_current_app_context)
     result = picker.run()
 
     if result is None:
@@ -1358,6 +2000,38 @@ def _handle_popup(text: str) -> None:
 
     _popup_trigger = "popup"
     TUI.status("\U0001f3af", f"Popup \u2192 {cmd_name}", TUI.GREEN)
+
+    # For LLM commands in live mode, dispatch synchronously so we can show refinement
+    if is_llm and LLM_MODE == "live" and _TKINTER_AVAILABLE:
+        start_t = time.time()
+        try:
+            dispatch(cmd_name, payload, text, cmd_config)
+        except Exception as exc:
+            TUI.error(f"Popup dispatch error: {exc}")
+            return
+        duration = time.time() - start_t
+
+        # Get the result from undo stack
+        with _undo_lock:
+            last_result = _undo_stack[-1]["replacement"] if _undo_stack else None
+
+        if last_result:
+            refinement = RefinementDialog(text, last_result, cmd_name, duration)
+            final_text, accepted, iterations = refinement.run()
+
+            if accepted and iterations > 0 and final_text != last_result:
+                _push_undo(text, final_text)
+                _replace_selection(final_text)
+                _log_history(f"{cmd_name}+refine", payload, final_text, int(duration * 1000),
+                             app_context=_current_app_context.context_type if _current_app_context else "",
+                             text_length=len(payload),
+                             text_language=_current_text_analysis.language if _current_text_analysis else "",
+                             trigger="refinement")
+                TUI.micro_log(f"Refined ({iterations}x) — result updated")
+            elif not accepted:
+                _do_undo()
+                TUI.micro_log(f"Refinement cancelled — undone")
+        return
 
     # Dispatch in a worker thread so we don't block the main loop
     def _run():
@@ -1473,6 +2147,9 @@ def _should_notify(is_error: bool = False) -> bool:
 
 
 def notify(title: str, message: str, is_error: bool = False) -> None:
+    with _silent_mode_lock:
+        if _silent_mode:
+            return
     if not _should_notify(is_error=is_error):
         return
     try:
@@ -1542,6 +2219,27 @@ def _do_undo() -> None:
 
 def on_undo_triggered() -> None:
     threading.Thread(target=_do_undo, daemon=True).start()
+
+
+# ============================================================
+# Silent Mode Toggle
+# ============================================================
+
+def _toggle_silent_mode() -> None:
+    """Toggle silent mode on/off."""
+    global _silent_mode
+    with _silent_mode_lock:
+        _silent_mode = not _silent_mode
+        state = _silent_mode
+    if state:
+        TUI.micro_log(f"{TUI.DIM}Silent mode ON — notifications suppressed{TUI.RESET}")
+    else:
+        TUI.micro_log(f"{TUI.GREEN}Silent mode OFF — notifications enabled{TUI.RESET}")
+    _update_tray_color("grey" if state else ("green" if LLM_MODE == "live" else "yellow"))
+
+
+def on_silent_triggered() -> None:
+    threading.Thread(target=_toggle_silent_mode, daemon=True).start()
 
 
 # ============================================================
@@ -2224,6 +2922,60 @@ def handle_define(text: str, full_text: str, cmd_config: dict) -> None:
         notify("Define Error", str(exc)[:100], is_error=True)
 
 
+# ============================================================
+# Personal Commands via Examples
+# ============================================================
+
+def handle_personal_command(text: str, full_text: str, cmd_config: dict) -> None:
+    """Handle user-defined personal commands using few-shot LLM prompting."""
+    if LLM_MODE == "mock":
+        result = f"[MOCK] Personal: {cmd_config.get('description', '?')}"
+        _push_undo(full_text, result)
+        _replace_selection(result)
+        TUI.action("👤", "PERSONAL", f"[MOCK] {cmd_config.get('description', '')[:50]}")
+        return
+
+    examples = cmd_config.get("examples", [])
+    prompt_parts = []
+    if cmd_config.get("description"):
+        prompt_parts.append(f"Task: {cmd_config['description']}")
+    prompt_parts.append("")
+    for ex in examples:
+        prompt_parts.append(f"Input: {ex['input']}")
+        prompt_parts.append(f"Output: {ex['output']}")
+        prompt_parts.append("")
+    prompt_parts.append(f"Input: {text.strip()}")
+    prompt_parts.append("Output:")
+
+    prompt = "\n".join(prompt_parts)
+    model = cmd_config.get("model", "")
+    result = _llm_call(prompt, model=model)
+
+    _push_undo(full_text, result)
+    _replace_selection(result)
+    TUI.action("👤", "PERSONAL", f"{cmd_config.get('description', '')[:30]}: {result[:40]}")
+    notify("Personal Command", f"{result[:80]}")
+
+
+def _register_personal_commands() -> None:
+    """Register personal commands from config into the command system."""
+    for pc_name, pc_config in CONFIG.get("personal_commands", {}).items():
+        if not isinstance(pc_config, dict):
+            continue
+        trigger = pc_config.get("trigger", f"{pc_name.upper()}:")
+        cmd_key = f"personal_{pc_name}"
+        CONFIG.setdefault("commands", {})[cmd_key] = {
+            "prefixes": [trigger],
+            "keywords": [pc_name],
+            "description": pc_config.get("description", f"Personal: {pc_name}"),
+            "llm_required": True,
+            "_personal": True,
+            "examples": pc_config.get("examples", []),
+            "model": pc_config.get("model", ""),
+        }
+        _BUILTIN_HANDLERS[cmd_key] = handle_personal_command
+
+
 # Map of built-in command names → handler functions
 _BUILTIN_HANDLERS = {
     "translate": handle_translate,
@@ -2259,7 +3011,9 @@ _BUILTIN_HANDLERS = {
 _HISTORY_PATH = Path.home() / ".watashigpt_history.jsonl"
 
 
-def _log_history(command: str, input_text: str, output_text: str, duration_ms: int) -> None:
+def _log_history(command: str, input_text: str, output_text: str, duration_ms: int,
+                 app_context: str = "", text_length: int = 0,
+                 text_language: str = "", trigger: str = "") -> None:
     """Append a JSON line to ~/.watashigpt_history.jsonl."""
     try:
         provider = _last_llm_provider_used or _llm_provider or "builtin"
@@ -2270,6 +3024,10 @@ def _log_history(command: str, input_text: str, output_text: str, duration_ms: i
             "output": output_text[:500],
             "duration_ms": duration_ms,
             "provider": provider,
+            "app_context": app_context,
+            "text_length": text_length,
+            "text_language": text_language,
+            "trigger": trigger,
         }, ensure_ascii=False)
         with open(_HISTORY_PATH, "a") as f:
             f.write(entry + "\n")
@@ -2311,13 +3069,21 @@ def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> N
             output = _undo_stack[-1]["replacement"] if _undo_stack else "(done)"
         TUI.activity_entry(cmd_name, payload, output, duration, is_llm=is_llm,
                            trigger=_popup_trigger)
-        _log_history(cmd_name, payload, output, int(duration * 1000))
+        _log_history(cmd_name, payload, output, int(duration * 1000),
+                     app_context=_current_app_context.context_type if _current_app_context else "",
+                     text_length=len(payload),
+                     text_language=_current_text_analysis.language if _current_text_analysis else "",
+                     trigger=_popup_trigger)
 
     except Exception as exc:
         duration = time.time() - start_time
         TUI.activity_entry(cmd_name, payload, str(exc), duration, is_error=True,
                            trigger=_popup_trigger)
-        _log_history(cmd_name, payload, f"ERROR: {exc}", int(duration * 1000))
+        _log_history(cmd_name, payload, f"ERROR: {exc}", int(duration * 1000),
+                     app_context=_current_app_context.context_type if _current_app_context else "",
+                     text_length=len(payload),
+                     text_language=_current_text_analysis.language if _current_text_analysis else "",
+                     trigger=_popup_trigger)
         raise
 
 
@@ -2526,6 +3292,16 @@ def _do_intercept() -> None:
         truncated = text[:60] + ("..." if len(text) > 60 else "")
         TUI.action("📋", "CAPTURED", f"\"{truncated}\"")
 
+        # Phase 8: detect app context and analyze text
+        global _current_app_context, _current_text_analysis
+        _current_app_context = detect_active_window()
+        _current_text_analysis = analyze_text(text)
+        TUI.micro_log(
+            f"Context: {_current_app_context.context_type}"
+            f" · {_current_text_analysis.looks_like}"
+            f" · {_current_text_analysis.language}"
+        )
+
         interaction_mode = CONFIG.get("interaction_mode", "both")
         commands = CONFIG.get("commands", {})
 
@@ -2682,11 +3458,135 @@ def _session_export() -> None:
 
 
 # ============================================================
+# System Tray (pystray)
+# ============================================================
+
+def _create_tray_icon_image(color: str = "green"):
+    """Generate a 64x64 tray icon with the given status color."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    colors = {
+        "green":  (0, 212, 170, 255),
+        "yellow": (212, 170, 0, 255),
+        "red":    (212, 0, 0, 255),
+        "grey":   (128, 128, 128, 255),
+    }
+    c = colors.get(color, colors["green"])
+    draw.rounded_rectangle([4, 4, 60, 60], radius=12, fill=c)
+    try:
+        fnt = ImageFont.truetype("DejaVuSansMono-Bold.ttf", 28)
+    except Exception:
+        fnt = ImageFont.load_default()
+    draw.text((16, 14), "W", fill=(255, 255, 255, 255), font=fnt)
+    return img
+
+
+def _show_history_dialog() -> None:
+    """Show a small tkinter window with recent history entries."""
+    if not _TKINTER_AVAILABLE:
+        return
+    root = tk.Tk()
+    root.title("WatashiGPT History")
+    root.geometry("650x400")
+    root.configure(bg="#1a0a2e")
+
+    text_widget = tk.Text(root, bg="#1a0a2e", fg="#e0e0e0",
+                          font=("DejaVu Sans Mono", 9), wrap="word",
+                          relief="flat", bd=0)
+    text_widget.pack(fill="both", expand=True, padx=8, pady=8)
+
+    try:
+        entries: list[dict] = []
+        if _HISTORY_PATH.exists():
+            with open(_HISTORY_PATH, "r") as f:
+                for line in f:
+                    try:
+                        entries.append(json.loads(line.strip()))
+                    except json.JSONDecodeError:
+                        continue
+        for e in entries[-20:]:
+            ts = e.get("ts", "?")[:19]
+            cmd = e.get("command", "?")
+            inp = e.get("input", "")[:40].replace("\n", " ")
+            out = e.get("output", "")[:40].replace("\n", " ")
+            text_widget.insert("end", f"{ts}  {cmd:<12}  {inp}  →  {out}\n")
+    except Exception as exc:
+        text_widget.insert("end", f"Error: {exc}")
+
+    text_widget.config(state="disabled")
+    root.mainloop()
+
+
+def _start_tray() -> None:
+    """Start system tray icon in a background thread."""
+    global _tray_icon
+    try:
+        import pystray
+        from pystray import MenuItem
+    except ImportError:
+        TUI.warn("pystray not installed — tray icon disabled (pip install pystray Pillow)")
+        return
+
+    icon_img = _create_tray_icon_image(
+        "grey" if _silent_mode else ("green" if LLM_MODE == "live" else "yellow")
+    )
+    if icon_img is None:
+        TUI.warn("Pillow not installed — tray icon disabled (pip install Pillow)")
+        return
+
+    def on_history(icon, item):
+        threading.Thread(target=_show_history_dialog, daemon=True).start()
+
+    def on_settings(icon, item):
+        try:
+            _run_as_user(["xdg-open", str(_CONFIG_PATH)], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    def on_reload(icon, item):
+        _reload_config()
+
+    def on_silent(icon, item):
+        _toggle_silent_mode()
+
+    def on_exit(icon, item):
+        icon.stop()
+        _exit_event.set()
+
+    def silent_label(item):
+        return f"Silent Mode {'[ON]' if _silent_mode else '[OFF]'}"
+
+    icon = pystray.Icon(
+        "watashigpt",
+        icon_img,
+        "WatashiGPT",
+        menu=pystray.Menu(
+            MenuItem("History (last 20)", on_history),
+            MenuItem("Settings", on_settings),
+            pystray.Menu.SEPARATOR,
+            MenuItem("Reload Config", on_reload),
+            MenuItem(silent_label, on_silent),
+            pystray.Menu.SEPARATOR,
+            MenuItem("Exit", on_exit),
+        )
+    )
+    _tray_icon = icon
+    try:
+        icon.run()
+    except Exception as exc:
+        TUI.warn(f"Tray icon failed: {exc}")
+
+
+# ============================================================
 # Main Entry Point
 # ============================================================
 
-def main(keep_banner: bool = False) -> None:
-    global _start_time
+def main(keep_banner: bool = False, no_tray: bool = False) -> None:
+    global _start_time, _pattern_learner, _silent_mode
     _start_time = time.time()
 
     print("\033[2J\033[3J\033[H", end="", flush=True)
@@ -2709,12 +3609,16 @@ def main(keep_banner: bool = False) -> None:
         mode_val = f"{TUI.GREEN}LIVE ({_llm_provider}){TUI.RESET}"
     else:
         mode_val = f"{TUI.YELLOW}MOCK{TUI.RESET}"
+    learning_val = f"{TUI.CYAN}0 samples{TUI.RESET}"
+    if _pattern_learner and _pattern_learner.sample_count > 0:
+        learning_val = f"{TUI.CYAN}{_pattern_learner.sample_count} samples{TUI.RESET}"
     TUI.box("Environment", [
         f"  {TUI.DIM}Session{TUI.RESET}    {TUI.CYAN}{_SESSION_TYPE}{TUI.RESET}",
         f"  {TUI.DIM}Display{TUI.RESET}    {TUI.CYAN}{_DISPLAY}{TUI.RESET}",
         f"  {TUI.DIM}Wayland{TUI.RESET}    {TUI.CYAN}{'Yes' if _IS_WAYLAND else 'No'}{TUI.RESET}",
         f"  {TUI.DIM}User{TUI.RESET}       {TUI.CYAN}{_SUDO_USER or os.environ.get('USER', '?')}{TUI.RESET}",
         f"  {TUI.DIM}Mode{TUI.RESET}       {mode_val}",
+        f"  {TUI.DIM}Learning{TUI.RESET}   {learning_val}",
         f"  {TUI.DIM}Config{TUI.RESET}     {config_val}",
     ], TUI.CYAN)
 
@@ -2750,9 +3654,29 @@ def main(keep_banner: bool = False) -> None:
     # Background auto-update check
     threading.Thread(target=_check_for_updates, daemon=True).start()
 
+    # Start system tray icon
+    if not no_tray:
+        threading.Thread(target=_start_tray, daemon=True).start()
+
+    # Initialize PatternLearner
+    _pattern_learner = PatternLearner(_HISTORY_PATH)
+    _pattern_learner.load()
+    if _pattern_learner.sample_count > 0:
+        TUI.micro_log(f"PatternLearner: {_pattern_learner.sample_count} samples loaded")
+
+    # Initialize silent mode from config
+    _silent_mode = CONFIG.get("silent_mode", False)
+
+    # Register personal commands from config
+    _register_personal_commands()
+
     # Register hotkeys
     keyboard.add_hotkey(HOTKEY, on_hotkey_triggered)
     keyboard.add_hotkey(UNDO_HOTKEY, on_undo_triggered)
+    keyboard.add_hotkey(
+        CONFIG.get("hotkeys", {}).get("silent_toggle", "ctrl+alt+s"),
+        on_silent_triggered
+    )
 
     notify(
         "Action Middleware Active",
@@ -2961,6 +3885,7 @@ if __name__ == "__main__":
     parser.add_argument("--banner", action="store_true", help="Keep the full ASCII banner permanently")
     parser.add_argument("--history", action="store_true", help="Browse last 50 history entries")
     parser.add_argument("--grep", type=str, default=None, help="Filter history by command name (use with --history)")
+    parser.add_argument("--no-tray", action="store_true", help="Disable system tray icon")
     args = parser.parse_args()
 
     if args.install:
@@ -2968,4 +3893,4 @@ if __name__ == "__main__":
     elif args.history:
         show_history(grep_filter=args.grep)
     else:
-        main(keep_banner=args.banner)
+        main(keep_banner=args.banner, no_tray=args.no_tray)

@@ -1,5 +1,6 @@
 confidence_threshold: 0.7
 interaction_mode: both
+silent_mode: false
 commands:
   b64:
     description: Base64 encode text
@@ -470,6 +471,49 @@ hotkeys:
   exit: ctrl+c
   intercept: ctrl+alt+x
   undo: ctrl+alt+z
+  silent_toggle: ctrl+alt+s
+context_priorities:
+  terminal:
+  - command
+  - explain
+  - regex
+  - docstring
+  - review
+  browser:
+  - summarize
+  - translate
+  - rewrite
+  - bullets
+  - title
+  ide:
+  - docstring
+  - review
+  - explain
+  - gitcommit
+  - regex
+  - fmt
+  chat:
+  - rewrite
+  - tone
+  - translate
+  - tweet
+  docs:
+  - rewrite
+  - summarize
+  - bullets
+  - title
+  - meeting
+personal_commands: {}
+  # Example:
+  # standup:
+  #   trigger: "STANDUP:"
+  #   description: "Format text as standup update"
+  #   examples:
+  #     - input: "worked on auth, fixing bug 123"
+  #       output: |
+  #         **Yesterday:** Worked on authentication module
+  #         **Today:** Fixing bug #123
+  #         **Blockers:** None
 llm:
   api_key: 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
   fallback:

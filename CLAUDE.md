@@ -2,14 +2,14 @@
 
 ## Project Overview
 
-OS-level background assistant that intercepts selected text via global hotkeys, routes it through a 3-tier command system (prefix → keyword → LLM → fallback), and applies transformations. Single-file Python CLI with rich TUI. 38 commands (19 built-in + 19 LLM).
+OS-level background assistant that intercepts selected text via global hotkeys, routes it through a 3-tier command system (prefix → keyword → LLM → fallback), and applies transformations. Single-file Python CLI with rich TUI, context-aware intelligence, and system tray support. 38+ commands (19 built-in + 19 LLM + personal commands).
 
 ## Project Structure
 
 ```
 watashigpt/
 ├── action-middleware/
-│   ├── main.py           # All application code (~2115 lines)
+│   ├── main.py           # All application code (~3900 lines)
 │   ├── config.yaml       # Commands, hotkeys, LLM settings (auto-saved on provider setup)
 │   └── requirements.txt  # Python dependencies
 └── README.md
@@ -34,6 +34,9 @@ sudo -E python main.py --banner
 # Browse history (last 50 entries)
 python main.py --history
 python main.py --history --grep TR   # filter by command
+
+# Run without system tray icon
+sudo -E python main.py --no-tray
 ```
 
 ## Testing
@@ -52,6 +55,8 @@ No automated test suite. Manual testing:
 - **openai** — LLM client (supports Groq, OpenAI, Gemini, OpenRouter, GitHub Models via base_url)
 - **dateparser** — natural language date parsing (for `DATE:` command)
 - **watchdog** — config hot-reload on file change
+- **langdetect** — automatic language detection for text analysis
+- **pystray / Pillow** — system tray icon (optional)
 
 ## Architecture & Conventions
 
@@ -71,17 +76,25 @@ No automated test suite. Manual testing:
 - **Clipboard stack**: in-memory `_clipboard_stack` list for `STACK:`/`POP:` push/pop operations
 - **Safe math eval**: `CALC:` uses `ast.parse()` + AST node whitelisting — never raw `eval()`
 - **Undo**: CTRL+ALT+Z restores the original text by writing it to clipboard and pasting (not Ctrl+Z). Notification: "Undone · restored previous text"
-- **History log**: `~/.watashigpt_history.jsonl` with `ts`, `command`, `input`, `output`, `duration_ms`, `provider` fields
+- **History log**: `~/.watashigpt_history.jsonl` with `ts`, `command`, `input`, `output`, `duration_ms`, `provider`, `app_context`, `text_length`, `text_language`, `trigger` fields
 - **LLM fallback**: if primary provider errors/times out, auto-retry with secondary provider configured in `config.yaml` under `llm.fallback`
 - **Per-command model override**: optional `model:` key per command in config.yaml overrides the global model
 - **Notification level**: optional `notify:` field per command (`always` | `errors_only` | `never`) to suppress desktop notifications for noisy commands
 - **Auto-update**: background thread checks GitHub releases on startup; shows micro-log notice if newer `__version__` available
 - **`--history` CLI**: `python main.py --history [--grep CMD]` prints last 50 JSONL entries as formatted table
+- **AppContext**: `detect_active_window()` identifies terminal/browser/IDE/chat/docs context via xdotool/kdotool/swaymsg
+- **TextAnalysis**: `analyze_text()` heuristically detects language, code, formality, text type (no LLM)
+- **Smart suggestions**: `get_smart_suggestions()` scores commands by app context + text type + learned patterns
+- **PatternLearner**: reads history JSONL, computes usage-frequency weights per context; influences suggestion order after 20+ samples
+- **Personal commands**: `personal_commands:` in config.yaml with few-shot examples, `[ME]` badge in popup, `handle_personal_command()` handler
+- **Refinement dialog**: `RefinementDialog` (tkinter) shown after LLM commands for iterative refinement (max 3 iterations)
+- **System tray**: `pystray` icon with color status (green=live, yellow=mock, grey=silent), right-click menu for history/settings/reload/exit
+- **Silent mode**: `Ctrl+Alt+S` toggles notification suppression; `silent_mode:` in config.yaml
 
 ## TUI Features
 
 - **Collapsible banner**: full ASCII art for 2s at startup, collapses to single-line header (`--banner` to keep)
-- **Environment panel**: dim labels, bright cyan values, Mode row (LIVE/MOCK)
+- **Environment panel**: dim labels, bright cyan values, Mode row (LIVE/MOCK), Learning row (sample count)
 - **LLM panel**: green border + provider info in live mode, yellow/gold border + MOCK MODE in mock
 - **Commands panel**: `[LLM]`/`[FAST]` badges, live usage counters, dimmed rows with `[MOCK]` suffix for LLM commands in mock mode
 - **Activity feed**: color-coded rows (cyan=built-in, magenta=LLM, red=error) with timestamps and duration

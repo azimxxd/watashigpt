@@ -5,3 +5,6 @@ pyyaml>=6.0
 openai>=1.0
 watchdog>=4.0
 dateparser>=1.1
+langdetect>=1.0.9
+pystray>=0.19
+Pillow>=10.0
