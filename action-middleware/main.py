@@ -119,6 +119,7 @@ _IS_WAYLAND: bool = _SESSION_TYPE == "wayland"
 _SUDO_USER: str = os.environ.get("SUDO_USER", "")
 _DISPLAY: str = os.environ.get("DISPLAY", ":0")
 _WAYLAND_DISPLAY: str = os.environ.get("WAYLAND_DISPLAY", "")
+_HAS_WTYPE: bool = _IS_WAYLAND and shutil.which("wtype") is not None
 _DBUS_SESSION: str = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
 
 _undo_stack: list[dict] = []
@@ -1312,11 +1313,23 @@ if _TKINTER_AVAILABLE:
 
         def _build_ui(self) -> None:
             """Build the main popup layout."""
+            # Header with close button
+            header_frame = tk.Frame(self._root, bg=self.BG)
+            header_frame.pack(fill="x")
+
             # Preview
             preview = self._text[:60] + ("..." if len(self._text) > 60 else "")
-            tk.Label(self._root, text=f'"{preview}"', bg=self.BG, fg=self.PREVIEW_FG,
+            tk.Label(header_frame, text=f'"{preview}"', bg=self.BG, fg=self.PREVIEW_FG,
                      font=self._font_small, anchor="w", padx=8, pady=4
-                     ).pack(fill="x")
+                     ).pack(side="left", fill="x", expand=True)
+
+            # Close button (✕)
+            close_btn = tk.Label(header_frame, text="✕", bg=self.BG, fg=self.FG_DIM,
+                                font=self._font_bold, cursor="hand2", padx=8, pady=4)
+            close_btn.pack(side="right")
+            close_btn.bind("<Button-1>", lambda e: self._on_escape())
+            close_btn.bind("<Enter>", lambda e: close_btn.configure(fg="#ff4444"))
+            close_btn.bind("<Leave>", lambda e: close_btn.configure(fg=self.FG_DIM))
 
             # Analysis summary line
             if self._text_analysis:
@@ -1858,7 +1871,7 @@ if _TKINTER_AVAILABLE:
 
             # Result preview
             tk.Label(self._root, text="Result:", bg=self.BG, fg=self.FG_DIM,
-                     font=self._font_small, anchor="w", padx=8, pady=(4, 0)).pack(fill="x")
+                     font=self._font_small, anchor="w", padx=8, pady=4).pack(fill="x")
             preview_frame = tk.Frame(self._root, bg=self.SEARCH_BG)
             preview_frame.pack(fill="both", expand=True, padx=8, pady=4)
             self._preview = tk.Text(preview_frame, bg=self.SEARCH_BG, fg=self.FG,
@@ -1873,7 +1886,7 @@ if _TKINTER_AVAILABLE:
             # Refine input
             tk.Label(self._root, text="Refine or press Enter to accept:",
                      bg=self.BG, fg=self.FG_DIM, font=self._font_small,
-                     anchor="w", padx=8, pady=(4, 0)).pack(fill="x")
+                     anchor="w", padx=8, pady=4).pack(fill="x")
             entry_frame = tk.Frame(self._root, bg=self.SEARCH_BG)
             entry_frame.pack(fill="x", padx=8, pady=4)
             self._refine_entry = tk.Entry(
@@ -1985,9 +1998,13 @@ def _handle_popup(text: str) -> None:
     result = picker.run()
 
     if result is None:
-        # Check if an LLM command was blocked in mock mode
         TUI.micro_log(f"Command picker cancelled")
         return
+
+    # Allow window manager to restore focus to the original app after popup closes.
+    # On GNOME Wayland, focus restoration after an XWayland window (tkinter) closes
+    # can take 100-300ms depending on compositor load.
+    time.sleep(0.4)
 
     cmd_name, cmd_config, payload = result
     is_llm = cmd_config.get("llm_required", False)
@@ -2117,6 +2134,279 @@ def _get_primary_selection() -> str:
         return ""
 
 
+def _send_paste_keys() -> None:
+    """Send Ctrl+V paste using the most reliable method for the current platform.
+
+    On Wayland, uses wtype (native Wayland virtual-keyboard-v1 protocol) when
+    available — much more reliable than uinput-based keyboard.send() which GNOME
+    Wayland often ignores or misroutes.
+    """
+    if _HAS_WTYPE:
+        try:
+            _run_as_user(
+                ["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"],
+                capture_output=True, timeout=3,
+            )
+            return
+        except Exception:
+            pass
+    # Fallback: release lingering modifiers, then use keyboard library (uinput)
+    for key in ('ctrl', 'alt', 'shift'):
+        try:
+            keyboard.release(key)
+        except Exception:
+            pass
+    time.sleep(0.05)
+    keyboard.send("ctrl+v")
+
+
+# ============================================================
+# Toast Popup — Non-blocking "Applied" notification
+# ============================================================
+
+_toast_queue: queue.Queue = queue.Queue()  # Worker thread → main thread for toast
+
+
+if _TKINTER_AVAILABLE:
+
+    class ToastPopup:
+        """Non-blocking floating toast that shows result and auto-closes.
+        Does NOT steal focus from the original application."""
+        BG = "#1a0a2e"
+        FG = "#e0e0e0"
+        FG_DIM = "#888888"
+        BORDER_COLOR = "#00d4aa"
+        SEARCH_BG = "#0e0620"
+        AUTO_CLOSE_MS = 3000
+
+        def __init__(self, result_text: str):
+            self._text = result_text
+
+            self._root = tk.Tk()
+            self._root.withdraw()
+            self._root.overrideredirect(True)
+            self._root.attributes("-topmost", True)
+            self._root.configure(bg=self.BG, highlightbackground=self.BORDER_COLOR,
+                                 highlightthickness=1)
+
+            try:
+                self._font = tkfont.Font(family="DejaVu Sans Mono", size=10)
+                self._font_bold = tkfont.Font(family="DejaVu Sans Mono", size=10, weight="bold")
+                self._font_small = tkfont.Font(family="DejaVu Sans Mono", size=9)
+            except Exception:
+                self._font = tkfont.Font(family="Courier", size=10)
+                self._font_bold = tkfont.Font(family="Courier", size=10, weight="bold")
+                self._font_small = tkfont.Font(family="Courier", size=9)
+
+            self._build_ui()
+
+            # Position at bottom-right of screen
+            self._root.update_idletasks()
+            w = 350
+            h = 120
+            sw = self._root.winfo_screenwidth()
+            sh = self._root.winfo_screenheight()
+            x = sw - w - 20
+            y = sh - h - 60
+            self._root.geometry(f"{w}x{h}+{x}+{y}")
+            self._root.deiconify()
+
+            # Auto-close after 3 seconds
+            self._root.after(self.AUTO_CLOSE_MS, self._close)
+
+        def _build_ui(self) -> None:
+            # Header
+            header_frame = tk.Frame(self._root, bg=self.BG)
+            header_frame.pack(fill="x")
+            tk.Label(header_frame, text="\u2713 Text applied", bg=self.BG, fg=self.BORDER_COLOR,
+                     font=self._font_bold, anchor="w", padx=8, pady=4).pack(side="left")
+            # Close button
+            close_btn = tk.Label(header_frame, text="\u2715", bg=self.BG, fg=self.FG_DIM,
+                                font=self._font_bold, cursor="hand2", padx=8, pady=4)
+            close_btn.pack(side="right")
+            close_btn.bind("<Button-1>", lambda e: self._close())
+            close_btn.bind("<Enter>", lambda e: close_btn.configure(fg="#ff4444"))
+            close_btn.bind("<Leave>", lambda e: close_btn.configure(fg=self.FG_DIM))
+
+            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
+
+            # Preview of result
+            preview = self._text[:120] + ("..." if len(self._text) > 120 else "")
+            tk.Label(self._root, text=preview, bg=self.SEARCH_BG, fg=self.FG,
+                     font=self._font_small, anchor="nw", justify="left",
+                     wraplength=330, padx=8, pady=6).pack(fill="both", expand=True, padx=4, pady=4)
+
+            # Undo hint
+            undo_key = UNDO_HOTKEY.upper()
+            tk.Label(self._root, text=f"{undo_key} to undo",
+                     bg=self.BG, fg=self.FG_DIM, font=self._font_small,
+                     anchor="w", padx=8, pady=2).pack(fill="x")
+
+            # Bindings — clicking anywhere closes
+            self._root.bind("<Button-1>", lambda e: self._close())
+            self._root.bind("<Escape>", lambda e: self._close())
+
+        def _close(self) -> None:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+
+        def run(self) -> None:
+            """Show toast and block until auto-close or user click."""
+            try:
+                self._root.mainloop()
+            except Exception:
+                pass
+
+
+# ============================================================
+# Result Popup — Display-only command output
+# ============================================================
+
+_result_queue: queue.Queue = queue.Queue()  # Worker thread → main thread for result popup
+
+# Commands that show output in a popup instead of replacing text
+_DISPLAY_ONLY_COMMANDS = frozenset([
+    "explain", "review", "eli5", "roast", "haiku",
+    "count", "define", "wiki",
+])
+
+
+if _TKINTER_AVAILABLE:
+
+    class ResultPopup:
+        """Popup window to display command output (for commands that don't edit text).
+        Has a scrollable text area, copy button, and close button."""
+        BG = "#1a0a2e"
+        FG = "#e0e0e0"
+        FG_DIM = "#888888"
+        BORDER_COLOR = "#d45cff"
+        SEARCH_BG = "#0e0620"
+        BTN_BG = "#3a2a6e"
+        BTN_COPY_BG = "#00d4aa"
+        BTN_COPY_FG = "#000000"
+
+        def __init__(self, title: str, result_text: str):
+            self._title = title
+            self._text = result_text
+
+            self._root = tk.Tk()
+            self._root.withdraw()
+            self._root.overrideredirect(True)
+            self._root.attributes("-topmost", True)
+            self._root.configure(bg=self.BG, highlightbackground=self.BORDER_COLOR,
+                                 highlightthickness=1)
+
+            try:
+                self._font = tkfont.Font(family="DejaVu Sans Mono", size=10)
+                self._font_bold = tkfont.Font(family="DejaVu Sans Mono", size=10, weight="bold")
+                self._font_small = tkfont.Font(family="DejaVu Sans Mono", size=9)
+            except Exception:
+                self._font = tkfont.Font(family="Courier", size=10)
+                self._font_bold = tkfont.Font(family="Courier", size=10, weight="bold")
+                self._font_small = tkfont.Font(family="Courier", size=9)
+
+            self._build_ui()
+
+            # Position at center of screen
+            self._root.update_idletasks()
+            w = 500
+            h = 350
+            sw = self._root.winfo_screenwidth()
+            sh = self._root.winfo_screenheight()
+            x = (sw - w) // 2
+            y = (sh - h) // 2
+            self._root.geometry(f"{w}x{h}+{x}+{y}")
+            self._root.deiconify()
+            self._root.focus_force()
+
+        def _build_ui(self) -> None:
+            # Header
+            header_frame = tk.Frame(self._root, bg=self.BG)
+            header_frame.pack(fill="x")
+
+            tk.Label(header_frame, text=f"\U0001f4ac {self._title}",
+                     bg=self.BG, fg=self.BORDER_COLOR,
+                     font=self._font_bold, anchor="w", padx=8, pady=6).pack(side="left")
+
+            # Close button
+            close_btn = tk.Label(header_frame, text="\u2715", bg=self.BG, fg=self.FG_DIM,
+                                font=self._font_bold, cursor="hand2", padx=8, pady=6)
+            close_btn.pack(side="right")
+            close_btn.bind("<Button-1>", lambda e: self._close())
+            close_btn.bind("<Enter>", lambda e: close_btn.configure(fg="#ff4444"))
+            close_btn.bind("<Leave>", lambda e: close_btn.configure(fg=self.FG_DIM))
+
+            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
+
+            # Scrollable text area
+            text_frame = tk.Frame(self._root, bg=self.SEARCH_BG)
+            text_frame.pack(fill="both", expand=True, padx=6, pady=6)
+
+            scrollbar = tk.Scrollbar(text_frame)
+            scrollbar.pack(side="right", fill="y")
+
+            self._text_widget = tk.Text(
+                text_frame, bg=self.SEARCH_BG, fg=self.FG,
+                font=self._font_small, wrap="word",
+                relief="flat", bd=0,
+                yscrollcommand=scrollbar.set,
+                padx=8, pady=6,
+            )
+            self._text_widget.pack(fill="both", expand=True)
+            self._text_widget.insert("1.0", self._text)
+            self._text_widget.config(state="disabled")
+            scrollbar.config(command=self._text_widget.yview)
+
+            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
+
+            # Bottom bar with copy + close buttons
+            btn_frame = tk.Frame(self._root, bg=self.BG)
+            btn_frame.pack(fill="x", padx=8, pady=6)
+
+            # Copy button
+            copy_btn = tk.Label(btn_frame, text="  \U0001f4cb Copy  ", bg=self.BTN_COPY_BG,
+                                fg=self.BTN_COPY_FG, font=self._font_bold,
+                                cursor="hand2", padx=6, pady=3)
+            copy_btn.pack(side="left", padx=(0, 4))
+            copy_btn.bind("<Button-1>", lambda e: self._on_copy(copy_btn))
+            copy_btn.bind("<Enter>", lambda e: copy_btn.configure(bg="#00eebb"))
+            copy_btn.bind("<Leave>", lambda e: copy_btn.configure(bg=self.BTN_COPY_BG))
+
+            # Close button
+            close_btn2 = tk.Label(btn_frame, text="  Close (Esc)  ", bg=self.BTN_BG,
+                                  fg=self.FG, font=self._font_bold,
+                                  cursor="hand2", padx=6, pady=3)
+            close_btn2.pack(side="right")
+            close_btn2.bind("<Button-1>", lambda e: self._close())
+            close_btn2.bind("<Enter>", lambda e: close_btn2.configure(bg="#4a3a7e"))
+            close_btn2.bind("<Leave>", lambda e: close_btn2.configure(bg=self.BTN_BG))
+
+            # Key bindings
+            self._root.bind("<Escape>", lambda e: self._close())
+            self._root.bind("<Control-c>", lambda e: self._on_copy(copy_btn))
+
+        def _on_copy(self, btn) -> None:
+            """Copy result text to clipboard."""
+            clipboard_copy(self._text)
+            btn.configure(text="  \u2713 Copied!  ")
+            self._root.after(1500, lambda: btn.configure(text="  \U0001f4cb Copy  "))
+
+        def _close(self) -> None:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+
+        def run(self) -> None:
+            """Show popup and block until user closes it."""
+            try:
+                self._root.mainloop()
+            except Exception:
+                pass
+
+
 # ============================================================
 # Auto-Replace
 # ============================================================
@@ -2128,8 +2418,11 @@ def _replace_selection(new_text: str) -> None:
         return
     clipboard_copy(new_text)
     time.sleep(CLIPBOARD_DELAY)
-    keyboard.send("ctrl+v")
+    _send_paste_keys()
     TUI.success("Text replaced in-place")
+    # Queue a non-blocking toast notification for the main thread
+    if _TKINTER_AVAILABLE:
+        _toast_queue.put(new_text)
 
 
 # ============================================================
@@ -2200,7 +2493,7 @@ def _do_undo() -> None:
         TUI.action("↩", "UNDO", "Restoring previous clipboard")
         clipboard_copy(entry["original"])
         time.sleep(CLIPBOARD_DELAY)
-        keyboard.send("ctrl+v")
+        _send_paste_keys()
 
         truncated = entry["original"][:50] + ("..." if len(entry["original"]) > 50 else "")
         TUI.success(f"Undone — restored: \"{truncated}\"")
@@ -2319,16 +2612,21 @@ def handle_test(text: str, full_text: str, cmd_config: dict) -> None:
     notify("Test", f"Pipeline OK: \"{content[:60]}\"")
 
 
-def handle_llm_command(text: str, full_text: str, cmd_config: dict) -> None:
+def handle_llm_command(text: str, full_text: str, cmd_config: dict,
+                       cmd_key: str = "") -> None:
     """Generic handler for LLM-backed commands defined in config.yaml."""
     cmd_name = cmd_config.get("description", "LLM")
+    is_display_only = cmd_config.get("display_only", False) or cmd_key in _DISPLAY_ONLY_COMMANDS
 
     # Mock mode: return placeholder immediately, no API call
     if LLM_MODE == "mock":
         result = f"[MOCK] {cmd_name}: (LLM not configured)"
-        _push_undo(full_text, result)
-        _replace_selection(result)
-        TUI.action("🤖", cmd_name.upper(), f"\"{result}\" [mock]")
+        if is_display_only:
+            _result_queue.put((cmd_name, result))
+        else:
+            _push_undo(full_text, result)
+            _replace_selection(result)
+        TUI.action("\U0001f916", cmd_name.upper(), f"\"{result}\" [mock]")
         notify(cmd_name, result)
         return
 
@@ -2336,17 +2634,21 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict) -> None:
     prompt = prompt_template.format(text=text.strip())
     cmd_model = cmd_config.get("model", "")
 
-    TUI.status("🤖", f"Processing with LLM...", TUI.CYAN)
+    TUI.status("\U0001f916", f"Processing with LLM...", TUI.CYAN)
     notify(APP_NAME, "Processing...")
 
     result = _llm_call(prompt, model=cmd_model)
 
-    _push_undo(full_text, result)
-    _replace_selection(result)
+    if is_display_only:
+        # Display-only: show in a popup, don't replace text
+        _result_queue.put((cmd_name, result))
+    else:
+        _push_undo(full_text, result)
+        _replace_selection(result)
 
     truncated = result[:80] + ("..." if len(result) > 80 else "")
     provider_tag = f" [{_last_llm_provider_used}]" if _last_llm_provider_used else ""
-    TUI.action("🤖", cmd_name.upper(), f"\"{truncated}\"{provider_tag}")
+    TUI.action("\U0001f916", cmd_name.upper(), f"\"{truncated}\"{provider_tag}")
     notify(cmd_name, f"Done: \"{truncated}\"")
 
 
@@ -2400,7 +2702,7 @@ def handle_count(text: str, full_text: str, cmd_config: dict) -> None:
 
     stats = f"Words: {words} | Chars: {chars} | Lines: {lines} | Reading time: ~{reading_min} min"
     TUI.action("📊", "COUNT", stats)
-    notify("Text Stats", stats)
+    _result_queue.put(("Text Stats", stats))
 
 
 def handle_mock(text: str, full_text: str, cmd_config: dict) -> None:
@@ -2856,10 +3158,10 @@ def handle_wiki(text: str, full_text: str, cmd_config: dict) -> None:
             notify("Wikipedia", f"No results for \"{query}\"")
             return
 
-        # Truncate for notification (max ~300 chars)
-        summary = extract[:300] + ("..." if len(extract) > 300 else "")
-        TUI.action("📖", "WIKI", f"{title}: {summary[:80]}...")
-        notify(f"Wikipedia: {title}", summary)
+        # Show in result popup instead of just notification
+        full_result = f"{title}\n{'=' * len(title)}\n\n{extract}"
+        TUI.action("📖", "WIKI", f"{title}: {extract[:80]}...")
+        _result_queue.put((f"Wikipedia: {title}", full_result))
 
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -2907,8 +3209,24 @@ def handle_define(text: str, full_text: str, cmd_config: dict) -> None:
         defn = definitions[0].get("definition", "") if definitions else "(no definition)"
 
         result = f"({part_of_speech}) {defn}" if part_of_speech else defn
+
+        # Build full definition text with all meanings
+        all_parts = []
+        for meaning in meanings:
+            pos = meaning.get("partOfSpeech", "")
+            defs = meaning.get("definitions", [])
+            if pos:
+                all_parts.append(f"{pos}:")
+            for j, d in enumerate(defs[:3], 1):
+                defn_text = d.get("definition", "")
+                example = d.get("example", "")
+                all_parts.append(f"  {j}. {defn_text}")
+                if example:
+                    all_parts.append(f"     Example: \"{example}\"")
+
+        full_result = f"{word}\n{'=' * len(word)}\n\n" + "\n".join(all_parts)
         TUI.action("📚", "DEFINE", f"{word}: {result[:80]}")
-        notify(f"Define: {word}", result[:300])
+        _result_queue.put((f"Define: {word}", full_result))
 
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -3060,9 +3378,9 @@ def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> N
         if cmd_name in _BUILTIN_HANDLERS:
             _BUILTIN_HANDLERS[cmd_name](payload, full_text, cmd_config)
         elif cmd_config.get("llm_required"):
-            handle_llm_command(payload, full_text, cmd_config)
+            handle_llm_command(payload, full_text, cmd_config, cmd_key=cmd_name)
         else:
-            handle_llm_command(payload, full_text, cmd_config)
+            handle_llm_command(payload, full_text, cmd_config, cmd_key=cmd_name)
 
         duration = time.time() - start_time
         with _undo_lock:
@@ -3266,7 +3584,15 @@ def route(text: str) -> None:
 
 def _do_intercept() -> None:
     try:
-        time.sleep(0.5)
+        time.sleep(0.2)
+        # Release all modifier keys from the hotkey to prevent interference
+        # (e.g. Ctrl+Alt still held → ctrl+c becomes ctrl+alt+c)
+        for key in ('ctrl', 'alt', 'shift'):
+            try:
+                keyboard.release(key)
+            except Exception:
+                pass
+        time.sleep(0.1)
 
         TUI.separator()
         TUI.status("⌨", "Hotkey triggered — reading selection...", TUI.CYAN)
@@ -3302,27 +3628,17 @@ def _do_intercept() -> None:
             f" · {_current_text_analysis.language}"
         )
 
-        interaction_mode = CONFIG.get("interaction_mode", "both")
         commands = CONFIG.get("commands", {})
 
-        # If prefix/both mode and text has a known prefix or chain → route directly
-        if interaction_mode in ("prefix", "both"):
-            if _resolve_prefix(text, commands) or _parse_chain(text, commands):
-                global _popup_trigger
-                _popup_trigger = "prefix"
-                route(text)
-                return
+        # Always open command picker popup on hotkey
+        if _TKINTER_AVAILABLE:
+            _popup_queue.put(text)
+            TUI.micro_log(f"Opening command picker...")
+            return
 
-        # If popup/both mode and tkinter available → queue for main thread popup
-        if interaction_mode in ("popup", "both"):
-            if _TKINTER_AVAILABLE:
-                _popup_queue.put(text)
-                TUI.micro_log(f"Opening command picker...")
-                return
-            else:
-                TUI.warn("tkinter unavailable — falling back to prefix routing")
-
-        # Fallback: route normally (keyword/LLM classification)
+        # Fallback if tkinter unavailable: route via prefix/keyword/LLM
+        TUI.warn("tkinter unavailable — falling back to prefix routing")
+        global _popup_trigger
         _popup_trigger = "prefix"
         route(text)
 
@@ -3715,6 +4031,28 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
                     # Restore cbreak
                     tty.setcbreak(fd)
                 except queue.Empty:
+                    pass
+
+                # Check toast queue (non-blocking "applied" notification)
+                try:
+                    toast_text = _toast_queue.get_nowait()
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    if _TKINTER_AVAILABLE:
+                        toast = ToastPopup(toast_text)
+                        toast.run()
+                    tty.setcbreak(fd)
+                except queue.Empty:
+                    pass
+
+                # Check result queue (display-only command output popup)
+                try:
+                    result_title, result_text = _result_queue.get_nowait()
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    if _TKINTER_AVAILABLE:
+                        result_popup = ResultPopup(result_title, result_text)
+                        result_popup.run()
+                    tty.setcbreak(fd)
+                except (queue.Empty, ValueError):
                     pass
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
