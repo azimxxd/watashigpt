@@ -1,10 +1,8 @@
-# Для тупого алдияра
-1. Чтобы запустить: в консоли пишешь cd /путь/к/watashigpt/action-middleware
-2. Потом пишешь sudo -E /путь/к/watashigpt/.venv/bin/python main.py
+# ActionFlow
 
-# Action Middleware
+OS-level background assistant that intercepts selected text via global hotkeys, routes it through a 3-tier command system (prefix → keyword → LLM classification → fallback), and applies transformations in-place. Single-file Python CLI with rich TUI, context-aware intelligence, command picker popup, and system tray support.
 
-OS-level background assistant that intercepts selected text via a global hotkey, processes it by prefix, and replaces it in-place.
+**by WatashiGPT**
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![Platform](https://img.shields.io/badge/Platform-Linux-green)
@@ -14,8 +12,8 @@ OS-level background assistant that intercepts selected text via a global hotkey,
 ## How It Works
 
 1. Select any text in any application
-2. Press `Ctrl+Alt+X`
-3. The text is captured, processed based on its prefix, and replaced in-place
+2. Press `Ctrl+Alt+X` — a command picker popup appears
+3. Pick a command (or type a prefix like `TR:hello`) — the text is processed and replaced in-place
 4. Press `Ctrl+Alt+Z` to undo
 
 ```
@@ -23,62 +21,115 @@ OS-level background assistant that intercepts selected text via a global hotkey,
   │  ▄▀█ █▀▀ ▀█▀ █ █▀█ █▄░█            │
   │  █▀█ █▄▄ ░█░ █ █▄█ █░▀█            │
   │                                      │
-  │  █▀▄▀█ █ █▀▄ █▀▄ █░░ █▀▀ █░█░█     │
-  │  █░▀░█ █ █▄▀ █▄▀ █▄▄ ██▄ ▀▄▀▄▀     │
+  │  █▀▀ █░░ █▀█ █░█░█                  │
+  │  █▀░ █▄▄ █▄█ ▀▄▀▄▀                  │
   ╰──────────────────────────────────────╯
 ```
 
-## Prefixes
+## Commands
 
-| Prefix | Action | Description |
-|--------|--------|-------------|
-| `TR:` | Corporate Translator | Converts toxic/rude phrases into polite professional alternatives |
-| `CMD:` | Terminal Magic | Executes a shell command silently and shows result via notification |
-| `TEST:` | Pipeline Test | Verifies the full capture → process → replace pipeline works |
+### Built-in (no LLM required)
 
-### TR: Examples
+| Prefix | Action | Notes |
+|--------|--------|-------|
+| `TR:` | Rude → professional text | Phrase lookup from config |
+| `CMD:` / `RUN:` | Execute shell command | Dangerous pattern blocking |
+| `TEST:` / `PING:` | Pipeline verification | |
+| `FMT:` / `FORMAT:` | Auto-format JSON/XML | JSON first, XML fallback |
+| `COUNT:` / `STATS:` | Word/char/line stats + reading time | Notification only, no clipboard |
+| `MOCK:` / `SPONGE:` | Spongebob alternating caps | |
+| `B64:` / `BASE64:` | Base64 encode | |
+| `DECODE:` / `DB64:` | Base64 decode | Error notification on invalid |
+| `HASH:` / `SHA:` | SHA256 hex digest | |
+| `REDACT:` / `PII:` | Mask PII (emails, phones, cards, IPs) | Regex-based |
+| `CALC:` / `MATH:` | Safe math evaluator | Handles `15% of 340`, `sqrt(144)`, arithmetic |
+| `DATE:` | Natural language date → ISO format | Uses `dateparser` |
+| `ESCAPE:` / `ESC:` | Escape special characters | Auto-detects HTML/SQL/regex |
+| `SANITIZE:` / `STRIP:` | Strip HTML/markdown/ANSI formatting | Auto-detects format type |
+| `PASSWORD:` / `PW:` | Generate strong random password | |
+| `REPEAT:` / `AGAIN:` | Re-run last command on current selection | |
+| `CLIP:` | Named clipboard slots | `CLIP:save name` / `CLIP:load name` / `CLIP:list` |
+| `STACK:` / `PUSH:` | Push clipboard onto stack | |
+| `POP:` | Pop top item from clipboard stack | |
+| `WIKI:` | Wikipedia article summary | Notification only |
+| `DEFINE:` | Dictionary word definition | Notification only |
+| `IMG:` / `IMAGE:` | Generate image from description | Via Pollinations.ai |
 
-| You type | Gets replaced with |
-|----------|-------------------|
-| `TR:fix this garbage` | "Please review the code for potential improvements." |
-| `TR:this is broken` | "I've identified an issue that needs attention." |
-| `TR:who wrote this` | "Could we discuss the approach taken here?" |
-| `TR:are you serious` | "Could you help me understand the reasoning behind this?" |
-| `TR:do it yourself` | "I'd appreciate your help with this task." |
-| `TR:this is taking forever` | "Could we discuss the timeline and priorities?" |
-| `TR:just ship it` | "Let's discuss what an acceptable MVP looks like." |
-| `TR:stop wasting my time` | "I want to make sure we're using everyone's time effectively." |
+### LLM Commands (require a configured provider)
 
-27 phrases supported across categories: frustration, blame, refusal, deadline pressure, and meetings.
+| Prefix | Action |
+|--------|--------|
+| `SUM:` / `TLDR:` | Summarize text |
+| `RW:` / `REWRITE:` | Rewrite professionally |
+| `EXP:` / `EXPLAIN:` | Explain in simple terms |
+| `TONE:style:` | Dynamic tone rewriting (`TONE:casual:`, `TONE:formal:`, etc.) |
+| `BULLETS:` / `LIST:` | Convert to bullet list |
+| `TITLE:` / `HEADLINE:` | Generate short headline |
+| `TWEET:` | Shorten to 280 chars |
+| `EMAIL:` | Generate email from rough notes |
+| `REGEX:` | Generate regex from description |
+| `DOCSTRING:` / `DOC:` | Generate code docstring |
+| `REVIEW:` / `CR:` | Quick code review |
+| `GITCOMMIT:` / `COMMIT:` | Generate conventional commit message |
+| `MEETING:` / `NOTES:` | Structure meeting notes |
+| `TODO:` / `ACTIONS:` | Extract action items as checklist |
+| `ELI5:` | Explain like I'm 5 |
+| `HAIKU:` | Rewrite as haiku |
+| `ROAST:` | Light roast of selected text |
+| `FILL:` | Fill `{{placeholder}}` markers from context |
+| `TRANS:lang:` | Translate to language (`TRANS:JP:`, `TRANS:ES:`, etc.) |
 
-### CMD: Examples
+### Pipe Chains
+
+Chain multiple commands by separating with `|`:
 
 ```
-CMD:echo hello world       → notification with "hello world"
-CMD:date                   → notification with current date
-CMD:ls ~/Documents         → notification with directory listing
+TR:|SUM: rude long text   →  translates to professional, then summarizes
 ```
 
-### TEST: Examples
+### Personal Commands
 
-```
-TEST:hello world           → replaced with: [TEST OK] "hello world" | session=wayland | wayland=True
-```
+Define your own commands in `config.yaml` under `personal_commands:` with few-shot examples. They appear with a `[ME]` badge in the popup.
 
 ## Keybindings
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+Alt+X` | Intercept selected text |
+| `Ctrl+Alt+X` | Intercept selected text → open command picker |
 | `Ctrl+Alt+Z` | Undo last replacement |
+| `Ctrl+Alt+S` | Toggle silent mode (suppress notifications) |
 | `Ctrl+C` | Exit application |
+
+### TUI Keys
+
+| Key | Action |
+|-----|--------|
+| `/` | Fuzzy search commands |
+| `S` | Export current session to markdown |
+
+## LLM Providers
+
+Configured via interactive selector at first startup, or directly in `config.yaml`.
+
+| Provider | Default Model |
+|----------|---------------|
+| Groq | `llama-3.3-70b-versatile` |
+| OpenAI | `gpt-4o-mini` |
+| Gemini | `gemini-2.0-flash` |
+| OpenRouter | `meta-llama/llama-3.3-70b-instruct` |
+| GitHub Models | `gpt-4o-mini` |
+
+- **Mock mode**: runs without any LLM provider — built-in commands work, LLM commands return `[MOCK]` placeholders
+- **Confidence gating**: LLM classifier confidence below threshold (default `0.7`) skips the command with a notification
+- **Fallback**: if primary provider errors, auto-retries with secondary provider from `config.yaml`
+- **Per-command model override**: optional `model:` key per command in config
 
 ## Requirements
 
 ### System packages
 
 ```bash
-# Wayland (most modern Linux desktops)
+# Wayland
 sudo apt-get install wl-clipboard libnotify-bin
 
 # X11
@@ -91,19 +142,40 @@ sudo apt-get install xclip libnotify-bin
 pip install -r action-middleware/requirements.txt
 ```
 
-- `keyboard>=0.13.5` — global hotkey detection (requires root on Linux)
-- `pyperclip>=1.8.2` — clipboard (macOS/Windows fallback)
-- `plyer>=2.1.0` — notifications (macOS/Windows fallback)
+| Package | Purpose |
+|---------|---------|
+| `keyboard` | Global hotkey detection (requires root on Linux) |
+| `pyperclip` | Clipboard (macOS/Windows fallback) |
+| `plyer` | Notifications (macOS/Windows fallback) |
+| `pyyaml` | Config parsing |
+| `openai` | LLM client (supports all providers via base_url) |
+| `watchdog` | Config hot-reload on file change |
+| `dateparser` | Natural language date parsing |
+| `langdetect` | Automatic language detection |
+| `pystray` | System tray icon |
+| `Pillow` | System tray icon rendering |
 
 ## Usage
 
-The `keyboard` library requires root privileges on Linux for global hotkey access. Use `sudo -E` to preserve your display environment variables:
-
 ```bash
-sudo -E python action-middleware/main.py
-```
+cd action-middleware
 
-The `-E` flag preserves `DISPLAY`, `WAYLAND_DISPLAY`, and `DBUS_SESSION_BUS_ADDRESS` so clipboard and notification tools can connect to your session.
+# Run (requires root for keyboard access, -E preserves session env vars)
+sudo -E python main.py
+
+# Keep full ASCII banner permanently
+sudo -E python main.py --banner
+
+# Run without system tray icon
+sudo -E python main.py --no-tray
+
+# Browse history (last 50 entries)
+python main.py --history
+python main.py --history --grep TR    # filter by command
+
+# Install as systemd service
+sudo -E python main.py --install
+```
 
 ## Architecture
 
@@ -111,48 +183,53 @@ The `-E` flag preserves `DISPLAY`, `WAYLAND_DISPLAY`, and `DBUS_SESSION_BUS_ADDR
 Hotkey (Ctrl+Alt+X)
     │
     ├─ Callback fires on keyboard listener thread
-    │  └─ Spawns worker thread (non-blocking — prevents listener deadlock)
+    │  └─ Spawns worker thread (non-blocking)
     │
     ├─ Worker thread:
-    │  ├─ 0.5s delay (wait for physical key release)
-    │  ├─ Read primary selection (Wayland) or simulate Ctrl+C (X11)
-    │  ├─ Route by prefix (TR: / CMD: / TEST:)
+    │  ├─ Read selection (wl-paste on Wayland / Ctrl+C on X11)
+    │  ├─ Detect app context (terminal/browser/IDE/chat/docs)
+    │  ├─ Analyze text (language, code, formality, type)
+    │  └─ Queue popup for main thread
+    │
+    ├─ Main thread:
+    │  ├─ Show command picker popup (tkinter Toplevel)
+    │  ├─ Smart suggestions ranked by context + learned patterns
+    │  ├─ Route: prefix match → keyword → LLM classify → fallback
     │  ├─ Process text through handler
-    │  └─ Replace selection (clipboard + uinput Ctrl+V)
+    │  └─ Replace selection (clipboard + wtype paste)
     │
     └─ TUI output (thread-safe, timestamped, color-coded)
 ```
 
-### Platform handling
-
-| Component | Wayland | X11 |
-|-----------|---------|-----|
-| Read selection | `wl-paste --primary` | `keyboard` Ctrl+C + `xclip` |
-| Write clipboard | `wl-copy` | `xclip` |
-| Simulate keys | `keyboard` lib (`/dev/uinput`) | `keyboard` lib (`/dev/uinput`) |
-| Notifications | `notify-send` | `notify-send` |
-
 ### Key design decisions
 
-- **Non-blocking callbacks**: Hotkey callbacks spawn threads and return immediately. The `keyboard` library uses a single listener thread — blocking it deadlocks all hotkey detection.
-- **Primary selection on Wayland**: Instead of simulating Ctrl+C (which requires display server cooperation), Wayland's primary selection provides highlighted text directly.
-- **uinput for keystroke simulation**: The `keyboard` library writes to `/dev/uinput` at kernel level, bypassing Wayland's input injection restrictions.
-- **`sudo -E` with `_run_as_user`**: The script runs as root (for `/dev/input` access) but clipboard/notification commands run as the original user (who owns the display session).
+- **Config-driven**: all commands defined in `config.yaml`, no hardcoding
+- **3-tier routing**: prefix match → keyword match → LLM classification → fallback
+- **Non-blocking callbacks**: hotkey callbacks spawn threads and return immediately
+- **Primary selection on Wayland**: reads highlighted text directly via `wl-paste`
+- **wtype for paste**: reliable paste on GNOME Wayland instead of uinput
+- **`sudo -E` with `_run_as_user()`**: runs as root for `/dev/input` access but clipboard/notification commands run as the original user
+- **Pattern learning**: `PatternLearner` reads history, computes usage-frequency weights per app context after 20+ samples
+- **Safe math eval**: `CALC:` uses `ast.parse()` + AST node whitelisting — never raw `eval()`
 
 ## Project Structure
 
 ```
 watashigpt/
 ├── action-middleware/
-│   ├── main.py              # All application code
+│   ├── main.py              # All application code (~4000 lines)
+│   ├── config.yaml.example  # Example config with all commands and settings
 │   └── requirements.txt     # Python dependencies
 ├── .gitignore
 └── README.md
 ```
 
-## Roadmap
+## TUI
 
-- **Phase 2**: Replace prefix-based routing with LLM intent classification (send text to AI API, receive `{"intent": "translate", "payload": "..."}`)
-- Custom phrase dictionaries (user-editable config file)
-- More action prefixes (summarize, rewrite, explain)
-- System tray icon with status indicator
+- **Collapsible banner**: full ASCII art for 2s at startup, collapses to single-line header (`--banner` to keep)
+- **Environment panel**: mode (LIVE/MOCK), learning sample count
+- **LLM panel**: green border in live mode, yellow in mock
+- **Commands panel**: `[LLM]`/`[FAST]` badges, live usage counters
+- **Activity feed**: color-coded rows with timestamps and duration
+- **Micro-log**: rolling 3-line status bar
+- **System tray**: color status icon (green=live, yellow=mock, grey=silent), right-click menu

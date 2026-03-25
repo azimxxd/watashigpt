@@ -85,6 +85,16 @@ commands:
     - meaning of
     prefixes:
     - 'DEFINE:'
+  image:
+    description: Generate image from text (Pollinations.ai)
+    keywords:
+    - image
+    - picture
+    - generate image
+    - draw
+    prefixes:
+    - 'IMG:'
+    - 'IMAGE:'
   docstring:
     description: Generate code docstring (LLM)
     keywords:
@@ -514,8 +524,10 @@ personal_commands: {}
   #         **Yesterday:** Worked on authentication module
   #         **Today:** Fixing bug #123
   #         **Blockers:** None
+command_security:
+  allowed_commands: [ls, cat, grep, find, git, echo, date, python, node, curl, wc, head, tail, sort, uniq, diff, file, stat, whoami, hostname, uname, env, printenv, which, type]
 llm:
-  api_key: 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
+  api_key: ''  # Use env var ACTIONFLOW_API_KEY instead
   fallback:
     api_key: ''
     model: ''

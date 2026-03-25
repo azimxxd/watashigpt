@@ -1,8 +1,10 @@
-# WatashiGPT — Claude Code Instructions
+# ActionFlow — Claude Code Instructions
 
 ## Project Overview
 
 OS-level background assistant that intercepts selected text via global hotkeys, routes it through a 3-tier command system (prefix → keyword → LLM → fallback), and applies transformations. Single-file Python CLI with rich TUI, context-aware intelligence, and system tray support. 38+ commands (19 built-in + 19 LLM + personal commands).
+
+**Developer: WatashiGPT**
 
 ## Project Structure
 
@@ -72,11 +74,11 @@ No automated test suite. Manual testing:
 - **Config persistence**: `_save_llm_config()` writes provider/key/model to `config.yaml` so subsequent runs skip the interactive selector
 - **Pipe chains**: `TR:|SUM: text` chains multiple commands, passing output of each step to the next
 - **REPEAT tracking**: `dispatch()` stores `_last_command` for the `REPEAT:` command (skips tracking repeat itself)
-- **Named clips**: `~/.watashigpt_clips.json` persists named clipboard slots across restarts
+- **Named clips**: `~/.actionflow_clips.json` persists named clipboard slots across restarts
 - **Clipboard stack**: in-memory `_clipboard_stack` list for `STACK:`/`POP:` push/pop operations
 - **Safe math eval**: `CALC:` uses `ast.parse()` + AST node whitelisting — never raw `eval()`
 - **Undo**: CTRL+ALT+Z restores the original text by writing it to clipboard and pasting (not Ctrl+Z). Notification: "Undone · restored previous text"
-- **History log**: `~/.watashigpt_history.jsonl` with `ts`, `command`, `input`, `output`, `duration_ms`, `provider`, `app_context`, `text_length`, `text_language`, `trigger` fields
+- **History log**: `~/.actionflow_history.jsonl` with `ts`, `command`, `input`, `output`, `duration_ms`, `provider`, `app_context`, `text_length`, `text_language`, `trigger` fields
 - **LLM fallback**: if primary provider errors/times out, auto-retry with secondary provider configured in `config.yaml` under `llm.fallback`
 - **Per-command model override**: optional `model:` key per command in config.yaml overrides the global model
 - **Notification level**: optional `notify:` field per command (`always` | `errors_only` | `never`) to suppress desktop notifications for noisy commands
@@ -101,7 +103,7 @@ No automated test suite. Manual testing:
 - **Keybindings panel**: dynamic undo stack count
 - **Micro-log**: rolling 3-line status bar at bottom
 - **Command search**: press `/` in TUI to fuzzy-search commands by name, keywords, prefixes, description
-- **Session export**: press `S` to dump current session activity to `~/watashigpt_session_<timestamp>.md`
+- **Session export**: press `S` to dump current session activity to `~/actionflow_session_<timestamp>.md`
 
 ## Code Style
 

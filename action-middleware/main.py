@@ -1,4 +1,4 @@
-# Action Middleware — OS-level background assistant
+# ActionFlow — OS-level background assistant
 #
 # Run with: sudo -E python main.py
 #   -E preserves DISPLAY, WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS
@@ -34,6 +34,9 @@ import math
 import ast
 import secrets
 import string
+import shlex
+import operator
+import tempfile
 from dataclasses import dataclass
 
 try:
@@ -42,6 +45,18 @@ try:
     _TKINTER_AVAILABLE = True
 except ImportError:
     _TKINTER_AVAILABLE = False
+
+# Persistent hidden tk root — tkinter only allows one Tk() instance per process.
+# All popups must use Toplevel(). This root is created lazily on first use.
+_tk_root: "tk.Tk | None" = None
+
+def _get_tk_root() -> "tk.Tk":
+    """Return the persistent hidden Tk root, creating it on first call."""
+    global _tk_root
+    if _tk_root is None or not _tk_root.winfo_exists():
+        _tk_root = tk.Tk()
+        _tk_root.withdraw()
+    return _tk_root
 
 if platform.system() != "Linux":
     import pyperclip
@@ -111,8 +126,8 @@ CONFIG = load_config()
 
 HOTKEY: str = CONFIG["hotkeys"]["intercept"]
 UNDO_HOTKEY: str = CONFIG["hotkeys"]["undo"]
-CLIPBOARD_DELAY: float = 0.3
-APP_NAME: str = "Action Middleware"
+CLIPBOARD_DELAY: float = 0.15
+APP_NAME: str = "ActionFlow"
 
 _SESSION_TYPE: str = os.environ.get("XDG_SESSION_TYPE", "x11")
 _IS_WAYLAND: bool = _SESSION_TYPE == "wayland"
@@ -143,10 +158,11 @@ _start_time: float = time.time()
 
 _last_command: dict | None = None  # For REPEAT: stores {"name": ..., "config": ...}
 _clipboard_stack: list[str] = []   # For STACK/POP
-_CLIPS_PATH = Path.home() / ".watashigpt_clips.json"
+_CLIPS_PATH = Path.home() / ".actionflow_clips.json"
 
 _popup_queue: queue.Queue = queue.Queue()  # Hotkey thread → main thread for popup
 _popup_trigger: str = "prefix"  # Set per-dispatch: "prefix" or "popup"
+_dispatch_busy: bool = False  # True while a command is being dispatched
 
 _current_app_context = None   # AppContext instance, set per-intercept
 _current_text_analysis = None  # TextAnalysis instance, set per-intercept
@@ -605,7 +621,7 @@ LLM_MODE = "mock"  # "live" or "mock" — set during startup, never changes afte
 
 
 def _save_llm_config(provider: str, api_key: str, model: str) -> None:
-    """Persist LLM provider/key/model to config.yaml."""
+    """Persist LLM provider/model to config.yaml. API key is NEVER written to disk."""
     try:
         if _CONFIG_PATH.exists():
             with open(_CONFIG_PATH, "r") as f:
@@ -615,8 +631,8 @@ def _save_llm_config(provider: str, api_key: str, model: str) -> None:
         if "llm" not in data:
             data["llm"] = {}
         data["llm"]["provider"] = provider
-        data["llm"]["api_key"] = api_key
         data["llm"]["model"] = model
+        data["llm"].pop("api_key", None)  # Never persist API key to disk
         with open(_CONFIG_PATH, "w") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
     except Exception as exc:
@@ -697,7 +713,9 @@ def _llm_setup_prompt() -> None:
     # Persist to config.yaml so subsequent runs skip the selector
     _save_llm_config(provider, api_key, model)
 
-    print(f"\n  {g}✓ LLM configured: {provider}/{model}{r}\n")
+    print(f"\n  {g}✓ LLM configured: {provider}/{model}{r}")
+    print(f"  {d}Tip: export ACTIONFLOW_API_KEY='{api_key}' in your shell profile{r}")
+    print(f"  {d}API keys are never saved to config.yaml for security.{r}\n")
 
 
 _PROVIDER_BASE_URLS = {
@@ -752,9 +770,10 @@ def _init_llm() -> None:
     api_key = llm_cfg.get("api_key", "").strip()
     model = llm_cfg.get("model", "").strip()
 
-    # Allow env var override for API key
-    if not api_key:
-        api_key = os.environ.get("ACTION_MW_API_KEY", "").strip()
+    # Env var takes priority over config (config should never store keys)
+    env_key = os.environ.get("ACTIONFLOW_API_KEY", "").strip()
+    if env_key:
+        api_key = env_key
 
     if not provider or not api_key:
         _llm_ready = False
@@ -1026,8 +1045,8 @@ class TUI:
             "  ▄▀█ █▀▀ ▀█▀ █ █▀█ █▄░█",
             "  █▀█ █▄▄ ░█░ █ █▄█ █░▀█",
             "",
-            "  █▀▄▀█ █ █▀▄ █▀▄ █░░ █▀▀ █░█░█ ▄▀█ █▀█ █▀▀",
-            "  █░▀░█ █ █▄▀ █▄▀ █▄▄ ██▄ ▀▄▀▄▀ █▀█ █▀▄ ██▄",
+            "  █▀▀ █░░ █▀█ █░█░█",
+            "  █▀░ █▄▄ █▄█ ▀▄▀▄▀",
         ]
 
         with cls._print_lock:
@@ -1054,7 +1073,7 @@ class TUI:
 
         cmd_count = len(CONFIG.get("commands", {}))
         line = (
-            f"  {cls.MAGENTA}{cls.BOLD}▶ WATASHIGPT{cls.RESET}  "
+            f"  {cls.MAGENTA}{cls.BOLD}▶ ACTIONFLOW{cls.RESET}  "
             f"{cls.DIM}|{cls.RESET}  {mode_str}  "
             f"{cls.DIM}|{cls.RESET}  {cls.DIM}{cmd_count} commands{cls.RESET}  "
             f"{cls.DIM}|{cls.RESET}  {cls.DIM}uptime: {uptime}{cls.RESET}"
@@ -1216,11 +1235,16 @@ class TUI:
 # Command Picker — Tkinter Popup
 # ============================================================
 
-_TONE_STYLES = ["casual", "formal", "aggressive", "empathetic", "confident", "sarcastic", "diplomatic"]
+_TONE_STYLES = ["casual", "formal", "aggressive", "empathetic", "confident", "sarcastic", "diplomatic",
+               "gen-z", "academic", "professional email", "encouraging"]
 _TRANS_LANGS = [
     ("Japanese", "JP", "\U0001f1ef\U0001f1f5"), ("Spanish", "ES", "\U0001f1ea\U0001f1f8"),
     ("French", "FR", "\U0001f1eb\U0001f1f7"), ("German", "DE", "\U0001f1e9\U0001f1ea"),
     ("Chinese", "ZH", "\U0001f1e8\U0001f1f3"), ("Arabic", "AR", "\U0001f1f8\U0001f1e6"),
+    ("Russian", "RU", "\U0001f1f7\U0001f1fa"), ("Korean", "KO", "\U0001f1f0\U0001f1f7"),
+    ("Portuguese", "PT", "\U0001f1e7\U0001f1f7"), ("Italian", "IT", "\U0001f1ee\U0001f1f9"),
+    ("Turkish", "TR", "\U0001f1f9\U0001f1f7"), ("Hindi", "HI", "\U0001f1ee\U0001f1f3"),
+    ("Polish", "PL", "\U0001f1f5\U0001f1f1"), ("Dutch", "NL", "\U0001f1f3\U0001f1f1"),
 ]
 
 if _TKINTER_AVAILABLE:
@@ -1267,7 +1291,8 @@ if _TKINTER_AVAILABLE:
             self._row_widgets: list = []
             self._is_searching = False
 
-            self._root = tk.Tk()
+            _get_tk_root()
+            self._root = tk.Toplevel()
             self._root.withdraw()
             self._root.overrideredirect(True)
             self._root.attributes("-topmost", True)
@@ -1808,165 +1833,10 @@ if _TKINTER_AVAILABLE:
         def run(self) -> tuple | None:
             """Show the popup and block until a choice is made. Returns (cmd_name, cmd_config, payload) or None."""
             try:
-                self._root.mainloop()
+                self._root.wait_window(self._root)
             except Exception:
                 return None
             return self._result
-
-
-if _TKINTER_AVAILABLE:
-    class RefinementDialog:
-        """Post-LLM-command dialog for iterative refinement. Max 3 iterations."""
-        BG = "#1a0a2e"
-        FG = "#e0e0e0"
-        FG_DIM = "#888888"
-        BORDER_COLOR = "#d45cff"
-        SEARCH_BG = "#0e0620"
-        MAX_ITERATIONS = 3
-
-        def __init__(self, original: str, result: str, cmd_name: str, duration: float):
-            self._original = original
-            self._result = result
-            self._cmd_name = cmd_name
-            self._duration = duration
-            self._iterations = 0
-            self._accepted = False
-            self._final_result = result
-
-            self._root = tk.Tk()
-            self._root.withdraw()
-            self._root.overrideredirect(True)
-            self._root.attributes("-topmost", True)
-            self._root.configure(bg=self.BG, highlightbackground=self.BORDER_COLOR,
-                                 highlightthickness=1)
-
-            try:
-                self._font = tkfont.Font(family="DejaVu Sans Mono", size=10)
-                self._font_bold = tkfont.Font(family="DejaVu Sans Mono", size=10, weight="bold")
-                self._font_small = tkfont.Font(family="DejaVu Sans Mono", size=9)
-            except Exception:
-                self._font = tkfont.Font(family="Courier", size=10)
-                self._font_bold = tkfont.Font(family="Courier", size=10, weight="bold")
-                self._font_small = tkfont.Font(family="Courier", size=9)
-
-            self._build_ui()
-
-            # Position at screen center
-            self._root.update_idletasks()
-            w = 450
-            h = 280
-            sw = self._root.winfo_screenwidth()
-            sh = self._root.winfo_screenheight()
-            self._root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
-            self._root.deiconify()
-            self._root.focus_force()
-            self._refine_entry.focus_set()
-
-        def _build_ui(self) -> None:
-            # Header
-            header_text = f"\u2713 {self._cmd_name.title()} applied  ({self._duration:.1f}s)"
-            tk.Label(self._root, text=header_text, bg=self.BG, fg="#00d4aa",
-                     font=self._font_bold, anchor="w", padx=8, pady=4).pack(fill="x")
-            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
-
-            # Result preview
-            tk.Label(self._root, text="Result:", bg=self.BG, fg=self.FG_DIM,
-                     font=self._font_small, anchor="w", padx=8, pady=4).pack(fill="x")
-            preview_frame = tk.Frame(self._root, bg=self.SEARCH_BG)
-            preview_frame.pack(fill="both", expand=True, padx=8, pady=4)
-            self._preview = tk.Text(preview_frame, bg=self.SEARCH_BG, fg=self.FG,
-                                    font=self._font_small, wrap="word", height=5,
-                                    relief="flat", bd=0, state="normal")
-            self._preview.pack(fill="both", expand=True, padx=4, pady=4)
-            self._preview.insert("1.0", self._result[:500])
-            self._preview.config(state="disabled")
-
-            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
-
-            # Refine input
-            tk.Label(self._root, text="Refine or press Enter to accept:",
-                     bg=self.BG, fg=self.FG_DIM, font=self._font_small,
-                     anchor="w", padx=8, pady=4).pack(fill="x")
-            entry_frame = tk.Frame(self._root, bg=self.SEARCH_BG)
-            entry_frame.pack(fill="x", padx=8, pady=4)
-            self._refine_entry = tk.Entry(
-                entry_frame, bg=self.SEARCH_BG, fg=self.FG,
-                insertbackground=self.FG, font=self._font, relief="flat", bd=0,
-            )
-            self._refine_entry.pack(fill="x", padx=4, pady=4)
-
-            # Status line
-            self._status_label = tk.Label(
-                self._root, text=f"Enter: accept \u00b7 Type + Enter: refine "
-                f"({self.MAX_ITERATIONS} left) \u00b7 Esc: undo",
-                bg=self.BG, fg=self.FG_DIM, font=self._font_small,
-                anchor="w", padx=8, pady=4)
-            self._status_label.pack(fill="x")
-
-            # Bindings
-            self._root.bind("<Return>", self._on_enter)
-            self._root.bind("<Escape>", self._on_escape)
-            self._root.bind("<FocusOut>", lambda e: None)
-
-        def _on_enter(self, event=None) -> None:
-            instruction = self._refine_entry.get().strip()
-            if not instruction:
-                # Accept result
-                self._accepted = True
-                self._root.destroy()
-                return
-
-            if self._iterations >= self.MAX_ITERATIONS:
-                self._status_label.config(text="Max refinements reached — press Enter to accept")
-                self._refine_entry.delete(0, "end")
-                return
-
-            self._iterations += 1
-            self._refine_entry.delete(0, "end")
-            remaining = self.MAX_ITERATIONS - self._iterations
-            self._status_label.config(text=f"Refining... ({remaining} left)")
-
-            threading.Thread(target=self._do_refine, args=(instruction,), daemon=True).start()
-
-        def _do_refine(self, instruction: str) -> None:
-            prompt = (
-                f"Original text:\n{self._original[:300]}\n\n"
-                f"Current result:\n{self._result[:500]}\n\n"
-                f"Refinement instruction: {instruction}\n\n"
-                f"Apply the refinement and return ONLY the updated text."
-            )
-            try:
-                result = _llm_call(prompt)
-                self._result = result
-                self._final_result = result
-                self._root.after(0, self._update_preview)
-            except Exception as exc:
-                self._root.after(0, lambda: self._status_label.config(
-                    text=f"Error: {str(exc)[:60]}"))
-
-        def _update_preview(self) -> None:
-            self._preview.config(state="normal")
-            self._preview.delete("1.0", "end")
-            self._preview.insert("1.0", self._result[:500])
-            self._preview.config(state="disabled")
-            remaining = self.MAX_ITERATIONS - self._iterations
-            if remaining > 0:
-                self._status_label.config(
-                    text=f"Enter: accept \u00b7 Type + Enter: refine ({remaining} left) \u00b7 Esc: undo")
-            else:
-                self._status_label.config(text="Max refinements reached — press Enter to accept")
-
-        def _on_escape(self, event=None) -> None:
-            self._accepted = False
-            self._root.destroy()
-
-        def run(self) -> tuple[str, bool, int]:
-            """Returns (final_text, accepted, iteration_count)."""
-            try:
-                self._root.mainloop()
-            except Exception:
-                return (self._result, False, self._iterations)
-            return (self._final_result, self._accepted, self._iterations)
 
 
 def _handle_popup(text: str) -> None:
@@ -2001,11 +1871,6 @@ def _handle_popup(text: str) -> None:
         TUI.micro_log(f"Command picker cancelled")
         return
 
-    # Allow window manager to restore focus to the original app after popup closes.
-    # On GNOME Wayland, focus restoration after an XWayland window (tkinter) closes
-    # can take 100-300ms depending on compositor load.
-    time.sleep(0.4)
-
     cmd_name, cmd_config, payload = result
     is_llm = cmd_config.get("llm_required", False)
 
@@ -2018,46 +1883,18 @@ def _handle_popup(text: str) -> None:
     _popup_trigger = "popup"
     TUI.status("\U0001f3af", f"Popup \u2192 {cmd_name}", TUI.GREEN)
 
-    # For LLM commands in live mode, dispatch synchronously so we can show refinement
-    if is_llm and LLM_MODE == "live" and _TKINTER_AVAILABLE:
-        start_t = time.time()
-        try:
-            dispatch(cmd_name, payload, text, cmd_config)
-        except Exception as exc:
-            TUI.error(f"Popup dispatch error: {exc}")
-            return
-        duration = time.time() - start_t
+    # Wait for compositor to restore focus to the original app after
+    # the XWayland tkinter popup closes (GNOME Wayland needs ~300-500ms).
+    time.sleep(0.6)
 
-        # Get the result from undo stack
-        with _undo_lock:
-            last_result = _undo_stack[-1]["replacement"] if _undo_stack else None
-
-        if last_result:
-            refinement = RefinementDialog(text, last_result, cmd_name, duration)
-            final_text, accepted, iterations = refinement.run()
-
-            if accepted and iterations > 0 and final_text != last_result:
-                _push_undo(text, final_text)
-                _replace_selection(final_text)
-                _log_history(f"{cmd_name}+refine", payload, final_text, int(duration * 1000),
-                             app_context=_current_app_context.context_type if _current_app_context else "",
-                             text_length=len(payload),
-                             text_language=_current_text_analysis.language if _current_text_analysis else "",
-                             trigger="refinement")
-                TUI.micro_log(f"Refined ({iterations}x) — result updated")
-            elif not accepted:
-                _do_undo()
-                TUI.micro_log(f"Refinement cancelled — undone")
-        return
-
-    # Dispatch in a worker thread so we don't block the main loop
-    def _run():
-        try:
-            dispatch(cmd_name, payload, text, cmd_config)
-        except Exception as exc:
-            TUI.error(f"Popup dispatch error: {exc}")
-
-    threading.Thread(target=_run, daemon=True).start()
+    global _dispatch_busy
+    _dispatch_busy = True
+    try:
+        dispatch(cmd_name, payload, text, cmd_config)
+    except Exception as exc:
+        TUI.error(f"Popup dispatch error: {exc}")
+    finally:
+        _dispatch_busy = False
 
 
 # ============================================================
@@ -2137,127 +1974,32 @@ def _get_primary_selection() -> str:
 def _send_paste_keys() -> None:
     """Send Ctrl+V paste using the most reliable method for the current platform.
 
-    On Wayland, uses wtype (native Wayland virtual-keyboard-v1 protocol) when
-    available — much more reliable than uinput-based keyboard.send() which GNOME
-    Wayland often ignores or misroutes.
+    Strategy (tried in order):
+    1. wtype — native Wayland virtual-keyboard-v1 protocol (best on sway/wlroots)
+    2. keyboard.send via uinput — works under sudo, reliable when modifiers are clean
     """
-    if _HAS_WTYPE:
-        try:
-            _run_as_user(
-                ["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"],
-                capture_output=True, timeout=3,
-            )
-            return
-        except Exception:
-            pass
-    # Fallback: release lingering modifiers, then use keyboard library (uinput)
+    # Release any lingering modifier keys from the hotkey combo first
     for key in ('ctrl', 'alt', 'shift'):
         try:
             keyboard.release(key)
         except Exception:
             pass
     time.sleep(0.05)
+
+    if _HAS_WTYPE:
+        try:
+            # -d 50: 50ms delay between key events for compositor reliability
+            result = _run_as_user(
+                ["wtype", "-d", "50", "-M", "ctrl", "-k", "v", "-m", "ctrl"],
+                capture_output=True, timeout=3,
+            )
+            if result.returncode == 0:
+                return
+        except Exception:
+            pass
+
+    # Fallback: uinput via keyboard library
     keyboard.send("ctrl+v")
-
-
-# ============================================================
-# Toast Popup — Non-blocking "Applied" notification
-# ============================================================
-
-_toast_queue: queue.Queue = queue.Queue()  # Worker thread → main thread for toast
-
-
-if _TKINTER_AVAILABLE:
-
-    class ToastPopup:
-        """Non-blocking floating toast that shows result and auto-closes.
-        Does NOT steal focus from the original application."""
-        BG = "#1a0a2e"
-        FG = "#e0e0e0"
-        FG_DIM = "#888888"
-        BORDER_COLOR = "#00d4aa"
-        SEARCH_BG = "#0e0620"
-        AUTO_CLOSE_MS = 3000
-
-        def __init__(self, result_text: str):
-            self._text = result_text
-
-            self._root = tk.Tk()
-            self._root.withdraw()
-            self._root.overrideredirect(True)
-            self._root.attributes("-topmost", True)
-            self._root.configure(bg=self.BG, highlightbackground=self.BORDER_COLOR,
-                                 highlightthickness=1)
-
-            try:
-                self._font = tkfont.Font(family="DejaVu Sans Mono", size=10)
-                self._font_bold = tkfont.Font(family="DejaVu Sans Mono", size=10, weight="bold")
-                self._font_small = tkfont.Font(family="DejaVu Sans Mono", size=9)
-            except Exception:
-                self._font = tkfont.Font(family="Courier", size=10)
-                self._font_bold = tkfont.Font(family="Courier", size=10, weight="bold")
-                self._font_small = tkfont.Font(family="Courier", size=9)
-
-            self._build_ui()
-
-            # Position at bottom-right of screen
-            self._root.update_idletasks()
-            w = 350
-            h = 120
-            sw = self._root.winfo_screenwidth()
-            sh = self._root.winfo_screenheight()
-            x = sw - w - 20
-            y = sh - h - 60
-            self._root.geometry(f"{w}x{h}+{x}+{y}")
-            self._root.deiconify()
-
-            # Auto-close after 3 seconds
-            self._root.after(self.AUTO_CLOSE_MS, self._close)
-
-        def _build_ui(self) -> None:
-            # Header
-            header_frame = tk.Frame(self._root, bg=self.BG)
-            header_frame.pack(fill="x")
-            tk.Label(header_frame, text="\u2713 Text applied", bg=self.BG, fg=self.BORDER_COLOR,
-                     font=self._font_bold, anchor="w", padx=8, pady=4).pack(side="left")
-            # Close button
-            close_btn = tk.Label(header_frame, text="\u2715", bg=self.BG, fg=self.FG_DIM,
-                                font=self._font_bold, cursor="hand2", padx=8, pady=4)
-            close_btn.pack(side="right")
-            close_btn.bind("<Button-1>", lambda e: self._close())
-            close_btn.bind("<Enter>", lambda e: close_btn.configure(fg="#ff4444"))
-            close_btn.bind("<Leave>", lambda e: close_btn.configure(fg=self.FG_DIM))
-
-            tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
-
-            # Preview of result
-            preview = self._text[:120] + ("..." if len(self._text) > 120 else "")
-            tk.Label(self._root, text=preview, bg=self.SEARCH_BG, fg=self.FG,
-                     font=self._font_small, anchor="nw", justify="left",
-                     wraplength=330, padx=8, pady=6).pack(fill="both", expand=True, padx=4, pady=4)
-
-            # Undo hint
-            undo_key = UNDO_HOTKEY.upper()
-            tk.Label(self._root, text=f"{undo_key} to undo",
-                     bg=self.BG, fg=self.FG_DIM, font=self._font_small,
-                     anchor="w", padx=8, pady=2).pack(fill="x")
-
-            # Bindings — clicking anywhere closes
-            self._root.bind("<Button-1>", lambda e: self._close())
-            self._root.bind("<Escape>", lambda e: self._close())
-
-        def _close(self) -> None:
-            try:
-                self._root.destroy()
-            except Exception:
-                pass
-
-        def run(self) -> None:
-            """Show toast and block until auto-close or user click."""
-            try:
-                self._root.mainloop()
-            except Exception:
-                pass
 
 
 # ============================================================
@@ -2291,7 +2033,8 @@ if _TKINTER_AVAILABLE:
             self._title = title
             self._text = result_text
 
-            self._root = tk.Tk()
+            _get_tk_root()
+            self._root = tk.Toplevel()
             self._root.withdraw()
             self._root.overrideredirect(True)
             self._root.attributes("-topmost", True)
@@ -2402,7 +2145,7 @@ if _TKINTER_AVAILABLE:
         def run(self) -> None:
             """Show popup and block until user closes it."""
             try:
-                self._root.mainloop()
+                self._root.wait_window(self._root)
             except Exception:
                 pass
 
@@ -2417,12 +2160,14 @@ def _replace_selection(new_text: str) -> None:
         TUI.success("Chain step complete (output passed to next step)")
         return
     clipboard_copy(new_text)
-    time.sleep(CLIPBOARD_DELAY)
+    # Wait for clipboard to settle — wl-copy needs time to register
+    time.sleep(0.25)
     _send_paste_keys()
+    # Small delay after paste to let the target app process the input
+    time.sleep(0.1)
     TUI.success("Text replaced in-place")
-    # Queue a non-blocking toast notification for the main thread
-    if _TKINTER_AVAILABLE:
-        _toast_queue.put(new_text)
+    truncated = new_text[:60] + ("..." if len(new_text) > 60 else "")
+    notify(APP_NAME, f"Applied: \"{truncated}\"")
 
 
 # ============================================================
@@ -2439,6 +2184,13 @@ def _should_notify(is_error: bool = False) -> bool:
     return True
 
 
+def _sanitize_for_notify(s: str) -> str:
+    """Strip markup characters and truncate for safe use in notify-send."""
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    s = s.replace("\x00", "")  # strip null bytes
+    return s[:300]
+
+
 def notify(title: str, message: str, is_error: bool = False) -> None:
     with _silent_mode_lock:
         if _silent_mode:
@@ -2448,7 +2200,8 @@ def notify(title: str, message: str, is_error: bool = False) -> None:
     try:
         if platform.system() == "Linux":
             _run_as_user(
-                ["notify-send", "-t", "5000", title, message],
+                ["notify-send", "-t", "5000",
+                 _sanitize_for_notify(title), _sanitize_for_notify(message)],
                 capture_output=True,
                 timeout=3,
             )
@@ -2480,7 +2233,13 @@ def _push_undo(original: str, replacement: str) -> None:
 
 def _do_undo() -> None:
     try:
-        time.sleep(0.5)
+        time.sleep(0.2)
+        # Release modifier keys from the undo hotkey combo
+        for key in ('ctrl', 'alt', 'shift'):
+            try:
+                keyboard.release(key)
+            except Exception:
+                pass
 
         with _undo_lock:
             if not _undo_stack:
@@ -2492,8 +2251,9 @@ def _do_undo() -> None:
         TUI.separator()
         TUI.action("↩", "UNDO", "Restoring previous clipboard")
         clipboard_copy(entry["original"])
-        time.sleep(CLIPBOARD_DELAY)
+        time.sleep(0.25)
         _send_paste_keys()
+        time.sleep(0.1)
 
         truncated = entry["original"][:50] + ("..." if len(entry["original"]) > 50 else "")
         TUI.success(f"Undone — restored: \"{truncated}\"")
@@ -2552,28 +2312,45 @@ def handle_translate(text: str, full_text: str, cmd_config: dict) -> None:
     notify("Corporate Translator", f"Replaced: \"{result[:80]}\"")
 
 
+_CMD_ALLOWED_COMMANDS: list[str] = CONFIG.get("command_security", {}).get(
+    "allowed_commands",
+    ["ls", "cat", "grep", "find", "git", "echo", "date", "python", "node",
+     "curl", "wc", "head", "tail", "sort", "uniq", "diff", "file", "stat",
+     "whoami", "hostname", "uname", "env", "printenv", "which", "type"],
+)
+
+
 def handle_command(text: str, full_text: str, cmd_config: dict) -> None:
-    """Terminal Magic — execute a shell command silently."""
+    """Terminal Magic — execute a shell command silently.
+
+    Security: uses shlex.split (no shell=True), allowlist for binary names,
+    and runs as $SUDO_USER (not root) via _run_as_user().
+    """
     command = text.strip()
 
-    dangerous_patterns = ["rm -rf /", "format", "mkfs", ":(){", "dd if="]
-    for pattern in dangerous_patterns:
-        if pattern in command.lower():
-            TUI.error(f"BLOCKED — dangerous pattern: '{pattern}'")
-            notify("Security Block", f"Command blocked — contains '{pattern}'")
-            return
+    # Parse into argument list — no shell interpretation
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        TUI.error(f"CMD: invalid command syntax: {exc}")
+        notify("Security Block", "Invalid command syntax")
+        return
+
+    if not parts:
+        TUI.error("CMD: empty command")
+        return
+
+    # Allowlist check: only the binary name (basename), not full paths
+    binary = os.path.basename(parts[0])
+    if binary not in _CMD_ALLOWED_COMMANDS:
+        TUI.error(f"BLOCKED — '{binary}' not in allowed commands list")
+        notify("Security Block",
+               f"'{binary}' is not allowed. Allowed: {', '.join(_CMD_ALLOWED_COMMANDS[:10])}...")
+        return
 
     try:
-        if platform.system() == "Windows":
-            result = subprocess.run(
-                ["cmd", "/c", command],
-                capture_output=True, text=True, timeout=30,
-            )
-        else:
-            result = subprocess.run(
-                command, shell=True,
-                capture_output=True, text=True, timeout=30,
-            )
+        # Execute as the real user, NOT root — shell=False by default
+        result = _run_as_user(parts, capture_output=True, text=True, timeout=30)
 
         TUI.action("⚡", "COMMAND", f"`{command}`")
 
@@ -2614,7 +2391,10 @@ def handle_test(text: str, full_text: str, cmd_config: dict) -> None:
 
 def handle_llm_command(text: str, full_text: str, cmd_config: dict,
                        cmd_key: str = "") -> None:
-    """Generic handler for LLM-backed commands defined in config.yaml."""
+    """Generic handler for LLM-backed commands defined in config.yaml.
+
+    Injects context variables: {context}, {code_language}, {app_context}
+    """
     cmd_name = cmd_config.get("description", "LLM")
     is_display_only = cmd_config.get("display_only", False) or cmd_key in _DISPLAY_ONLY_COMMANDS
 
@@ -2631,7 +2411,41 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict,
         return
 
     prompt_template = cmd_config.get("llm_prompt", "Process this text: {text}")
-    prompt = prompt_template.format(text=text.strip())
+
+    # Build context variables for smart prompt injection
+    fmt_vars = {"text": text.strip()}
+    if _current_text_analysis:
+        fmt_vars["code_language"] = _current_text_analysis.code_language or "unknown"
+        fmt_vars["looks_like"] = _current_text_analysis.looks_like
+        fmt_vars["language"] = _current_text_analysis.language
+        fmt_vars["is_code"] = str(_current_text_analysis.is_code)
+        # Build a context hint string
+        ctx_parts = []
+        if _current_text_analysis.is_code:
+            ctx_parts.append(f"code ({_current_text_analysis.code_language or 'unknown language'})")
+        if not _current_text_analysis.is_formal:
+            ctx_parts.append("informal tone")
+        ctx_parts.append(f"looks like: {_current_text_analysis.looks_like}")
+        fmt_vars["context"] = ", ".join(ctx_parts) if ctx_parts else "general text"
+    else:
+        fmt_vars["context"] = "general text"
+        fmt_vars["code_language"] = "unknown"
+        fmt_vars["looks_like"] = "prose"
+        fmt_vars["language"] = "en"
+        fmt_vars["is_code"] = "False"
+
+    if _current_app_context:
+        fmt_vars["app_context"] = _current_app_context.context_type
+    else:
+        fmt_vars["app_context"] = "unknown"
+
+    # Safely format the prompt — ignore missing keys
+    try:
+        prompt = prompt_template.format(**fmt_vars)
+    except KeyError:
+        # Fallback: only inject {text} if other vars are missing from template
+        prompt = prompt_template.format(text=text.strip())
+
     cmd_model = cmd_config.get("model", "")
 
     TUI.status("\U0001f916", f"Processing with LLM...", TUI.CYAN)
@@ -2653,43 +2467,100 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict,
 
 
 def handle_fmt(text: str, full_text: str, cmd_config: dict) -> None:
-    """Auto-format JSON or XML text with indentation."""
+    """Auto-format JSON, XML, or YAML text with indentation.
+
+    Supports modes:
+    - FMT: / FORMAT: — prettify (default)
+    - MIN: / MINIFY: — minify (compress to one line)
+    - SORT: — prettify with sorted keys (JSON only)
+    """
     content = text.strip()
+
+    # Detect mode from prefix (set by router, may be embedded in payload)
+    minify = False
+    sort_keys = False
+    content_lower = content.lower()
+    if content_lower.startswith("min:") or content_lower.startswith("minify:"):
+        minify = True
+        content = _re.sub(r'^(?:min|minify):\s*', '', content, flags=_re.IGNORECASE).strip()
+    elif content_lower.startswith("sort:"):
+        sort_keys = True
+        content = _re.sub(r'^sort:\s*', '', content, flags=_re.IGNORECASE).strip()
+
     # Try JSON first
     try:
         parsed = json.loads(content)
-        result = json.dumps(parsed, indent=2, ensure_ascii=False)
+        if minify:
+            result = json.dumps(parsed, separators=(',', ':'), ensure_ascii=False)
+            label = "Minified"
+        else:
+            result = json.dumps(parsed, indent=2, ensure_ascii=False, sort_keys=sort_keys)
+            label = "Formatted" + (" (sorted)" if sort_keys else "")
 
         _push_undo(full_text, result)
         _replace_selection(result)
 
-        TUI.action("🔧", "FMT", f"Formatted JSON ({len(content)} → {len(result)} chars)")
-        notify("Format", "JSON formatted successfully")
+        TUI.action("🔧", "FMT", f"{label} JSON ({len(content)} → {len(result)} chars)")
+        notify("Format", f"JSON {label.lower()} successfully")
         return
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        json_error = exc  # Save for fallback error reporting
+
+    # Try YAML
+    try:
+        parsed_yaml = yaml.safe_load(content)
+        if isinstance(parsed_yaml, (dict, list)):
+            if minify:
+                # YAML minify = dump as JSON compact
+                result = json.dumps(parsed_yaml, separators=(',', ':'), ensure_ascii=False)
+                label = "YAML → minified JSON"
+            else:
+                result = yaml.dump(parsed_yaml, default_flow_style=False,
+                                   allow_unicode=True, sort_keys=sort_keys).strip()
+                label = "Formatted YAML" + (" (sorted)" if sort_keys else "")
+
+            _push_undo(full_text, result)
+            _replace_selection(result)
+
+            TUI.action("🔧", "FMT", f"{label} ({len(content)} → {len(result)} chars)")
+            notify("Format", f"{label} successfully")
+            return
+    except Exception:
         pass
 
     # Try XML
     try:
         import xml.dom.minidom
         dom = xml.dom.minidom.parseString(content)
-        result = dom.toprettyxml(indent="  ")
-        # Remove the XML declaration if it wasn't in the original
-        if not content.strip().startswith("<?xml"):
-            result = "\n".join(result.split("\n")[1:])
-        result = result.strip()
+        if minify:
+            result = dom.toxml()
+            # Remove XML declaration for minified output
+            if not content.strip().startswith("<?xml"):
+                result = _re.sub(r'^<\?xml[^?]*\?>\s*', '', result)
+            label = "Minified"
+        else:
+            result = dom.toprettyxml(indent="  ")
+            # Remove the XML declaration if it wasn't in the original
+            if not content.strip().startswith("<?xml"):
+                result = "\n".join(result.split("\n")[1:])
+            result = result.strip()
+            label = "Formatted"
 
         _push_undo(full_text, result)
         _replace_selection(result)
 
-        TUI.action("🔧", "FMT", f"Formatted XML ({len(content)} → {len(result)} chars)")
-        notify("Format", "XML formatted successfully")
+        TUI.action("🔧", "FMT", f"{label} XML ({len(content)} → {len(result)} chars)")
+        notify("Format", f"XML {label.lower()} successfully")
         return
     except Exception:
         pass
 
-    TUI.error("FMT: could not parse as JSON or XML")
-    notify("Format Error", "FMT: could not parse as JSON or XML")
+    # Report error with position hint from JSON parser
+    err_msg = f"Could not parse as JSON, YAML, or XML"
+    if json_error:
+        err_msg += f" (JSON error at line {json_error.lineno}, col {json_error.colno}: {json_error.msg})"
+    TUI.error(f"FMT: {err_msg}")
+    notify("Format Error", err_msg[:200])
 
 
 def handle_count(text: str, full_text: str, cmd_config: dict) -> None:
@@ -2765,6 +2636,16 @@ _PII_PATTERNS = [
     (_re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"), "[CARD]"),
     (_re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)?\d{3,4}[-.\s]?\d{4}\b"), "[PHONE]"),
     (_re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[IP]"),
+    # Date patterns (DD/MM/YYYY, MM-DD-YYYY, YYYY.MM.DD)
+    (_re.compile(r"\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b"), "[DATE]"),
+    # SSN-like (XXX-XX-XXXX)
+    (_re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
+    # Passport-like (2 letters + 7 digits)
+    (_re.compile(r"\b[A-Z]{2}\d{7}\b"), "[PASSPORT]"),
+    # Bearer tokens / API keys (long hex/base64 strings)
+    (_re.compile(r"(?:Bearer\s+|api[_-]?key[=:]\s*)[A-Za-z0-9_\-./+=]{20,}"), "[API_KEY]"),
+    # Generic long tokens (40+ hex chars, e.g. SHA hashes, API keys)
+    (_re.compile(r"\b[a-fA-F0-9]{40,}\b"), "[TOKEN]"),
 ]
 
 
@@ -2791,6 +2672,16 @@ _CALC_NATURAL = [
     (_re.compile(r"(\d+(?:\.\d+)?)\s*\*\*\s*(\d+(?:\.\d+)?)"), lambda m: str(float(m.group(1)) ** float(m.group(2)))),
 ]
 
+# Math function substitutions — pre-process before AST parse
+_MATH_FUNCS = {
+    "sin": math.sin, "cos": math.cos, "tan": math.tan,
+    "asin": math.asin, "acos": math.acos, "atan": math.atan,
+    "log": math.log10, "ln": math.log, "log2": math.log2,
+    "abs": abs, "ceil": math.ceil, "floor": math.floor,
+    "sqrt": math.sqrt, "exp": math.exp,
+    "radians": math.radians, "degrees": math.degrees,
+}
+
 
 def _safe_eval_math(expr: str) -> str | None:
     """Safely evaluate a math expression using ast. Returns result string or None."""
@@ -2806,30 +2697,77 @@ def _safe_eval_math(expr: str) -> str | None:
             except Exception:
                 pass
 
+    # Pre-process math functions: sin(45) → _RESULT_
+    func_expr = expr
+    for func_name, func_fn in _MATH_FUNCS.items():
+        pattern = _re.compile(rf'{func_name}\(([^)]+)\)', _re.IGNORECASE)
+        while pattern.search(func_expr):
+            m = pattern.search(func_expr)
+            try:
+                inner_val = _safe_eval_math(m.group(1))
+                if inner_val is not None:
+                    func_result = func_fn(float(inner_val))
+                    func_expr = func_expr[:m.start()] + str(func_result) + func_expr[m.end():]
+                else:
+                    break
+            except (ValueError, OverflowError):
+                break
+
     # Clean the expression: keep only math chars
-    cleaned = _re.sub(r"[^0-9+\-*/().%^ ]", "", expr)
+    cleaned = _re.sub(r"[^0-9+\-*/().%^ e]", "", func_expr)
     cleaned = cleaned.replace("^", "**")
     if not cleaned.strip():
         return None
 
     try:
-        # Parse as AST and validate — only allow math operations
         tree = ast.parse(cleaned, mode='eval')
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
-                                 ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow,
-                                 ast.Mod, ast.FloorDiv, ast.USub, ast.UAdd)):
-                continue
-            return None  # Unsafe node type
-        result = eval(compile(tree, "<calc>", "eval"))
+        result = _ast_eval(tree.body)
         f = float(result)
         return str(int(f)) if f == int(f) else str(round(f, 10))
+    except (ValueError, TypeError, ZeroDivisionError, OverflowError):
+        return None
     except Exception:
         return None
 
 
+# Operator map for safe AST evaluation (no eval() used)
+_AST_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub,
+    ast.Mult: operator.mul, ast.Div: operator.truediv,
+    ast.Pow: operator.pow, ast.Mod: operator.mod,
+    ast.FloorDiv: operator.floordiv,
+}
+
+
+def _ast_eval(node: ast.AST):
+    """Recursively evaluate an AST math expression. No eval() — only safe operations."""
+    if isinstance(node, ast.Constant):
+        if not isinstance(node.value, (int, float)):
+            raise ValueError(f"Only numeric constants allowed, got {type(node.value)}")
+        if isinstance(node.value, int) and abs(node.value) > 10**15:
+            raise ValueError("Integer constant too large")
+        return node.value
+    elif isinstance(node, ast.BinOp):
+        left = _ast_eval(node.left)
+        right = _ast_eval(node.right)
+        if isinstance(node.op, ast.Pow) and isinstance(right, (int, float)) and right > 100:
+            raise ValueError("Exponent too large (max 100)")
+        op_fn = _AST_OPS.get(type(node.op))
+        if op_fn is None:
+            raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+        return op_fn(left, right)
+    elif isinstance(node, ast.UnaryOp):
+        operand = _ast_eval(node.operand)
+        if isinstance(node.op, ast.USub):
+            return -operand
+        if isinstance(node.op, ast.UAdd):
+            return +operand
+        raise ValueError(f"Unsupported unary op: {type(node.op).__name__}")
+    raise ValueError(f"Unsupported AST node: {type(node).__name__}")
+
+
 def handle_calc(text: str, full_text: str, cmd_config: dict) -> None:
-    """Safe math expression evaluator."""
+    """Safe math expression evaluator with trig, log, and formatting."""
     content = text.strip()
     result = _safe_eval_math(content)
 
@@ -2838,11 +2776,13 @@ def handle_calc(text: str, full_text: str, cmd_config: dict) -> None:
         notify("Calc Error", f"Could not evaluate: {content[:60]}")
         return
 
-    _push_undo(full_text, result)
-    _replace_selection(result)
+    # Format output as "expression = result"
+    display = f"{content} = {result}"
+    _push_undo(full_text, display)
+    _replace_selection(display)
 
-    TUI.action("🧮", "CALC", f"\"{content[:40]}\" = {result}")
-    notify("Calculator", f"{content[:40]} = {result}")
+    TUI.action("🧮", "CALC", display[:80])
+    notify("Calculator", display[:120])
 
 
 def handle_date(text: str, full_text: str, cmd_config: dict) -> None:
@@ -2968,6 +2908,10 @@ def handle_repeat(text: str, full_text: str, cmd_config: dict) -> None:
     dispatch(cmd_name, text.strip(), full_text, last_config)
 
 
+_CLIP_NAME_RE = _re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+_MAX_CLIP_SLOTS = 100
+
+
 def handle_clip(text: str, full_text: str, cmd_config: dict) -> None:
     """Named clipboard slots: save/load/list."""
     content = text.strip()
@@ -2976,6 +2920,12 @@ def handle_clip(text: str, full_text: str, cmd_config: dict) -> None:
     parts = content.split(None, 1)
     sub = parts[0].lower() if parts else ""
     arg = parts[1].strip() if len(parts) > 1 else ""
+
+    # Validate slot name
+    if sub in ("save", "load") and arg and not _CLIP_NAME_RE.match(arg):
+        TUI.error("CLIP: name must be 1-64 alphanumeric/dash/underscore characters")
+        notify("Clip Error", "Invalid slot name")
+        return
 
     # Load existing clips
     clips = {}
@@ -2986,9 +2936,14 @@ def handle_clip(text: str, full_text: str, cmd_config: dict) -> None:
             pass
 
     if sub == "save" and arg:
+        if len(clips) >= _MAX_CLIP_SLOTS and arg not in clips:
+            TUI.error(f"CLIP: maximum {_MAX_CLIP_SLOTS} slots reached")
+            notify("Clip Error", f"Maximum {_MAX_CLIP_SLOTS} slots reached")
+            return
         current = clipboard_paste()
         clips[arg] = current
         _CLIPS_PATH.write_text(json.dumps(clips, ensure_ascii=False, indent=2))
+        os.chmod(_CLIPS_PATH, 0o600)
         TUI.action("📌", "CLIP:SAVE", f"Saved slot \"{arg}\" ({len(current)} chars)")
         notify("Clip Save", f"Saved to slot \"{arg}\"")
 
@@ -3015,8 +2970,15 @@ def handle_clip(text: str, full_text: str, cmd_config: dict) -> None:
         notify("Clip Error", "Usage: CLIP:save <name> | CLIP:load <name> | CLIP:list")
 
 
+_MAX_CLIPBOARD_STACK = 50
+
+
 def handle_stack(text: str, full_text: str, cmd_config: dict) -> None:
     """Push current clipboard onto the stack."""
+    if len(_clipboard_stack) >= _MAX_CLIPBOARD_STACK:
+        TUI.warn(f"STACK: maximum depth ({_MAX_CLIPBOARD_STACK}) reached")
+        notify("Stack Full", f"Maximum {_MAX_CLIPBOARD_STACK} items")
+        return
     current = clipboard_paste()
     _clipboard_stack.append(current)
     depth = len(_clipboard_stack)
@@ -3132,8 +3094,166 @@ def handle_trans(text: str, full_text: str, cmd_config: dict) -> None:
 
 
 # ============================================================
+# IMAGE — AI Image Generation
+# ============================================================
+
+_IMAGE_DIR = Path(tempfile.gettempdir()) / "actionflow_images"
+
+
+def _clipboard_copy_image(image_path: str) -> bool:
+    """Copy an image file to the clipboard so Ctrl+V pastes the image.
+
+    On Wayland: wl-copy --type image/png < file.png
+    On X11: xclip -selection clipboard -t image/png -i file.png
+    """
+    try:
+        if _IS_WAYLAND:
+            with open(image_path, "rb") as f:
+                proc = _run_as_user(
+                    ["wl-copy", "--type", "image/png"],
+                    input=f.read(), capture_output=True,
+                )
+        else:
+            proc = _run_as_user(
+                ["xclip", "-selection", "clipboard", "-t", "image/png", "-i", image_path],
+                capture_output=True,
+            )
+        return proc.returncode == 0
+    except Exception as exc:
+        TUI.error(f"Image clipboard copy failed: {exc}")
+        return False
+
+
+def _pollinations_generate(prompt: str, max_retries: int = 3) -> bytes | None:
+    """Try to generate an image via Pollinations.ai with retries and seed rotation.
+
+    Returns raw image bytes on success, None on failure.
+    """
+    encoded_prompt = urllib.parse.quote(prompt)
+    for attempt in range(max_retries):
+        seed = int(time.time()) + attempt * 7
+        url = (f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+               f"?width=1024&height=1024&seed={seed}&nologo=true")
+        req = urllib.request.Request(url, headers={"User-Agent": "ActionFlow/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read(10 * 1024 * 1024 + 1)
+                if len(data) > 10 * 1024 * 1024:
+                    continue
+                content_type = resp.headers.get("Content-Type", "")
+                if "image" in content_type:
+                    return data
+        except urllib.error.HTTPError as exc:
+            TUI.warn(f"IMAGE: attempt {attempt + 1}/{max_retries} failed (HTTP {exc.code})")
+            if exc.code == 429:
+                time.sleep(3)  # rate limit — wait before retry
+            else:
+                time.sleep(1)
+        except Exception:
+            time.sleep(1)
+    return None
+
+
+_IMAGE_STYLES = {
+    "photo": "photorealistic, high quality, 4K",
+    "anime": "anime style, vibrant colors, detailed",
+    "pixel": "pixel art, retro game style, 8-bit",
+    "sketch": "pencil sketch, hand-drawn, artistic",
+    "oil": "oil painting, classic art style, textured brushstrokes",
+    "watercolor": "watercolor painting, soft colors, artistic",
+    "3d": "3D rendered, cinema 4D, high quality render",
+    "comic": "comic book style, bold lines, vibrant",
+}
+
+_IMAGE_STYLE_RE = _re.compile(
+    r'^(' + '|'.join(_IMAGE_STYLES.keys()) + r'):\s*', _re.IGNORECASE
+)
+
+
+def handle_image(text: str, full_text: str, cmd_config: dict) -> None:
+    """Generate an image from a text prompt using Pollinations.ai (free, no API key).
+
+    Supports style prefixes: photo:, anime:, pixel:, sketch:, oil:, watercolor:, 3d:, comic:
+    The image is copied to the clipboard and pasted into the active application.
+    Also saved to /tmp/actionflow_images/ for later access.
+    """
+    prompt = text.strip()
+    if not prompt:
+        TUI.error("IMAGE: no prompt provided")
+        notify("Image Error", "Please provide a description for the image")
+        return
+
+    # Detect style prefix
+    style_match = _IMAGE_STYLE_RE.match(prompt)
+    if style_match:
+        style_key = style_match.group(1).lower()
+        style_desc = _IMAGE_STYLES.get(style_key, "")
+        prompt = prompt[style_match.end():].strip()
+        if style_desc:
+            prompt = f"{prompt}, {style_desc}"
+        TUI.status("🎨", f"Style: {style_key} | Generating: \"{prompt[:50]}\"...", TUI.CYAN)
+    else:
+        TUI.status("🎨", f"Generating image: \"{prompt[:50]}\"...", TUI.CYAN)
+    notify(APP_NAME, "Generating image...")
+
+    image_data = _pollinations_generate(prompt)
+
+    if image_data is None:
+        TUI.error("IMAGE: all generation attempts failed")
+        notify("Image Error", "Could not generate image — service may be overloaded, try again")
+        return
+
+    try:
+        # Save to temp directory
+        _IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = _re.sub(r'[^a-zA-Z0-9_-]', '_', prompt[:40])
+        image_path = _IMAGE_DIR / f"{timestamp}_{safe_name}.png"
+        image_path.write_bytes(image_data)
+
+        TUI.success(f"Image saved: {image_path}")
+
+        # Copy image to clipboard and paste
+        if _clipboard_copy_image(str(image_path)):
+            time.sleep(CLIPBOARD_DELAY)
+            _send_paste_keys()
+            TUI.success("Image pasted into application")
+            notify("Image Generated",
+                   f"Pasted! Saved at: {image_path}")
+        else:
+            # Fallback: insert the file path as text
+            clipboard_copy(str(image_path))
+            time.sleep(CLIPBOARD_DELAY)
+            _send_paste_keys()
+            TUI.warn("Could not paste image — inserted file path instead")
+            notify("Image Generated",
+                   f"Saved at: {image_path} (path inserted)")
+
+        TUI.action("🎨", "IMAGE", f"\"{prompt[:50]}\" → {image_path.name}")
+
+    except urllib.error.URLError as exc:
+        TUI.error(f"IMAGE: network error — {exc}")
+        notify("Image Error", f"Network error: {exc}")
+    except Exception as exc:
+        TUI.error(f"IMAGE: generation failed — {exc}")
+        notify("Image Error", f"Failed: {exc}")
+
+
+# ============================================================
 # WIKI / DEFINE — Web Lookup Commands
 # ============================================================
+
+_MAX_API_RESPONSE_BYTES = 512 * 1024  # 512 KB
+
+
+def _safe_url_read(req, timeout: int = 10) -> bytes:
+    """Read URL response with a size limit to prevent memory exhaustion."""
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read(_MAX_API_RESPONSE_BYTES + 1)
+        if len(data) > _MAX_API_RESPONSE_BYTES:
+            raise ValueError("API response too large (>512KB)")
+        return data
+
 
 def handle_wiki(text: str, full_text: str, cmd_config: dict) -> None:
     """Wikipedia lookup — fetches first paragraph, shows as notification only."""
@@ -3146,9 +3266,8 @@ def handle_wiki(text: str, full_text: str, cmd_config: dict) -> None:
     try:
         encoded = urllib.parse.quote(query)
         url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}"
-        req = urllib.request.Request(url, headers={"User-Agent": "WatashiGPT/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
+        req = urllib.request.Request(url, headers={"User-Agent": "ActionFlow/1.0"})
+        data = json.loads(_safe_url_read(req).decode())
 
         extract = data.get("extract", "")
         title = data.get("title", query)
@@ -3186,9 +3305,8 @@ def handle_define(text: str, full_text: str, cmd_config: dict) -> None:
     try:
         encoded = urllib.parse.quote(word.lower())
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{encoded}"
-        req = urllib.request.Request(url, headers={"User-Agent": "WatashiGPT/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
+        req = urllib.request.Request(url, headers={"User-Agent": "ActionFlow/1.0"})
+        data = json.loads(_safe_url_read(req).decode())
 
         if not data or not isinstance(data, list):
             TUI.warn(f"DEFINE: no definition for \"{word}\"")
@@ -3319,6 +3437,7 @@ _BUILTIN_HANDLERS = {
     "trans": handle_trans,
     "wiki": handle_wiki,
     "define": handle_define,
+    "image": handle_image,
 }
 
 
@@ -3326,14 +3445,22 @@ _BUILTIN_HANDLERS = {
 # History Log
 # ============================================================
 
-_HISTORY_PATH = Path.home() / ".watashigpt_history.jsonl"
+_HISTORY_PATH = Path.home() / ".actionflow_history.jsonl"
+
+# Commands whose input/output must never be logged in plaintext
+_SENSITIVE_COMMANDS = frozenset({"password", "redact", "command"})
 
 
 def _log_history(command: str, input_text: str, output_text: str, duration_ms: int,
                  app_context: str = "", text_length: int = 0,
                  text_language: str = "", trigger: str = "") -> None:
-    """Append a JSON line to ~/.watashigpt_history.jsonl."""
+    """Append a JSON line to ~/.actionflow_history.jsonl."""
     try:
+        # Redact sensitive command data from logs
+        if command in _SENSITIVE_COMMANDS:
+            input_text = f"[{len(input_text)} chars]"
+            output_text = "[REDACTED]"
+
         provider = _last_llm_provider_used or _llm_provider or "builtin"
         entry = json.dumps({
             "ts": datetime.now().isoformat(timespec="seconds"),
@@ -3349,6 +3476,8 @@ def _log_history(command: str, input_text: str, output_text: str, duration_ms: i
         }, ensure_ascii=False)
         with open(_HISTORY_PATH, "a") as f:
             f.write(entry + "\n")
+        # Restrict file permissions: owner read/write only
+        os.chmod(_HISTORY_PATH, 0o600)
     except Exception as exc:
         TUI.warn(f"History log write failed: {exc}")
 
@@ -3582,17 +3711,35 @@ def route(text: str) -> None:
 # Interceptor
 # ============================================================
 
+_RATE_LIMIT_INTERVAL = 1.0  # Minimum seconds between dispatches
+_last_dispatch_time = 0.0
+_rate_limit_lock = threading.Lock()
+
+
+def _rate_limit_check() -> bool:
+    """Return True if enough time has passed since last dispatch."""
+    global _last_dispatch_time
+    with _rate_limit_lock:
+        now = time.time()
+        if now - _last_dispatch_time < _RATE_LIMIT_INTERVAL:
+            return False
+        _last_dispatch_time = now
+        return True
+
+
 def _do_intercept() -> None:
     try:
-        time.sleep(0.2)
+        if not _rate_limit_check():
+            TUI.warn("Rate limited — please wait before triggering again")
+            return
+        # Brief pause to let the user release hotkey keys
+        time.sleep(0.15)
         # Release all modifier keys from the hotkey to prevent interference
-        # (e.g. Ctrl+Alt still held → ctrl+c becomes ctrl+alt+c)
         for key in ('ctrl', 'alt', 'shift'):
             try:
                 keyboard.release(key)
             except Exception:
                 pass
-        time.sleep(0.1)
 
         TUI.separator()
         TUI.status("⌨", "Hotkey triggered — reading selection...", TUI.CYAN)
@@ -3632,6 +3779,10 @@ def _do_intercept() -> None:
 
         # Always open command picker popup on hotkey
         if _TKINTER_AVAILABLE:
+            if _dispatch_busy:
+                notify(APP_NAME, "⏳ Command still processing — please wait")
+                TUI.warn("Hotkey ignored — command still processing")
+                return
             _popup_queue.put(text)
             TUI.micro_log(f"Opening command picker...")
             return
@@ -3720,10 +3871,10 @@ def _command_search() -> None:
 def _session_export() -> None:
     """Dump the full activity log for the current session to a markdown file."""
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    export_path = Path.home() / f"watashigpt_session_{ts}.md"
+    export_path = Path.home() / f"actionflow_session_{ts}.md"
 
     lines = [
-        f"# WatashiGPT Session Export",
+        f"# ActionFlow Session Export",
         f"",
         f"- **Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"- **Mode**: {LLM_MODE}",
@@ -3797,7 +3948,7 @@ def _create_tray_icon_image(color: str = "green"):
         fnt = ImageFont.truetype("DejaVuSansMono-Bold.ttf", 28)
     except Exception:
         fnt = ImageFont.load_default()
-    draw.text((16, 14), "W", fill=(255, 255, 255, 255), font=fnt)
+    draw.text((16, 14), "A", fill=(255, 255, 255, 255), font=fnt)
     return img
 
 
@@ -3805,8 +3956,9 @@ def _show_history_dialog() -> None:
     """Show a small tkinter window with recent history entries."""
     if not _TKINTER_AVAILABLE:
         return
-    root = tk.Tk()
-    root.title("WatashiGPT History")
+    _get_tk_root()
+    root = tk.Toplevel()
+    root.title("ActionFlow History")
     root.geometry("650x400")
     root.configure(bg="#1a0a2e")
 
@@ -3834,7 +3986,7 @@ def _show_history_dialog() -> None:
         text_widget.insert("end", f"Error: {exc}")
 
     text_widget.config(state="disabled")
-    root.mainloop()
+    root.wait_window(root)
 
 
 def _start_tray() -> None:
@@ -3877,9 +4029,9 @@ def _start_tray() -> None:
         return f"Silent Mode {'[ON]' if _silent_mode else '[OFF]'}"
 
     icon = pystray.Icon(
-        "watashigpt",
+        "actionflow",
         icon_img,
-        "WatashiGPT",
+        "ActionFlow",
         menu=pystray.Menu(
             MenuItem("History (last 20)", on_history),
             MenuItem("Settings", on_settings),
@@ -3995,7 +4147,7 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     )
 
     notify(
-        "Action Middleware Active",
+        "ActionFlow Active",
         f"{HOTKEY.upper()} to intercept | {UNDO_HOTKEY.upper()} to undo | Ctrl+C to exit",
     )
 
@@ -4022,35 +4174,30 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
                     elif ch in ('S', 's'):
                         _session_export()
 
-                # Check popup queue
+                # Check popup queue — command picker triggered by hotkey
                 try:
                     popup_text = _popup_queue.get_nowait()
-                    # Restore terminal for tkinter
+                    # Restore terminal for tkinter popup
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                    _handle_popup(popup_text)
-                    # Restore cbreak
+                    try:
+                        _handle_popup(popup_text)
+                    except Exception as exc:
+                        TUI.error(f"Popup error: {exc}")
+                    # Restore cbreak for TUI
                     tty.setcbreak(fd)
                 except queue.Empty:
                     pass
 
-                # Check toast queue (non-blocking "applied" notification)
-                try:
-                    toast_text = _toast_queue.get_nowait()
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                    if _TKINTER_AVAILABLE:
-                        toast = ToastPopup(toast_text)
-                        toast.run()
-                    tty.setcbreak(fd)
-                except queue.Empty:
-                    pass
-
-                # Check result queue (display-only command output popup)
+                # Check result queue — display-only popups (wiki, define, count)
                 try:
                     result_title, result_text = _result_queue.get_nowait()
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                    if _TKINTER_AVAILABLE:
-                        result_popup = ResultPopup(result_title, result_text)
-                        result_popup.run()
+                    try:
+                        if _TKINTER_AVAILABLE:
+                            result_popup = ResultPopup(result_title, result_text)
+                            result_popup.run()
+                    except Exception as exc:
+                        TUI.error(f"Result popup error: {exc}")
                     tty.setcbreak(fd)
                 except (queue.Empty, ValueError):
                     pass
@@ -4072,10 +4219,9 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
 def _check_for_updates() -> None:
     """Silently check GitHub releases for a newer version tag. Runs in background thread."""
     try:
-        url = "https://api.github.com/repos/azimxxd/watashigpt/releases/latest"
-        req = urllib.request.Request(url, headers={"User-Agent": "WatashiGPT"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
+        url = "https://api.github.com/repos/azimxxd/actionflow/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "ActionFlow"})
+        data = json.loads(_safe_url_read(req, timeout=5).decode())
         latest_tag = data.get("tag_name", "").lstrip("v")
         current = __version__.lstrip("v")
         if latest_tag and latest_tag != current:
@@ -4103,7 +4249,7 @@ def _check_for_updates() -> None:
 
 def show_history(grep_filter: str | None = None) -> None:
     """Print last 50 history entries as a formatted table. Optionally filter by command."""
-    history_path = Path.home() / ".watashigpt_history.jsonl"
+    history_path = Path.home() / ".actionflow_history.jsonl"
     if not history_path.exists():
         print(f"{TUI.YELLOW}No history file found at {history_path}{TUI.RESET}")
         return
@@ -4171,7 +4317,7 @@ def show_history(grep_filter: str | None = None) -> None:
 
 
 def install_systemd_service() -> None:
-    """Generate and install a systemd unit file for WatashiGPT."""
+    """Generate and install a systemd unit file for ActionFlow."""
     if os.geteuid() != 0:
         print(f"{TUI.RED}Error: --install must be run as root (sudo).{TUI.RESET}")
         sys.exit(1)
@@ -4187,7 +4333,7 @@ def install_systemd_service() -> None:
 
     unit_content = f"""\
 [Unit]
-Description=WatashiGPT Action Middleware
+Description=ActionFlow by WatashiGPT
 After=graphical-session.target
 
 [Service]
@@ -4204,21 +4350,21 @@ PassEnvironment=WAYLAND_DISPLAY XDG_SESSION_TYPE XDG_RUNTIME_DIR DBUS_SESSION_BU
 WantedBy=graphical-session.target
 """
 
-    unit_path = Path("/etc/systemd/system/watashigpt.service")
+    unit_path = Path("/etc/systemd/system/actionflow.service")
     unit_path.write_text(unit_content)
     print(f"{TUI.GREEN}✓{TUI.RESET} Wrote {unit_path}")
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "enable", "watashigpt"], check=True)
+    subprocess.run(["systemctl", "enable", "actionflow"], check=True)
     print(f"{TUI.GREEN}✓{TUI.RESET} Service enabled")
     print()
-    print(f"  Start now with:  {TUI.CYAN}systemctl start watashigpt{TUI.RESET}")
-    print(f"  Check status:    {TUI.CYAN}systemctl status watashigpt{TUI.RESET}")
-    print(f"  View logs:       {TUI.CYAN}journalctl -u watashigpt -f{TUI.RESET}")
+    print(f"  Start now with:  {TUI.CYAN}systemctl start actionflow{TUI.RESET}")
+    print(f"  Check status:    {TUI.CYAN}systemctl status actionflow{TUI.RESET}")
+    print(f"  View logs:       {TUI.CYAN}journalctl -u actionflow -f{TUI.RESET}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="WatashiGPT Action Middleware")
+    parser = argparse.ArgumentParser(description="ActionFlow by WatashiGPT")
     parser.add_argument("--install", action="store_true", help="Install as a systemd service")
     parser.add_argument("--banner", action="store_true", help="Keep the full ASCII banner permanently")
     parser.add_argument("--history", action="store_true", help="Browse last 50 history entries")
