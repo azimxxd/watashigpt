@@ -72,10 +72,10 @@ _CONFIG_PATH = _SCRIPT_DIR / "config.yaml"
 _DEFAULT_CONFIG = {
     "hotkeys": {"intercept": "ctrl+alt+x", "undo": "ctrl+alt+z"},
     "commands": {
-        "translate": {
-            "prefixes": ["TR:"],
-            "keywords": ["translate", "polite", "rephrase"],
-            "description": "Convert rude text to professional",
+        "polite": {
+            "prefixes": ["POL:", "POLITE:"],
+            "keywords": ["polite", "rephrase", "professional", "corporatize"],
+            "description": "Rewrite rude/blunt text politely",
             "phrases": {
                 "fix this garbage": "Please review the code for potential improvements.",
                 "this is broken": "I've identified an issue that needs attention.",
@@ -93,6 +93,7 @@ _DEFAULT_CONFIG = {
         },
     },
     "llm": {"provider": "", "api_key": "", "model": ""},
+    "image_api": {"provider": "pollinations", "api_key": "", "model": "seedream"},
 }
 
 
@@ -110,6 +111,8 @@ def load_config() -> dict:
                 cfg["commands"] = user_cfg["commands"]
             if "llm" in user_cfg:
                 cfg["llm"] = {**cfg["llm"], **user_cfg["llm"]}
+            if "image_api" in user_cfg:
+                cfg["image_api"] = {**cfg["image_api"], **user_cfg["image_api"]}
             return cfg
         except Exception as exc:
             print(f"  Warning: Failed to load config.yaml: {exc}")
@@ -135,7 +138,92 @@ _SUDO_USER: str = os.environ.get("SUDO_USER", "")
 _DISPLAY: str = os.environ.get("DISPLAY", ":0")
 _WAYLAND_DISPLAY: str = os.environ.get("WAYLAND_DISPLAY", "")
 _HAS_WTYPE: bool = _IS_WAYLAND and shutil.which("wtype") is not None
+_HAS_YDOTOOL: bool = _IS_WAYLAND and shutil.which("ydotool") is not None
+_WTYPE_DISABLED: bool = False
+_YDOTOOL_DISABLED: bool = False
 _DBUS_SESSION: str = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+
+# Portal paste helper — subprocess running as real user for GNOME Wayland
+_paste_helper_proc: subprocess.Popen | None = None
+_paste_helper_lock = threading.Lock()
+
+
+def _start_paste_helper() -> bool:
+    """Start the portal paste helper subprocess as the real user."""
+    global _paste_helper_proc
+    helper_path = Path(__file__).parent / "paste_helper.py"
+    if not helper_path.exists():
+        TUI.warn(f"paste_helper.py not found at {helper_path}")
+        return False
+
+    # Build env with all session variables the portal needs
+    env = {**os.environ}
+    if _WAYLAND_DISPLAY:
+        env["WAYLAND_DISPLAY"] = _WAYLAND_DISPLAY
+    if _DBUS_SESSION:
+        env["DBUS_SESSION_BUS_ADDRESS"] = _DBUS_SESSION
+    # Ensure XDG_RUNTIME_DIR is set (portal requires it)
+    if _SUDO_USER and "XDG_RUNTIME_DIR" not in env:
+        try:
+            uid = int(subprocess.check_output(["id", "-u", _SUDO_USER]).strip())
+            env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
+        except Exception:
+            pass
+
+    cmd = ["/usr/bin/python3", "-u", str(helper_path)]
+    if _SUDO_USER and os.geteuid() == 0:
+        preserve = "DISPLAY,DBUS_SESSION_BUS_ADDRESS,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,XDG_SESSION_TYPE,XDG_CURRENT_DESKTOP"
+        cmd = ["sudo", "-u", _SUDO_USER, f"--preserve-env={preserve}"] + cmd
+
+    try:
+        TUI.micro_log(f"Helper cmd: {' '.join(cmd[:4])}...")
+        _paste_helper_proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, text=True,
+        )
+        # Wait for READY or ERR (with timeout)
+        import select as _sel
+        ready, _, _ = _sel.select([_paste_helper_proc.stdout], [], [], 10)
+        if not ready:
+            TUI.warn("Paste helper timed out waiting for READY")
+            _paste_helper_proc.kill()
+            _paste_helper_proc = None
+            return False
+        line = _paste_helper_proc.stdout.readline().strip()
+        if line == "READY":
+            return True
+        stderr = _paste_helper_proc.stderr.read() if _paste_helper_proc.stderr else ""
+        TUI.warn(f"Paste helper failed: {line} | {stderr[:200]}")
+        _paste_helper_proc = None
+        return False
+    except Exception as exc:
+        TUI.warn(f"Paste helper start error: {exc}")
+        _paste_helper_proc = None
+        return False
+
+
+def _portal_send(command: str) -> bool:
+    """Send a command to the paste helper. Returns True on success."""
+    global _paste_helper_proc
+    import select as _sel
+    with _paste_helper_lock:
+        if _paste_helper_proc is None or _paste_helper_proc.poll() is not None:
+            _paste_helper_proc = None
+            return False
+        try:
+            _paste_helper_proc.stdin.write(command + "\n")
+            _paste_helper_proc.stdin.flush()
+            # Wait for response with timeout
+            ready, _, _ = _sel.select([_paste_helper_proc.stdout], [], [], 3)
+            if not ready:
+                TUI.warn("Portal helper response timeout")
+                return False
+            response = _paste_helper_proc.stdout.readline().strip()
+            return response == "OK"
+        except Exception as exc:
+            TUI.warn(f"Portal send error: {exc}")
+            _paste_helper_proc = None
+            return False
 
 _undo_stack: list[dict] = []
 _undo_lock = threading.Lock()
@@ -163,6 +251,7 @@ _CLIPS_PATH = Path.home() / ".actionflow_clips.json"
 _popup_queue: queue.Queue = queue.Queue()  # Hotkey thread → main thread for popup
 _popup_trigger: str = "prefix"  # Set per-dispatch: "prefix" or "popup"
 _dispatch_busy: bool = False  # True while a command is being dispatched
+_current_source_window: str | None = None  # Window ID currently targeted for paste/replacement
 
 _current_app_context = None   # AppContext instance, set per-intercept
 _current_text_analysis = None  # TextAnalysis instance, set per-intercept
@@ -233,6 +322,21 @@ def _find_focused_sway(node: dict) -> dict | None:
     return None
 
 
+def _parse_gdbus_eval_output(output: str) -> tuple[bool, str]:
+    """Parse gdbus org.gnome.Shell.Eval output: (true, 'value')."""
+    text = (output or "").strip()
+    m = _re.match(
+        r"""^\(\s*(true|false)\s*,\s*(?:'([^']*)'|"([^"]*)")\s*\)$""",
+        text,
+        flags=_re.IGNORECASE,
+    )
+    if not m:
+        return False, ""
+    ok = m.group(1).lower() == "true"
+    value = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+    return ok, value
+
+
 def detect_active_window() -> AppContext:
     """Detect the currently focused window. Uses xdotool (X11) or kdotool/swaymsg (Wayland)."""
     title = ""
@@ -276,6 +380,98 @@ def detect_active_window() -> AppContext:
                 return AppContext(ctx_type, title, pattern)
 
     return AppContext(AppContext.UNKNOWN, title, "")
+
+
+# ============================================================
+# Window Focus — Save / Restore
+# ============================================================
+
+def _get_active_window_id() -> str | None:
+    """Return the active window ID so we can refocus it later."""
+    try:
+        if _IS_WAYLAND:
+            # GNOME: use gdbus to get the focused window's stable_sequence
+            try:
+                proc = _run_as_user(
+                    ["gdbus", "call", "--session",
+                     "--dest", "org.gnome.Shell",
+                     "--object-path", "/org/gnome/Shell",
+                     "--method", "org.gnome.Shell.Eval",
+                     "global.display.focus_window ? global.display.focus_window.get_id().toString() : ''"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if proc.returncode == 0:
+                    ok, value = _parse_gdbus_eval_output(proc.stdout)
+                    if ok and value:
+                        return f"gnome:{value}"
+            except Exception:
+                pass
+            # KDE: kdotool
+            try:
+                proc = _run_as_user(["kdotool", "getactivewindow"],
+                                    capture_output=True, text=True, timeout=2)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    return f"kde:{proc.stdout.strip()}"
+            except Exception:
+                pass
+        else:
+            # X11: xdotool
+            try:
+                proc = _run_as_user(["xdotool", "getactivewindow"],
+                                    capture_output=True, text=True, timeout=2)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    return f"x11:{proc.stdout.strip()}"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _focus_window(window_id: str) -> bool:
+    """Refocus a window previously captured by _get_active_window_id()."""
+    if not window_id:
+        return False
+    try:
+        kind, wid = window_id.split(":", 1)
+        if kind == "gnome":
+            proc = _run_as_user(
+                ["gdbus", "call", "--session",
+                 "--dest", "org.gnome.Shell",
+                 "--object-path", "/org/gnome/Shell",
+                 "--method", "org.gnome.Shell.Eval",
+                 f"""
+                 (function() {{
+                     let start = Date.now();
+                     let actors = global.get_window_actors();
+                     for (let a of actors) {{
+                         let w = a.get_meta_window();
+                         if (w && w.get_id().toString() === '{wid}') {{
+                             w.activate(global.get_current_time());
+                             return 'ok';
+                         }}
+                     }}
+                     return 'not_found';
+                 }})()
+                 """],
+                capture_output=True, text=True, timeout=2,
+            )
+            if proc.returncode != 0:
+                return False
+            ok, value = _parse_gdbus_eval_output(proc.stdout)
+            # gdbus output: (true, 'ok') when focus activation succeeded
+            return ok and value.strip().lower() == "ok"
+        elif kind == "kde":
+            proc = _run_as_user(["kdotool", "windowactivate", wid],
+                                capture_output=True, timeout=2)
+            return proc.returncode == 0
+        elif kind == "x11":
+            proc = _run_as_user(["xdotool", "windowactivate", wid],
+                                capture_output=True, timeout=2)
+            return proc.returncode == 0
+    except Exception as exc:
+        TUI.warn(f"Focus restore failed: {exc}")
+    return False
 
 
 # ============================================================
@@ -394,11 +590,11 @@ def analyze_text(text: str) -> TextAnalysis:
 
 _DEFAULT_CONTEXT_PRIORITIES: dict[str, list[str]] = {
     "terminal":  ["command", "explain", "regex", "docstring", "review"],
-    "browser":   ["summarize", "translate", "rewrite", "bullets", "title"],
+    "browser":   ["summarize", "polite", "rewrite", "bullets", "title"],
     "ide":       ["docstring", "review", "explain", "gitcommit", "regex", "fmt"],
-    "chat":      ["rewrite", "tone", "translate", "tweet"],
+    "chat":      ["rewrite", "tone", "polite", "tweet"],
     "docs":      ["rewrite", "summarize", "bullets", "title", "meeting"],
-    "unknown":   ["summarize", "rewrite", "explain", "fmt", "translate"],
+    "unknown":   ["summarize", "rewrite", "explain", "fmt", "polite"],
 }
 
 _TEXT_TYPE_PRIORITIES: dict[str, list[str]] = {
@@ -411,7 +607,7 @@ _TEXT_TYPE_PRIORITIES: dict[str, list[str]] = {
     "log":           ["explain", "summarize", "redact"],
     "email_draft":   ["email", "rewrite", "tone"],
     "url":           ["wiki", "summarize"],
-    "prose":         ["summarize", "rewrite", "translate", "bullets", "title"],
+    "prose":         ["summarize", "rewrite", "polite", "bullets", "title"],
 }
 
 
@@ -455,8 +651,8 @@ def get_smart_suggestions(
 
     # 5. Informality boost
     if not text_analysis.is_formal:
-        if "translate" in commands:
-            scores["translate"] = scores.get("translate", 0) + 4
+        if "polite" in commands:
+            scores["polite"] = scores.get("polite", 0) + 4
         if "rewrite" in commands:
             scores["rewrite"] = scores.get("rewrite", 0) + 3
 
@@ -618,6 +814,9 @@ _llm_fallback_provider = ""
 _llm_fallback_model = ""
 
 LLM_MODE = "mock"  # "live" or "mock" — set during startup, never changes after
+_image_api_provider = ""
+_image_api_key = ""  # Image API key (from env or startup prompt)
+_image_api_model = ""
 
 
 def _save_llm_config(provider: str, api_key: str, model: str) -> None:
@@ -639,11 +838,31 @@ def _save_llm_config(provider: str, api_key: str, model: str) -> None:
         TUI.warn(f"Could not save LLM config: {exc}")
 
 
+def _save_image_api_config(provider: str, api_key: str, model: str) -> None:
+    """Persist image provider to config.yaml. API key is NEVER written to disk."""
+    try:
+        if _CONFIG_PATH.exists():
+            with open(_CONFIG_PATH, "r") as f:
+                data = yaml.safe_load(f) or {}
+        else:
+            data = {}
+        if "image_api" not in data:
+            data["image_api"] = {}
+        data["image_api"]["provider"] = provider
+        data["image_api"]["model"] = model
+        data["image_api"].pop("api_key", None)  # Never persist API key to disk
+        with open(_CONFIG_PATH, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+    except Exception as exc:
+        TUI.warn(f"Could not save image API config: {exc}")
+
+
 def _llm_setup_prompt() -> None:
     """Interactive terminal prompt for LLM configuration with arrow-key selection."""
     llm_cfg = CONFIG.get("llm", {})
-    has_config = bool(llm_cfg.get("provider", "").strip())
-    if has_config:
+    has_provider = bool(llm_cfg.get("provider", "").strip())
+    has_key = bool(llm_cfg.get("api_key", "").strip()) or bool(os.environ.get("ACTIONFLOW_API_KEY", "").strip())
+    if has_provider and has_key:
         return
 
     c = TUI.CYAN
@@ -652,33 +871,44 @@ def _llm_setup_prompt() -> None:
     d = TUI.DIM
     g = TUI.GREEN
 
+    existing_provider = llm_cfg.get("provider", "").strip()
+
     print()
-    TUI.box("LLM Setup", [
-        f"  {d}LLM enables smart commands: summarize, rewrite, explain{r}",
-        f"  {d}Without LLM, commands run in mock mode (instant, offline){r}",
-        f"",
-        f"  {b}Select a provider:{r}",
-    ], TUI.CYAN)
 
-    options = ["groq", "openai", "gemini", "openrouter", "github", "skip → mock"]
-
-    if sys.stdin.isatty():
-        choice = TUI.selector(options)
+    # If provider already set but key missing, skip provider selection
+    if has_provider:
+        TUI.box("LLM Setup", [
+            f"  {d}Provider {b}{existing_provider}{r}{d} configured but API key missing{r}",
+            f"  {d}Set ACTIONFLOW_API_KEY env var or enter it below{r}",
+        ], TUI.CYAN)
+        provider = existing_provider
     else:
-        labels = "  ".join(f"[{i+1}] {o}" for i, o in enumerate(options))
-        print(f"  {d}{labels}{r}")
-        try:
-            raw = input(f"  {c}Choice (1-{len(options)}):{r} ").strip()
-        except (EOFError, KeyboardInterrupt):
-            raw = str(len(options))
-        choice = {str(i+1): i for i in range(len(options))}.get(raw)
+        TUI.box("LLM Setup", [
+            f"  {d}LLM enables smart commands: summarize, rewrite, explain{r}",
+            f"  {d}Without LLM, commands run in mock mode (instant, offline){r}",
+            f"",
+            f"  {b}Select a provider:{r}",
+        ], TUI.CYAN)
 
-    skip_index = len(options) - 1
-    if choice is None or choice == skip_index:
-        print(f"  {d}Launching in mock mode.{r}\n")
-        return
+        options = ["groq", "openai", "gemini", "openrouter", "github", "skip → mock"]
 
-    provider = options[choice]
+        if sys.stdin.isatty():
+            choice = TUI.selector(options)
+        else:
+            labels = "  ".join(f"[{i+1}] {o}" for i, o in enumerate(options))
+            print(f"  {d}{labels}{r}")
+            try:
+                raw = input(f"  {c}Choice (1-{len(options)}):{r} ").strip()
+            except (EOFError, KeyboardInterrupt):
+                raw = str(len(options))
+            choice = {str(i+1): i for i in range(len(options))}.get(raw)
+
+        skip_index = len(options) - 1
+        if choice is None or choice == skip_index:
+            print(f"  {d}Launching in mock mode.{r}\n")
+            return
+
+        provider = options[choice]
 
     print(f"  {d}Enter your {provider} API key:{r}")
     try:
@@ -698,7 +928,8 @@ def _llm_setup_prompt() -> None:
         "openrouter": "meta-llama/llama-3.3-70b-instruct",
         "github": "gpt-4o-mini",
     }
-    default_model = _PROVIDER_DEFAULTS.get(provider, "gpt-4o-mini")
+    existing_model = llm_cfg.get("model", "").strip()
+    default_model = existing_model or _PROVIDER_DEFAULTS.get(provider, "gpt-4o-mini")
     try:
         model = input(f"  {c}{b}Model{r} {d}[{default_model}]{r}{c}{b}:{r} ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -716,6 +947,101 @@ def _llm_setup_prompt() -> None:
     print(f"\n  {g}✓ LLM configured: {provider}/{model}{r}")
     print(f"  {d}Tip: export ACTIONFLOW_API_KEY='{api_key}' in your shell profile{r}")
     print(f"  {d}API keys are never saved to config.yaml for security.{r}\n")
+
+
+def _image_api_setup_prompt() -> None:
+    """Interactive image API setup using the same pattern as LLM setup."""
+    image_cfg = CONFIG.get("image_api", {})
+    has_provider = bool(image_cfg.get("provider", "").strip())
+    has_key = bool(image_cfg.get("api_key", "").strip()) or bool(
+        os.environ.get("ACTIONFLOW_IMAGE_API_KEY", "").strip()
+    )
+    if has_provider and has_key:
+        return
+
+    c = TUI.CYAN
+    r = TUI.RESET
+    b = TUI.BOLD
+    d = TUI.DIM
+    g = TUI.GREEN
+
+    existing_provider = image_cfg.get("provider", "").strip()
+
+    print()
+
+    if has_provider:
+        TUI.box("Image API Setup", [
+            f"  {d}Provider {b}{existing_provider}{r}{d} configured but API key missing{r}",
+            f"  {d}Set ACTIONFLOW_IMAGE_API_KEY env var or enter it below{r}",
+        ], TUI.CYAN)
+        provider = existing_provider
+    else:
+        TUI.box("Image API Setup", [
+            f"  {d}Image generation provider setup{r}",
+            f"  {d}Without a key, image generation may be rate-limited{r}",
+            f"",
+            f"  {b}Select a provider:{r}",
+        ], TUI.CYAN)
+
+        options = ["pollinations", "skip → no key"]
+
+        if sys.stdin.isatty():
+            choice = TUI.selector(options)
+        else:
+            labels = "  ".join(f"[{i+1}] {o}" for i, o in enumerate(options))
+            print(f"  {d}{labels}{r}")
+            try:
+                raw = input(f"  {c}Choice (1-{len(options)}):{r} ").strip()
+            except (EOFError, KeyboardInterrupt):
+                raw = str(len(options))
+            choice = {str(i+1): i for i in range(len(options))}.get(raw)
+
+        skip_index = len(options) - 1
+        if choice is None or choice == skip_index:
+            print(f"  {d}Launching without image API key.{r}\n")
+            return
+        provider = options[choice]
+
+    print(f"  {d}Enter your {provider} image API key:{r}")
+
+    try:
+        api_key = input(f"  {c}{b}Image API Key:{r} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n  {d}Cancelled. Launching without image API key.{r}\n")
+        return
+
+    if not api_key:
+        print(f"  {TUI.YELLOW}No image API key provided. Continuing without key.{r}\n")
+        return
+
+    CONFIG["image_api"]["provider"] = provider
+    CONFIG["image_api"]["api_key"] = api_key
+    image_model = image_cfg.get("model", "").strip() or "seedream"
+    CONFIG["image_api"]["model"] = image_model
+    _save_image_api_config(provider, api_key, image_model)
+
+    _image_api_key = api_key
+    print(f"\n  {g}✓ Image API configured: {provider}{r}")
+    print(f"  {d}Tip: export ACTIONFLOW_IMAGE_API_KEY='{api_key}' in your shell profile{r}")
+    print(f"  {d}Image API keys are never saved to config.yaml for security.{r}\n")
+
+
+def _init_image_api() -> None:
+    """Initialize image provider/key from config + env var."""
+    global _image_api_provider, _image_api_key, _image_api_model
+
+    image_cfg = CONFIG.get("image_api", {})
+    provider = image_cfg.get("provider", "").strip().lower()
+    api_key = image_cfg.get("api_key", "").strip()
+    model = image_cfg.get("model", "").strip() or "seedream"
+
+    env_key = os.environ.get("ACTIONFLOW_IMAGE_API_KEY", "").strip()
+    if env_key:
+        api_key = env_key
+
+    _image_api_provider = provider
+    _image_api_key = api_key
+    _image_api_model = model
 
 
 _PROVIDER_BASE_URLS = {
@@ -1839,14 +2165,18 @@ if _TKINTER_AVAILABLE:
             return self._result
 
 
-def _handle_popup(text: str) -> None:
+def _handle_popup(text: str, source_window: str | None = None) -> None:
     """Show the command picker popup and dispatch the chosen command."""
-    global _popup_trigger
+    global _popup_trigger, _dispatch_busy, _current_source_window
 
     if not _TKINTER_AVAILABLE:
         TUI.warn("tkinter not available — cannot show popup")
         _popup_trigger = "prefix"
-        route(text)
+        _current_source_window = source_window
+        try:
+            route(text)
+        finally:
+            _current_source_window = None
         return
 
     commands = CONFIG.get("commands", {})
@@ -1869,6 +2199,9 @@ def _handle_popup(text: str) -> None:
 
     if result is None:
         TUI.micro_log(f"Command picker cancelled")
+        # Refocus original app even on cancel
+        if source_window:
+            _focus_window(source_window)
         return
 
     cmd_name, cmd_config, payload = result
@@ -1878,23 +2211,34 @@ def _handle_popup(text: str) -> None:
     if is_llm and LLM_MODE == "mock":
         notify(APP_NAME, "LLM not configured — enable a provider at startup")
         TUI.warn("LLM not configured — command not applied")
+        if source_window:
+            _focus_window(source_window)
         return
 
     _popup_trigger = "popup"
     TUI.status("\U0001f3af", f"Popup \u2192 {cmd_name}", TUI.GREEN)
 
-    # Wait for compositor to restore focus to the original app after
-    # the XWayland tkinter popup closes (GNOME Wayland needs ~300-500ms).
-    time.sleep(0.6)
+    # Refocus the original app before processing
+    if source_window:
+        if _focus_window(source_window):
+            TUI.micro_log("Refocused source window")
+        else:
+            TUI.warn("Direct source-window focus failed — will retry before paste")
+    time.sleep(0.3)
 
-    global _dispatch_busy
     _dispatch_busy = True
+    _current_source_window = source_window
+    TUI.micro_log(f"Processing {cmd_name}...")
     try:
         dispatch(cmd_name, payload, text, cmd_config)
     except Exception as exc:
         TUI.error(f"Popup dispatch error: {exc}")
     finally:
         _dispatch_busy = False
+        _current_source_window = None
+        # Reset keyboard state after dispatch to ensure hotkeys keep working.
+        time.sleep(0.05)
+        _reset_keyboard_state()
 
 
 # ============================================================
@@ -1927,30 +2271,43 @@ def _run_as_user(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 # ============================================================
 
 def clipboard_copy(text: str) -> None:
+    import base64 as _b64
+    # On Wayland, prefer the paste helper (runs as real user — no nested-sudo hang)
+    if _IS_WAYLAND and _paste_helper_proc is not None:
+        b64 = _b64.b64encode(text.encode("utf-8")).decode("ascii")
+        if _portal_send(f"CLIPBOARD:{b64}"):
+            return
+        TUI.warn("Helper clipboard failed — falling back to wl-copy")
+
     if platform.system() == "Linux":
         if _IS_WAYLAND:
             cmd = ["wl-copy", "--", text]
         else:
             cmd = ["xclip", "-selection", "clipboard"]
-        if _IS_WAYLAND:
-            proc = _run_as_user(cmd, capture_output=True)
-        else:
-            proc = _run_as_user(cmd, input=text.encode(), capture_output=True)
-        if proc.returncode != 0:
-            TUI.error(f"Clipboard copy failed: {proc.stderr.decode().strip()}")
+        try:
+            if _IS_WAYLAND:
+                proc = _run_as_user(cmd, capture_output=True, timeout=3)
+            else:
+                proc = _run_as_user(cmd, input=text.encode(), capture_output=True, timeout=3)
+            if proc.returncode != 0:
+                TUI.error(f"Clipboard copy failed: {proc.stderr.decode().strip()}")
+        except subprocess.TimeoutExpired:
+            TUI.warn("wl-copy timed out")
     else:
         pyperclip.copy(text)
 
 
-def clipboard_paste() -> str:
+def clipboard_paste(timeout: float = 1.0) -> str:
     if platform.system() == "Linux":
         try:
             if _IS_WAYLAND:
                 cmd = ["wl-paste", "--no-newline"]
             else:
                 cmd = ["xclip", "-selection", "clipboard", "-o"]
-            proc = _run_as_user(cmd, capture_output=True, text=True)
+            proc = _run_as_user(cmd, capture_output=True, text=True, timeout=timeout)
             return proc.stdout if proc.returncode == 0 else ""
+        except subprocess.TimeoutExpired:
+            return ""
         except Exception as exc:
             TUI.error(f"Clipboard paste failed: {exc}")
             return ""
@@ -1971,35 +2328,149 @@ def _get_primary_selection() -> str:
         return ""
 
 
-def _send_paste_keys() -> None:
-    """Send Ctrl+V paste using the most reliable method for the current platform.
-
-    Strategy (tried in order):
-    1. wtype — native Wayland virtual-keyboard-v1 protocol (best on sway/wlroots)
-    2. keyboard.send via uinput — works under sudo, reliable when modifiers are clean
-    """
-    # Release any lingering modifier keys from the hotkey combo first
+def _reset_keyboard_state() -> None:
+    """Release all modifier keys and clear the keyboard library's internal state."""
     for key in ('ctrl', 'alt', 'shift'):
         try:
             keyboard.release(key)
         except Exception:
             pass
-    time.sleep(0.05)
+    try:
+        keyboard._pressed_events.clear()
+    except Exception:
+        pass
 
-    if _HAS_WTYPE:
+
+def _gnome_send_keys_via_dbus(keys_js: str) -> bool:
+    """Use GNOME Shell Eval to inject key events via DBus. Works on GNOME Wayland."""
+    try:
+        js = f"""
+        (function() {{
+            const Clutter = imports.gi.Clutter;
+            const event = Clutter.get_default_backend().get_default_seat();
+            const vk = event.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
+            const now = global.get_current_time();
+            {keys_js}
+            return 'ok';
+        }})()
+        """
+        proc = _run_as_user(
+            ["gdbus", "call", "--session",
+             "--dest", "org.gnome.Shell",
+             "--object-path", "/org/gnome/Shell",
+             "--method", "org.gnome.Shell.Eval", js],
+            capture_output=True, text=True, timeout=2,
+        )
+        if proc.returncode == 0 and "'ok'" in proc.stdout:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _send_paste_keys() -> None:
+    """Send Ctrl+V to paste clipboard contents into the focused window.
+
+    Tries methods in order:
+      1. Portal helper (xdg-desktop-portal RemoteDesktop — works on GNOME Wayland)
+      2. ydotool (works on all Wayland compositors)
+      3. wtype (Wayland virtual keyboard protocol — not supported on GNOME)
+      4. keyboard library uinput (last resort)
+    After pasting, always resets keyboard state to prevent stuck modifiers.
+    """
+    global _WTYPE_DISABLED, _YDOTOOL_DISABLED
+
+    # Release any lingering modifier keys from the hotkey combo
+    _reset_keyboard_state()
+    time.sleep(0.12)
+
+    # Method 1: Portal helper (xdg-desktop-portal RemoteDesktop)
+    # This is the ONLY reliable method on GNOME Wayland because GNOME blocks
+    # wtype (no virtual-keyboard protocol) and uinput events don't reach
+    # focused Wayland clients.
+    if _paste_helper_proc is not None:
+        TUI.micro_log("Attempting portal paste...")
+        result = _portal_send("PASTE")
+        TUI.micro_log(f"Portal paste result: {result}")
+        if result:
+            TUI.micro_log("Pasted via portal helper Ctrl+V")
+            time.sleep(0.08)
+            return
+        TUI.warn("Portal paste failed — trying next method")
+
+    # Method 2: ydotool (works on all Wayland compositors via /dev/uinput daemon)
+    if _HAS_YDOTOOL and not _YDOTOOL_DISABLED:
         try:
-            # -d 50: 50ms delay between key events for compositor reliability
-            result = _run_as_user(
-                ["wtype", "-d", "50", "-M", "ctrl", "-k", "v", "-m", "ctrl"],
-                capture_output=True, timeout=3,
+            result = subprocess.run(
+                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+                capture_output=True, timeout=1.0,
             )
             if result.returncode == 0:
+                TUI.micro_log("Pasted via ydotool Ctrl+V")
+                time.sleep(0.05)
+                _reset_keyboard_state()
                 return
-        except Exception:
-            pass
+            err = result.stderr.decode(errors="ignore").strip()
+            TUI.warn(f"ydotool failed (rc={result.returncode}): {err}")
+        except subprocess.TimeoutExpired:
+            TUI.warn("ydotool timed out — trying next method")
+        except FileNotFoundError:
+            _YDOTOOL_DISABLED = True
+            TUI.warn("ydotool not found — trying next method")
+        except Exception as exc:
+            TUI.warn(f"ydotool error: {exc}")
 
-    # Fallback: uinput via keyboard library
+    # Method 3: wtype (Wayland virtual keyboard protocol — not supported on GNOME)
+    if _HAS_WTYPE and not _WTYPE_DISABLED:
+        try:
+            result = _run_as_user(
+                ["wtype", "-d", "50", "-M", "ctrl", "-k", "v", "-m", "ctrl"],
+                capture_output=True, timeout=0.6,
+            )
+            if result.returncode == 0:
+                TUI.micro_log("Pasted via wtype Ctrl+V")
+                return
+            err = result.stderr.decode(errors="ignore").strip()
+            if "virtual keyboard protocol" in err.lower():
+                _WTYPE_DISABLED = True
+                TUI.warn("wtype unsupported — trying next method")
+            else:
+                TUI.warn(f"wtype failed (rc={result.returncode}): {err}")
+        except subprocess.TimeoutExpired:
+            TUI.warn("wtype timed out — trying next method")
+        except Exception as exc:
+            TUI.warn(f"wtype error: {exc}")
+
+    # Method 4: keyboard library uinput (last resort — may not work on GNOME Wayland)
+    TUI.micro_log("Pasting via keyboard uinput Ctrl+V (last resort)")
     keyboard.send("ctrl+v")
+    time.sleep(0.1)
+
+    if (_current_app_context is not None and
+            _current_app_context.context_type == AppContext.TERMINAL):
+        TUI.micro_log("Terminal context — trying Shift+Insert fallback")
+        keyboard.send("shift+insert")
+        time.sleep(0.05)
+
+    time.sleep(0.05)
+    _reset_keyboard_state()
+
+
+def _focus_by_alt_tab() -> bool:
+    """Fallback focus strategy for compositors where direct window activation is unavailable."""
+    try:
+        _reset_keyboard_state()
+        time.sleep(0.04)
+        keyboard.press("alt")
+        keyboard.press_and_release("tab")
+        time.sleep(0.03)
+        keyboard.release("alt")
+        time.sleep(0.14)
+        TUI.micro_log("Focus fallback: Alt+Tab")
+        return True
+    except Exception as exc:
+        TUI.warn(f"Alt+Tab fallback failed: {exc}")
+        return False
 
 
 # ============================================================
@@ -2010,7 +2481,6 @@ _result_queue: queue.Queue = queue.Queue()  # Worker thread → main thread for 
 
 # Commands that show output in a popup instead of replacing text
 _DISPLAY_ONLY_COMMANDS = frozenset([
-    "explain", "review", "eli5", "roast", "haiku",
     "count", "define", "wiki",
 ])
 
@@ -2154,20 +2624,107 @@ if _TKINTER_AVAILABLE:
 # Auto-Replace
 # ============================================================
 
+_CLIPBOARD_SYNC_TIMEOUT = 0.25
+_CLIPBOARD_SYNC_POLL = 0.01
+_CLIPBOARD_RESTORE_DELAY = 2.0
+_FOCUS_RETRY_COUNT = 3
+_FOCUS_RETRY_DELAY = 0.06
+_clipboard_restore_token = 0
+_clipboard_restore_lock = threading.Lock()
+
+
+def _wait_for_clipboard_sync(expected_text: str,
+                             timeout: float = _CLIPBOARD_SYNC_TIMEOUT) -> bool:
+    """Wait briefly until clipboard content matches expected text."""
+    expected = expected_text.rstrip("\n")
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        current = clipboard_paste(timeout=0.08).rstrip("\n")
+        if current == expected:
+            return True
+        time.sleep(_CLIPBOARD_SYNC_POLL)
+    return False
+
+
+def _cancel_pending_clipboard_restore() -> None:
+    """Invalidate any pending async clipboard restore task."""
+    global _clipboard_restore_token
+    with _clipboard_restore_lock:
+        _clipboard_restore_token += 1
+
+
+def _schedule_clipboard_restore(previous_clipboard: str) -> None:
+    """Restore clipboard asynchronously so dispatch can finish immediately."""
+    global _clipboard_restore_token
+    with _clipboard_restore_lock:
+        _clipboard_restore_token += 1
+        token = _clipboard_restore_token
+
+    def _worker() -> None:
+        try:
+            time.sleep(_CLIPBOARD_RESTORE_DELAY)
+            with _clipboard_restore_lock:
+                if token != _clipboard_restore_token:
+                    return
+            clipboard_copy(previous_clipboard)
+            TUI.micro_log("Clipboard restored")
+        except Exception as exc:
+            TUI.warn(f"Clipboard restore failed: {exc}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _refocus_source_window_for_paste() -> None:
+    """Best-effort refocus of the original app before sending Ctrl+V."""
+    if not _current_source_window:
+        if _popup_trigger == "popup":
+            _focus_by_alt_tab()
+        return
+
+    for attempt in range(_FOCUS_RETRY_COUNT):
+        if _focus_window(_current_source_window):
+            if attempt > 0:
+                TUI.micro_log("Refocused source window for paste")
+            time.sleep(0.06)
+            return
+        time.sleep(_FOCUS_RETRY_DELAY)
+
+    TUI.warn("Could not refocus source window before paste")
+    if _popup_trigger == "popup":
+        _focus_by_alt_tab()
+
+
 def _replace_selection(new_text: str) -> None:
     if _chain_suppress_paste:
         # Intermediate chain step — store result but don't paste
         TUI.success("Chain step complete (output passed to next step)")
         return
+
+    previous_clipboard = clipboard_paste(timeout=0.2)
+
+    # 1. Copy result to clipboard
+    TUI.micro_log("Copying result to clipboard...")
     clipboard_copy(new_text)
-    # Wait for clipboard to settle — wl-copy needs time to register
-    time.sleep(0.25)
+    # Give clipboard time to register
+    time.sleep(0.15)
+    TUI.micro_log("Clipboard set")
+
+    # 2. Refocus the source window before pasting
+    TUI.micro_log(f"Source window: {_current_source_window or 'none (staying in current)'}")
+    _refocus_source_window_for_paste()
+    time.sleep(0.08)
+
+    # 3. Paste into focused window
+    TUI.micro_log("Sending paste keys...")
     _send_paste_keys()
-    # Small delay after paste to let the target app process the input
-    time.sleep(0.1)
+    # Delay clipboard restore to ensure paste completes first
+    _schedule_clipboard_restore(previous_clipboard)
+
     TUI.success("Text replaced in-place")
+    TUI.micro_log("Paste sequence complete")
     truncated = new_text[:60] + ("..." if len(new_text) > 60 else "")
-    notify(APP_NAME, f"Applied: \"{truncated}\"")
+    notify(APP_NAME, f"Done: \"{truncated}\"")
 
 
 # ============================================================
@@ -2235,11 +2792,7 @@ def _do_undo() -> None:
     try:
         time.sleep(0.2)
         # Release modifier keys from the undo hotkey combo
-        for key in ('ctrl', 'alt', 'shift'):
-            try:
-                keyboard.release(key)
-            except Exception:
-                pass
+        _reset_keyboard_state()
 
         with _undo_lock:
             if not _undo_stack:
@@ -2249,11 +2802,14 @@ def _do_undo() -> None:
             entry = _undo_stack.pop()
 
         TUI.separator()
-        TUI.action("↩", "UNDO", "Restoring previous clipboard")
+        TUI.action("↩", "UNDO", "Restoring previous text")
+        previous_clipboard = clipboard_paste(timeout=0.2)
         clipboard_copy(entry["original"])
-        time.sleep(0.25)
+        time.sleep(0.4)
+        _refocus_source_window_for_paste()
         _send_paste_keys()
-        time.sleep(0.1)
+        _schedule_clipboard_restore(previous_clipboard)
+        time.sleep(0.15)
 
         truncated = entry["original"][:50] + ("..." if len(entry["original"]) > 50 else "")
         TUI.success(f"Undone — restored: \"{truncated}\"")
@@ -2299,17 +2855,33 @@ def on_silent_triggered() -> None:
 # Built-in Handlers
 # ============================================================
 
-def handle_translate(text: str, full_text: str, cmd_config: dict) -> None:
-    """Corporate Translator — uses phrases from config."""
+def handle_polite(text: str, full_text: str, cmd_config: dict) -> None:
+    """Rewrite rude/blunt text politely — phrase lookup first, LLM fallback."""
     phrases = cmd_config.get("phrases", {})
     normalised = text.strip().lower()
-    result = phrases.get(normalised, f"Politely: {text.strip()}")
+
+    # Try exact phrase match from config first
+    result = phrases.get(normalised)
+
+    # No phrase match — use LLM if available
+    if result is None:
+        if _llm_ready:
+            TUI.status("\U0001f916", "Rewriting politely with LLM...", TUI.CYAN)
+            prompt = (
+                "Rewrite the following text to be polite and professional. "
+                "Keep the same meaning but make it appropriate for a workplace. "
+                "Return ONLY the rewritten text, nothing else:\n\n"
+                f"{text.strip()}"
+            )
+            result = _llm_call(prompt)
+        else:
+            notify(APP_NAME, "LLM not configured — cannot rewrite. Use POL: with a provider.")
+            TUI.warn("No phrase match and LLM unavailable — text unchanged")
+            return
 
     _push_undo(full_text, result)
     _replace_selection(result)
-
-    TUI.action("📝", "TRANSLATE", f"\"{normalised}\" → \"{result}\"")
-    notify("Corporate Translator", f"Replaced: \"{result[:80]}\"")
+    TUI.action("📝", "POLITE", f"\"{normalised}\" → \"{result[:60]}\"")
 
 
 _CMD_ALLOWED_COMMANDS: list[str] = CONFIG.get("command_security", {}).get(
@@ -2449,7 +3021,6 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict,
     cmd_model = cmd_config.get("model", "")
 
     TUI.status("\U0001f916", f"Processing with LLM...", TUI.CYAN)
-    notify(APP_NAME, "Processing...")
 
     result = _llm_call(prompt, model=cmd_model)
 
@@ -2463,7 +3034,6 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict,
     truncated = result[:80] + ("..." if len(result) > 80 else "")
     provider_tag = f" [{_last_llm_provider_used}]" if _last_llm_provider_used else ""
     TUI.action("\U0001f916", cmd_name.upper(), f"\"{truncated}\"{provider_tag}")
-    notify(cmd_name, f"Done: \"{truncated}\"")
 
 
 def handle_fmt(text: str, full_text: str, cmd_config: dict) -> None:
@@ -3097,7 +3667,37 @@ def handle_trans(text: str, full_text: str, cmd_config: dict) -> None:
 # IMAGE — AI Image Generation
 # ============================================================
 
-_IMAGE_DIR = Path(tempfile.gettempdir()) / "actionflow_images"
+def _get_effective_home() -> Path:
+    """Resolve the non-root user's home when running under sudo."""
+    if _SUDO_USER:
+        home = os.path.expanduser(f"~{_SUDO_USER}")
+        if home and not home.startswith("~"):
+            return Path(home)
+    return Path.home()
+
+
+_IMAGE_DIR = _get_effective_home() / "Pictures" / "ActionFlow_Generated"
+
+
+def _open_image_folder(path: Path) -> bool:
+    """Open the generated images folder in the system file manager."""
+    try:
+        proc = _run_as_user(
+            ["xdg-open", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            TUI.micro_log(f"Opened image folder: {path}")
+            return True
+        err = (proc.stderr or "").strip()
+        TUI.warn(f"Could not open image folder: {err or f'rc={proc.returncode}'}")
+    except FileNotFoundError:
+        TUI.warn("xdg-open not found — cannot open image folder automatically")
+    except Exception as exc:
+        TUI.warn(f"Failed to open image folder: {exc}")
+    return False
 
 
 def _clipboard_copy_image(image_path: str) -> bool:
@@ -3130,11 +3730,50 @@ def _pollinations_generate(prompt: str, max_retries: int = 3) -> bytes | None:
     Returns raw image bytes on success, None on failure.
     """
     encoded_prompt = urllib.parse.quote(prompt)
+    headers = {"User-Agent": "ActionFlow/1.0"}
+    model = (_image_api_model or "").strip() or "seedream"
+    if _image_api_key:
+        # Send both common header styles for provider compatibility.
+        headers["Authorization"] = f"Bearer {_image_api_key}"
+        headers["X-API-Key"] = _image_api_key
+    
+    def _extract_allowed_models(err_text: str) -> list[str]:
+        text = err_text.replace('\\"', '"')
+        try:
+            maybe_json = json.loads(text)
+            if isinstance(maybe_json, dict) and "message" in maybe_json:
+                text = str(maybe_json["message"])
+        except Exception:
+            pass
+        m = _re.search(r"expected one of\s+(.+)", text, flags=_re.IGNORECASE)
+        if not m:
+            return []
+        tail = m.group(1)
+        models = _re.findall(r'"([A-Za-z0-9._-]+)"', tail)
+        # Preserve order while deduplicating
+        seen = set()
+        out = []
+        for name in models:
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
+
     for attempt in range(max_retries):
         seed = int(time.time()) + attempt * 7
-        url = (f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-               f"?width=1024&height=1024&seed={seed}&nologo=true")
-        req = urllib.request.Request(url, headers={"User-Agent": "ActionFlow/1.0"})
+        params = {
+            "model": model,
+            "width": 1024,
+            "height": 1024,
+            "seed": seed,
+        }
+        if _image_api_key:
+            # Query fallback to survive intermediary/proxy header stripping.
+            params["key"] = _image_api_key
+        query = urllib.parse.urlencode(params)
+        url = (f"https://gen.pollinations.ai/image/{encoded_prompt}"
+               f"?{query}")
+        req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = resp.read(10 * 1024 * 1024 + 1)
@@ -3143,8 +3782,35 @@ def _pollinations_generate(prompt: str, max_retries: int = 3) -> bytes | None:
                 content_type = resp.headers.get("Content-Type", "")
                 if "image" in content_type:
                     return data
+                TUI.warn(
+                    f"IMAGE: attempt {attempt + 1}/{max_retries} unexpected content-type: {content_type}"
+                )
         except urllib.error.HTTPError as exc:
-            TUI.warn(f"IMAGE: attempt {attempt + 1}/{max_retries} failed (HTTP {exc.code})")
+            err_detail = ""
+            try:
+                err_body = exc.read().decode("utf-8", errors="ignore")
+                err_detail = err_body[:180].replace("\n", " ").strip()
+            except Exception:
+                pass
+            if err_detail:
+                TUI.warn(
+                    f"IMAGE: attempt {attempt + 1}/{max_retries} failed "
+                    f"(HTTP {exc.code}): {err_detail}"
+                )
+            else:
+                TUI.warn(f"IMAGE: attempt {attempt + 1}/{max_retries} failed (HTTP {exc.code})")
+
+            # If model is restricted by key, switch to an allowed model and retry.
+            if exc.code == 400 and err_detail:
+                allowed = _extract_allowed_models(err_detail)
+                if allowed and model not in allowed:
+                    model = allowed[0]
+                    TUI.warn(f"IMAGE: switching model to '{model}' based on API response")
+                    continue
+
+            # Auth/config errors won't recover via retries.
+            if exc.code in (400, 401, 403):
+                break
             if exc.code == 429:
                 time.sleep(3)  # rate limit — wait before retry
             else:
@@ -3175,7 +3841,7 @@ def handle_image(text: str, full_text: str, cmd_config: dict) -> None:
 
     Supports style prefixes: photo:, anime:, pixel:, sketch:, oil:, watercolor:, 3d:, comic:
     The image is copied to the clipboard and pasted into the active application.
-    Also saved to /tmp/actionflow_images/ for later access.
+    Also saved to ~/Pictures/ActionFlow_Generated/ for later access.
     """
     prompt = text.strip()
     if not prompt:
@@ -3200,11 +3866,17 @@ def handle_image(text: str, full_text: str, cmd_config: dict) -> None:
 
     if image_data is None:
         TUI.error("IMAGE: all generation attempts failed")
-        notify("Image Error", "Could not generate image — service may be overloaded, try again")
+        if not _image_api_key:
+            notify(
+                "Image Error",
+                "Could not generate image. Set ACTIONFLOW_IMAGE_API_KEY and run with sudo -E.",
+            )
+        else:
+            notify("Image Error", "Could not generate image — check image API key/provider config")
         return
 
     try:
-        # Save to temp directory
+        # Save to persistent images directory
         _IMAGE_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = _re.sub(r'[^a-zA-Z0-9_-]', '_', prompt[:40])
@@ -3218,16 +3890,19 @@ def handle_image(text: str, full_text: str, cmd_config: dict) -> None:
             time.sleep(CLIPBOARD_DELAY)
             _send_paste_keys()
             TUI.success("Image pasted into application")
-            notify("Image Generated",
-                   f"Pasted! Saved at: {image_path}")
+            paste_msg = "Pasted into app"
         else:
             # Fallback: insert the file path as text
             clipboard_copy(str(image_path))
-            time.sleep(CLIPBOARD_DELAY)
+            time.sleep(0.4)
             _send_paste_keys()
             TUI.warn("Could not paste image — inserted file path instead")
-            notify("Image Generated",
-                   f"Saved at: {image_path} (path inserted)")
+            paste_msg = "Path inserted (image paste unavailable)"
+
+        folder_opened = _open_image_folder(_IMAGE_DIR)
+        open_msg = "Folder opened" if folder_opened else "Folder not opened"
+        notify("Image Generated",
+               f"{paste_msg}. Saved at: {image_path} · {open_msg}")
 
         TUI.action("🎨", "IMAGE", f"\"{prompt[:50]}\" → {image_path.name}")
 
@@ -3414,7 +4089,7 @@ def _register_personal_commands() -> None:
 
 # Map of built-in command names → handler functions
 _BUILTIN_HANDLERS = {
-    "translate": handle_translate,
+    "polite": handle_polite,
     "command": handle_command,
     "test": handle_test,
     "fmt": handle_fmt,
@@ -3538,17 +4213,34 @@ _chain_suppress_paste = False
 
 
 def _resolve_prefix(text: str, commands: dict) -> tuple[str, str, dict] | None:
-    """Match a prefix at the start of text. Returns (cmd_name, payload, cmd_config) or None."""
-    text_upper = text.upper()
+    """Match a prefix at the start of text. Returns (cmd_name, payload, cmd_config) or None.
+
+    Handles leading whitespace and optional space after prefix colon.
+    E.g. "  SUM: hello" and "SUM:hello" both match.
+    """
+    stripped = text.lstrip()
+    text_upper = stripped.upper()
+    # Sort prefixes by length descending to match longest prefix first
+    # (e.g. "TONE:casual:" before "TONE:")
+    candidates: list[tuple[str, str, dict]] = []
     for name, cmd in commands.items():
         for prefix in cmd.get("prefixes", []):
-            if text_upper.startswith(prefix.upper()):
-                return name, text[len(prefix):], cmd
-    return None
+            prefix_upper = prefix.upper()
+            if text_upper.startswith(prefix_upper):
+                payload = stripped[len(prefix):]
+                # Allow optional space after prefix (e.g. "SUM: text" and "SUM:text")
+                if payload.startswith(" "):
+                    payload = payload[1:]
+                candidates.append((name, payload, cmd, len(prefix)))
+    if not candidates:
+        return None
+    # Return the longest matching prefix
+    candidates.sort(key=lambda c: c[3], reverse=True)
+    return candidates[0][0], candidates[0][1], candidates[0][2]
 
 
 def _parse_chain(text: str, commands: dict) -> list[tuple[str, dict]] | None:
-    """Parse pipe-separated prefix chain like 'TR:|SUM: payload'.
+    """Parse pipe-separated prefix chain like 'POL:|SUM: payload'.
 
     Returns list of (cmd_name, cmd_config) for each step, or None if not a chain.
     """
@@ -3587,7 +4279,7 @@ def _parse_chain(text: str, commands: dict) -> list[tuple[str, dict]] | None:
 
 
 def _extract_chain_payload(text: str, commands: dict) -> str:
-    """Extract the payload text from a chain like 'TR:|SUM: the actual text'."""
+    """Extract the payload text from a chain like 'POL:|SUM: the actual text'."""
     remaining = text
     while True:
         pipe_pos = remaining.find("|")
@@ -3643,14 +4335,12 @@ def route(text: str) -> None:
         return
 
     # Tier 1: Exact prefix match (fastest, backward-compatible)
-    text_upper = text.upper()
-    for name, cmd in commands.items():
-        for prefix in cmd.get("prefixes", []):
-            if text_upper.startswith(prefix.upper()):
-                payload = text[len(prefix):]
-                TUI.status("🎯", f"Prefix match: {prefix} → {name}", TUI.GREEN)
-                dispatch(name, payload, text, cmd)
-                return
+    prefix_match = _resolve_prefix(text, commands)
+    if prefix_match:
+        name, payload, cmd = prefix_match
+        TUI.status("🎯", f"Prefix match → {name}", TUI.GREEN)
+        dispatch(name, payload, text, cmd)
+        return
 
     # Tier 2: Keyword match (check first 3 words)
     text_lower = text.strip().lower()
@@ -3732,14 +4422,14 @@ def _do_intercept() -> None:
         if not _rate_limit_check():
             TUI.warn("Rate limited — please wait before triggering again")
             return
+
+        # New hotkey cycle should not be affected by previous delayed clipboard restore.
+        _cancel_pending_clipboard_restore()
+
         # Brief pause to let the user release hotkey keys
         time.sleep(0.15)
         # Release all modifier keys from the hotkey to prevent interference
-        for key in ('ctrl', 'alt', 'shift'):
-            try:
-                keyboard.release(key)
-            except Exception:
-                pass
+        _reset_keyboard_state()
 
         TUI.separator()
         TUI.status("⌨", "Hotkey triggered — reading selection...", TUI.CYAN)
@@ -3748,13 +4438,19 @@ def _do_intercept() -> None:
         if _IS_WAYLAND:
             text: str = _get_primary_selection()
         else:
-            old_clipboard: str = clipboard_paste()
+            old_clipboard: str = clipboard_paste(timeout=0.2)
+            marker = f"__ACTIONFLOW_MARKER_{time.time_ns()}__"
+            # Use a marker to detect real Ctrl+C result even if selected text == old clipboard.
+            clipboard_copy(marker)
+            time.sleep(0.05)
             keyboard.send("ctrl+c")
             time.sleep(CLIPBOARD_DELAY)
-            text: str = clipboard_paste()
-            if text == old_clipboard:
-                TUI.warn("Clipboard unchanged — no text copied")
-                notify(APP_NAME, "No text selected (clipboard unchanged).")
+            text: str = clipboard_paste(timeout=0.25)
+            # Restore user's clipboard immediately after capture.
+            clipboard_copy(old_clipboard)
+            if text == marker:
+                TUI.warn("No text copied from selection")
+                notify(APP_NAME, "No text selected.")
                 return
 
         if not text or not text.strip():
@@ -3767,6 +4463,7 @@ def _do_intercept() -> None:
 
         # Phase 8: detect app context and analyze text
         global _current_app_context, _current_text_analysis
+        global _popup_trigger, _current_source_window, _dispatch_busy
         _current_app_context = detect_active_window()
         _current_text_analysis = analyze_text(text)
         TUI.micro_log(
@@ -3776,22 +4473,53 @@ def _do_intercept() -> None:
         )
 
         commands = CONFIG.get("commands", {})
+        routed_text = text.lstrip()
+        has_prefix = _resolve_prefix(routed_text, commands) is not None
+        has_chain = _parse_chain(routed_text, commands) is not None
 
-        # Always open command picker popup on hotkey
+        # If user explicitly typed a prefix/chain, run immediately without popup.
+        if has_prefix or has_chain:
+            _popup_trigger = "prefix"
+            _current_source_window = _get_active_window_id()
+            if _current_source_window:
+                TUI.micro_log(f"Captured source window: {_current_source_window}")
+            else:
+                TUI.micro_log("Captured source window: unavailable (will use Alt+Tab fallback)")
+
+            TUI.micro_log("Prefix detected — executing without popup")
+            try:
+                route(routed_text)
+            finally:
+                _current_source_window = None
+                # Reset keyboard state after dispatch to ensure hotkeys keep working.
+                time.sleep(0.05)
+                _reset_keyboard_state()
+            return
+
+        # No prefix: open command picker popup
         if _TKINTER_AVAILABLE:
             if _dispatch_busy:
                 notify(APP_NAME, "⏳ Command still processing — please wait")
                 TUI.warn("Hotkey ignored — command still processing")
                 return
-            _popup_queue.put(text)
+            # Save which window is focused so we can refocus it after the popup
+            source_window = _get_active_window_id()
+            if source_window:
+                TUI.micro_log(f"Captured source window: {source_window}")
+            else:
+                TUI.micro_log("Captured source window: unavailable (will use Alt+Tab fallback)")
+            _popup_queue.put((text, source_window))
             TUI.micro_log(f"Opening command picker...")
             return
 
         # Fallback if tkinter unavailable: route via prefix/keyword/LLM
         TUI.warn("tkinter unavailable — falling back to prefix routing")
-        global _popup_trigger
         _popup_trigger = "prefix"
-        route(text)
+        _current_source_window = _get_active_window_id()
+        try:
+            route(text)
+        finally:
+            _current_source_window = None
 
     except Exception as exc:
         TUI.error(f"Interceptor error: {exc}")
@@ -4067,6 +4795,9 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
 
     # Interactive LLM setup (only if not already configured)
     _llm_setup_prompt()
+    # Interactive image API setup (same env/setup pattern as LLM)
+    _image_api_setup_prompt()
+    _init_image_api()
 
     # Init LLM
     _init_llm()
@@ -4138,6 +4869,15 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     # Register personal commands from config
     _register_personal_commands()
 
+    # Start portal paste helper for GNOME Wayland
+    if _IS_WAYLAND:
+        TUI.micro_log("Starting portal paste helper...")
+        if _start_paste_helper():
+            TUI.micro_log(f"{TUI.GREEN}Portal paste helper ready{TUI.RESET}")
+        else:
+            TUI.warn("Portal paste helper unavailable — paste may not work on GNOME Wayland")
+            TUI.warn("Install ydotool as fallback: sudo apt install ydotool")
+
     # Register hotkeys
     keyboard.add_hotkey(HOTKEY, on_hotkey_triggered)
     keyboard.add_hotkey(UNDO_HOTKEY, on_undo_triggered)
@@ -4176,11 +4916,11 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
 
                 # Check popup queue — command picker triggered by hotkey
                 try:
-                    popup_text = _popup_queue.get_nowait()
+                    popup_text, source_window = _popup_queue.get_nowait()
                     # Restore terminal for tkinter popup
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                     try:
-                        _handle_popup(popup_text)
+                        _handle_popup(popup_text, source_window=source_window)
                     except Exception as exc:
                         TUI.error(f"Popup error: {exc}")
                     # Restore cbreak for TUI
@@ -4205,6 +4945,17 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     except KeyboardInterrupt:
         pass
+
+    # Clean up portal paste helper
+    if _paste_helper_proc is not None:
+        try:
+            _portal_send("QUIT")
+            _paste_helper_proc.wait(timeout=2)
+        except Exception:
+            try:
+                _paste_helper_proc.kill()
+            except Exception:
+                pass
 
     print()
     TUI.separator()
