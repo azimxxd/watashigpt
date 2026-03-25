@@ -1,6 +1,32 @@
+hotkeys:
+  intercept: ctrl+alt+x
+  undo: ctrl+alt+z
+  silent_toggle: ctrl+alt+s
 confidence_threshold: 0.7
 interaction_mode: both
-silent_mode: false
+silent_mode: true
+ui:
+  mode: silent
+  show_success_notifications: false
+  show_error_popups: false
+  show_result_popups: false
+  log_level: info
+  notify_on_image_save: true
+  log_path: ~/.actionflow.log
+  error_dedupe_window_seconds: 8
+platform:
+  clipboard_backend: auto
+  window_backend: auto
+app:
+  launch_at_startup: false
+  debug_console: false
+image_generation:
+  provider: pollinations
+  base_url: https://gen.pollinations.ai/image
+  model: flux
+  width: 1024
+  height: 1024
+  timeout: 60
 commands:
   b64:
     description: Base64 encode text
@@ -35,7 +61,7 @@ commands:
     - 'CALC:'
     - 'MATH:'
   clip:
-    description: Named clipboard slots (save/load/list)
+    description: Internal named text store (save/load/list/delete/clear)
     keywords:
     - clip save
     - clip load
@@ -43,7 +69,7 @@ commands:
     prefixes:
     - 'CLIP:'
   command:
-    description: Execute a shell command silently
+    description: Run an allowlisted system command and show real output
     keywords:
     - run
     - execute
@@ -54,7 +80,7 @@ commands:
     - 'RUN:'
     - 'EXEC:'
   count:
-    description: Word/char/line stats (notification only)
+    description: Realistic word/char/line stats with reading time
     keywords:
     - count
     - stats
@@ -78,7 +104,7 @@ commands:
     - 'DECODE:'
     - 'DB64:'
   define:
-    description: Dictionary word lookup (notification only)
+    description: Safe dictionary lookup with ranked definitions
     keywords:
     - define
     - definition
@@ -124,7 +150,7 @@ commands:
     prefixes:
     - 'ELI5:'
   email:
-    description: Generate email from notes (LLM)
+    description: Generate a clean single-language email draft (LLM)
     keywords:
     - email
     - draft email
@@ -137,14 +163,14 @@ commands:
     prefixes:
     - 'EMAIL:'
   escape:
-    description: Escape special characters (HTML/SQL/regex)
+    description: Escape text predictably for JSON/Python/regex/HTML/shell/SQL
     keywords:
     - escape
     prefixes:
     - 'ESCAPE:'
     - 'ESC:'
   explain:
-    description: Explain text or code (LLM)
+    description: Explain text or code clearly instead of paraphrasing it (LLM)
     keywords:
     - explain
     - what does
@@ -159,7 +185,7 @@ commands:
     - 'EXP:'
     - 'EXPLAIN:'
   fill:
-    description: Fill template placeholders (LLM)
+    description: Fill {{placeholders}} with explicit values or context (LLM)
     keywords:
     - fill
     - template
@@ -196,7 +222,7 @@ commands:
     - 'GITCOMMIT:'
     - 'COMMIT:'
   haiku:
-    description: Rewrite as haiku (LLM)
+    description: Turn the idea into a short haiku-style poem (LLM)
     keywords:
     - haiku
     - poem
@@ -253,7 +279,7 @@ commands:
     - 'PASSWD:'
     - 'PW:'
   pop:
-    description: Pop top item from clipboard stack
+    description: Pop the latest item from the internal text stack
     keywords:
     - pop
     - restore
@@ -310,8 +336,16 @@ commands:
     - improve
     - better
     - fix writing
-    llm_prompt: 'Rewrite the following text to be clear, professional, and well-structured.
-      Return only the rewritten text:
+    strength: strong
+    llm_prompt: 'You are a text rewriting engine, not a chatbot.
+      Rewrite the provided text in the SAME LANGUAGE as the source text.
+      Preserve the original meaning, but improve clarity, fluency, structure, tone, and wording.
+      If the source text is short, rough, simplistic, or poorly phrased, expand it slightly into a more natural, polished, and well-formed sentence while keeping the same core meaning.
+      A minimal punctuation-only fix is not enough if the source is clearly underwritten.
+      The output should be noticeably better written than the input.
+      Do not translate unless explicitly requested.
+      Do not add commentary, explanations, greetings, disclaimers, or meta-text.
+      Return ONLY the rewritten text:
 
 
       {text}'
@@ -342,7 +376,7 @@ commands:
     - 'STRIP:'
     - 'CLEAN:'
   stack:
-    description: Push clipboard onto stack
+    description: Push text into an internal LIFO stack
     keywords:
     - stack
     - push
@@ -422,38 +456,17 @@ commands:
     prefixes:
     - 'TRANS:'
   translate:
-    description: Convert rude text to professional
+    description: Translate text to a target language (LLM alias for TR:<LANG>:)
     keywords:
     - translate
-    - polite
-    - rephrase
-    - professional
-    - corporatize
-    phrases:
-      are you serious: Could you help me understand the reasoning behind this?
-      are you stupid: I think there might be a misunderstanding here.
-      do it yourself: I'd appreciate your help with this task.
-      figure it out: Happy to brainstorm solutions together.
-      fix this garbage: Please review the code for potential improvements.
-      hurry up: I'd like to understand the timeline expectations.
-      i don't care: I'll defer to the team's judgment on this.
-      just ship it: Let's discuss what an acceptable MVP looks like.
-      nobody asked for this: Could we revisit the requirements and priorities?
-      not my problem: I understand — let me find the right person to help.
-      stop wasting my time: I want to make sure we're using everyone's time effectively.
-      terrible code: The implementation could use some refinement.
-      that's wrong: I have a different perspective on this.
-      this is broken: I've identified an issue that needs attention.
-      this is taking forever: Could we discuss the timeline and priorities?
-      this is trash: I think we should consider a different approach.
-      this is your fault: Let's focus on finding a solution together.
-      this meeting is pointless: Could we clarify the meeting objectives?
-      this sucks: There may be room for improvement here.
-      what a mess: This could benefit from some restructuring.
-      whatever: I'm open to any approach the team prefers.
-      who wrote this: Could we discuss the approach taken here?
-      why isn't this done yet: Could we review the current blockers together?
-      you don't know what you're doing: Perhaps we could pair on this together?
+    - translate to
+    - convert language
+    llm_prompt: 'Translate the payload into the requested target language code and
+      return ONLY the translation. No commentary, no greetings, no explanations:
+
+
+      {text}'
+    llm_required: true
     prefixes:
     - 'TR:'
   tweet:
@@ -470,7 +483,7 @@ commands:
     prefixes:
     - 'TWEET:'
   wiki:
-    description: Wikipedia article summary (notification only)
+    description: Wikipedia summary with better ambiguity handling
     keywords:
     - wiki
     - wikipedia
@@ -527,7 +540,8 @@ personal_commands: {}
 command_security:
   allowed_commands: [ls, cat, grep, find, git, echo, date, python, node, curl, wc, head, tail, sort, uniq, diff, file, stat, whoami, hostname, uname, env, printenv, which, type]
 llm:
-  api_key: ''  # Use env var ACTIONFLOW_API_KEY instead
+  mode: auto   # auto | mock ; mock must be explicit
+  api_key: ''  # Optional. Prefer ACTIONFLOW_API_KEY env var or ~/.actionflow_secrets.yaml
   fallback:
     api_key: ''
     model: ''

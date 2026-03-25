@@ -1,235 +1,753 @@
 # ActionFlow
 
-OS-level background assistant that intercepts selected text via global hotkeys, routes it through a 3-tier command system (prefix → keyword → LLM classification → fallback), and applies transformations in-place. Single-file Python CLI with rich TUI, context-aware intelligence, command picker popup, and system tray support.
+Cross-platform OS-level text action middleware for Windows and Linux.
 
-**by WatashiGPT**
+It now runs as a desktop background app first: a tray icon, GUI settings, history/log viewers, setup dialogs, command picker, and result windows sit on top of the existing hotkey + clipboard engine. It watches global hotkeys, captures the current text selection, routes that text through built-in or LLM-backed commands, and pastes the result back into the focused app. Pipelines like `TR:EN:|SUM:` are supported, along with undo, repeat, named clips, stack push/pop, quiet notifications, picker selection, and tray/background mode.
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue)
-![Platform](https://img.shields.io/badge/Platform-Linux-green)
-![Wayland](https://img.shields.io/badge/Wayland-Supported-purple)
-![X11](https://img.shields.io/badge/X11-Supported-orange)
+## Branch Purpose
 
-## How It Works
+This desktop-oriented line of development is intended to live on a separate branch so it does not disturb the original upstream baseline.
 
-1. Select any text in any application
-2. Press `Ctrl+Alt+X` — a command picker popup appears
-3. Pick a command (or type a prefix like `TR:hello`) — the text is processed and replaced in-place
-4. Press `Ctrl+Alt+Z` to undo
+- recommended branch name: `windows-desktop`
+- upstream baseline repository: `https://github.com/azimxxd/watashigpt`
+- purpose: keep the Windows/Linux desktop GUI, tray, background runtime, and setup UX work isolated from the original console-first version
 
+This branch adds:
+
+- tray app / background desktop launcher
+- GUI settings
+- history and logs windows
+- setup dialogs for LLM and image credentials
+- windowless startup on Windows via `ActionFlow.pyw`
+- startup/runtime logging via `.actionflow_startup.log` and `.actionflow.log`
+- improved Windows runtime behavior with shared Linux support path
+
+## Current State / MVP Status
+
+This branch is now a desktop/background MVP rather than a pure console tool.
+
+What is working:
+
+- tray-first desktop app flow for Windows and Linux
+- GUI/background startup plus legacy debug console mode
+- global hotkeys, selection capture, clipboard backup/restore, and in-place replace flow
+- command picker without prefix
+- result windows for commands such as `COUNT`, `WIKI`, and `DEFINE`
+- GUI settings, first-run setup, history view, logs view, and startup tracing
+
+Current limitations:
+
+- hotkey reliability still depends on OS permissions, keyboard backend behavior, and desktop session details
+- Linux tray/hotkeys can vary between X11 and Wayland environments
+- Windows `pythonw.exe` startup should be inspected through log files if tray startup fails
+- this is a desktop-focused branch, not the untouched upstream baseline
+
+LLM commands now run through a strict transform-only layer instead of ad-hoc chat prompts. Every LLM transform command follows the same contract:
+
+- parse only the payload after the command prefix
+- resolve command arguments such as target language, tone, or fill variables
+- build a deterministic transform prompt
+- strip assistant boilerplate from model output
+- validate the output shape and retry once if needed
+- return only the final transformed text
+
+## What Changed
+
+The project now has a split architecture instead of a Linux-only monolith:
+
+```text
+action-middleware/
+  actionflow/
+    app/
+      main.py
+      hotkeys.py
+      tray.py
+      runtime.py
+    core/
+      command_registry.py
+      command_router.py
+      pipeline.py
+      clipboard_stack.py
+      history.py
+      text_ops.py
+      config.py
+      models.py
+      llm/
+        command_specs.py
+        output_cleaner.py
+        prompt_builder.py
+        transform_executor.py
+        validators.py
+      commands/
+        builtin.py
+        text.py
+        system.py
+        external.py
+        llm.py
+    platform/
+      base.py
+      linux.py
+      windows.py
+  tests/
 ```
-  ╭──────────────────────────────────────╮
-  │  ▄▀█ █▀▀ ▀█▀ █ █▀█ █▄░█            │
-  │  █▀█ █▄▄ ░█░ █ █▄█ █░▀█            │
-  │                                      │
-  │  █▀▀ █░░ █▀█ █░█░█                  │
-  │  █▀░ █▄▄ █▄█ ▀▄▀▄▀                  │
-  ╰──────────────────────────────────────╯
-```
+
+- `core/` contains command catalog, parsing, pipelines, history, stack/clip stores, transform execution, and pure text helpers.
+- `platform/` contains Linux and Windows adapters for hotkeys, clipboard, active window detection, paste flow, notifications, and OS integration.
+- `app/` is the runtime/orchestration layer and compatibility entrypoint.
+
+## Supported Platforms
+
+### Windows
+
+- Global hotkeys via `keyboard`
+- Clipboard read/write via `pyperclip` or Win32 clipboard API fallback
+- Selected text capture via transactional `Ctrl+C` clipboard workflow with sequence detection, retries, and timeout handling
+- Paste-back via transactional `Ctrl+V` flow with clipboard restore
+- Foreground window detection via Win32 APIs
+- Tray/notifications supported
+
+### Linux
+
+- Existing Linux behavior preserved
+- Wayland/X11 utilities remain supported, but only inside `platform/linux.py`
+- Clipboard flows still support `wl-clipboard`, `xclip`, and `wtype` fallback logic
 
 ## Commands
 
-### Built-in (no LLM required)
+### Built-in text/system/external
 
-| Prefix | Action | Notes |
-|--------|--------|-------|
-| `TR:` | Rude → professional text | Phrase lookup from config |
-| `CMD:` / `RUN:` | Execute shell command | Dangerous pattern blocking |
-| `TEST:` / `PING:` | Pipeline verification | |
-| `FMT:` / `FORMAT:` | Auto-format JSON/XML | JSON first, XML fallback |
-| `COUNT:` / `STATS:` | Word/char/line stats + reading time | Notification only, no clipboard |
-| `MOCK:` / `SPONGE:` | Spongebob alternating caps | |
-| `B64:` / `BASE64:` | Base64 encode | |
-| `DECODE:` / `DB64:` | Base64 decode | Error notification on invalid |
-| `HASH:` / `SHA:` | SHA256 hex digest | |
-| `REDACT:` / `PII:` | Mask PII (emails, phones, cards, IPs) | Regex-based |
-| `CALC:` / `MATH:` | Safe math evaluator | Handles `15% of 340`, `sqrt(144)`, arithmetic |
-| `DATE:` | Natural language date → ISO format | Uses `dateparser` |
-| `ESCAPE:` / `ESC:` | Escape special characters | Auto-detects HTML/SQL/regex |
-| `SANITIZE:` / `STRIP:` | Strip HTML/markdown/ANSI formatting | Auto-detects format type |
-| `PASSWORD:` / `PW:` | Generate strong random password | |
-| `REPEAT:` / `AGAIN:` | Re-run last command on current selection | |
-| `CLIP:` | Named clipboard slots | `CLIP:save name` / `CLIP:load name` / `CLIP:list` |
-| `STACK:` / `PUSH:` | Push clipboard onto stack | |
-| `POP:` | Pop top item from clipboard stack | |
-| `WIKI:` | Wikipedia article summary | Notification only |
-| `DEFINE:` | Dictionary word definition | Notification only |
-| `IMG:` / `IMAGE:` | Generate image from description | Via Pollinations.ai |
+| Command | Aliases |
+|---|---|
+| `test` | `TEST:`, `PING:` |
+| `fmt` | `FMT:`, `FORMAT:` |
+| `count` | `COUNT:`, `STATS:` |
+| `mock` | `MOCK:`, `SPONGE:` |
+| `b64` | `B64:`, `BASE64:` |
+| `decode` | `DECODE:`, `DB64:` |
+| `hash` | `HASH:`, `SHA:` |
+| `redact` | `REDACT:`, `PII:` |
+| `calc` | `CALC:`, `MATH:` |
+| `date` | `DATE:` |
+| `escape` | `ESCAPE:`, `ESC:` |
+| `sanitize` | `SANITIZE:`, `STRIP:`, `CLEAN:` |
+| `password` | `PASSWORD:`, `PASSWD:`, `PW:` |
+| `clip` | `CLIP:` |
+| `stack` | `STACK:`, `PUSH:` |
+| `pop` | `POP:` |
+| `repeat` | `REPEAT:`, `AGAIN:` |
+| `command` | `CMD:`, `RUN:`, `EXEC:` |
+| `wiki` | `WIKI:` |
+| `define` | `DEFINE:` |
+| `image` | `IMG:`, `IMAGE:` |
 
-### LLM Commands (require a configured provider)
+`IMAGE:` uses the image backend configured in `image_generation`. The default path targets Pollinations via `https://gen.pollinations.ai/image`. If the provider responds with `401`, ActionFlow now fails honestly, prompts for an image API key when possible, stores it in `~/.actionflow_secrets.yaml`, and retries the request instead of pretending the command succeeded.
 
-| Prefix | Action |
-|--------|--------|
-| `SUM:` / `TLDR:` | Summarize text |
-| `RW:` / `REWRITE:` | Rewrite professionally |
-| `EXP:` / `EXPLAIN:` | Explain in simple terms |
-| `TONE:style:` | Dynamic tone rewriting (`TONE:casual:`, `TONE:formal:`, etc.) |
-| `BULLETS:` / `LIST:` | Convert to bullet list |
-| `TITLE:` / `HEADLINE:` | Generate short headline |
-| `TWEET:` | Shorten to 280 chars |
-| `EMAIL:` | Generate email from rough notes |
-| `REGEX:` | Generate regex from description |
-| `DOCSTRING:` / `DOC:` | Generate code docstring |
-| `REVIEW:` / `CR:` | Quick code review |
-| `GITCOMMIT:` / `COMMIT:` | Generate conventional commit message |
-| `MEETING:` / `NOTES:` | Structure meeting notes |
-| `TODO:` / `ACTIONS:` | Extract action items as checklist |
-| `ELI5:` | Explain like I'm 5 |
-| `HAIKU:` | Rewrite as haiku |
-| `ROAST:` | Light roast of selected text |
-| `FILL:` | Fill `{{placeholder}}` markers from context |
-| `TRANS:lang:` | Translate to language (`TRANS:JP:`, `TRANS:ES:`, etc.) |
+### LLM commands
 
-### Pipe Chains
+| Command | Aliases |
+|---|---|
+| `translate` | `TR:<LANG>:` |
+| `trans` | `TRANS:<LANG>:` |
+| `summarize` | `SUM:`, `TLDR:` |
+| `rewrite` | `RW:`, `REWRITE:` |
+| `explain` | `EXP:`, `EXPLAIN:` |
+| `tone` | `TONE:<style>:` |
+| `bullets` | `BULLETS:`, `LIST:` |
+| `title` | `TITLE:`, `HEADLINE:` |
+| `tweet` | `TWEET:` |
+| `email` | `EMAIL:` |
+| `regex` | `REGEX:` |
+| `docstring` | `DOCSTRING:`, `DOC:` |
+| `review` | `REVIEW:`, `CR:` |
+| `gitcommit` | `GITCOMMIT:`, `COMMIT:` |
+| `meeting` | `MEETING:`, `NOTES:` |
+| `todo` | `TODO:`, `ACTIONS:` |
+| `eli5` | `ELI5:` |
+| `haiku` | `HAIKU:` |
+| `roast` | `ROAST:` |
+| `fill` | `FILL:` |
 
-Chain multiple commands by separating with `|`:
+## Transform-Only Semantics
 
-```
-TR:|SUM: rude long text   →  translates to professional, then summarizes
-```
+These commands are handled as strict text transformations, not chat replies:
 
-### Personal Commands
+- `TR:<LANG>:` and `TRANS:<LANG>:` translate only the payload and return only the translation
+- `RW:` rewrites only the payload, preserves the source language, and avoids assistant-style replies
+- `SUM:` returns only a concise summary
+- `EXP:` returns only the explanation
+- `TONE:<style>:` changes only the tone while preserving meaning
+- `BULLETS:` / `LIST:` return only a bullet list
+- `TITLE:` / `HEADLINE:` return only the title
+- `EMAIL:` returns only the email draft
+- `REGEX:` returns only the regex
+- `DOCSTRING:` returns only the docstring
+- `REVIEW:` returns concise review bullets
+- `GITCOMMIT:` returns only the commit message
 
-Define your own commands in `config.yaml` under `personal_commands:` with few-shot examples. They appear with a `[ME]` badge in the popup.
+Common assistant boilerplate such as `Sure`, `Here is the translation`, or `I'd be happy to help` is stripped automatically. If the cleaned output still fails the command contract, ActionFlow retries once with a stricter corrective prompt and then fails cleanly instead of inserting junk text.
 
-## Keybindings
+## Command Notes
 
-| Key | Action |
-|-----|--------|
-| `Ctrl+Alt+X` | Intercept selected text → open command picker |
-| `Ctrl+Alt+Z` | Undo last replacement |
-| `Ctrl+Alt+S` | Toggle silent mode (suppress notifications) |
-| `Ctrl+C` | Exit application |
+### `COUNT:` / `STATS:`
 
-### TUI Keys
+Returns realistic text stats:
 
-| Key | Action |
-|-----|--------|
-| `/` | Fuzzy search commands |
-| `S` | Export current session to markdown |
+- word count
+- character count
+- line count
+- reading time based on word count instead of blindly rounding up to one minute
 
-## LLM Providers
+Examples:
 
-Configured via interactive selector at first startup, or directly in `config.yaml`.
-
-| Provider | Default Model |
-|----------|---------------|
-| Groq | `llama-3.3-70b-versatile` |
-| OpenAI | `gpt-4o-mini` |
-| Gemini | `gemini-2.0-flash` |
-| OpenRouter | `meta-llama/llama-3.3-70b-instruct` |
-| GitHub Models | `gpt-4o-mini` |
-
-- **Mock mode**: runs without any LLM provider — built-in commands work, LLM commands return `[MOCK]` placeholders
-- **Confidence gating**: LLM classifier confidence below threshold (default `0.7`) skips the command with a notification
-- **Fallback**: if primary provider errors, auto-retries with secondary provider from `config.yaml`
-- **Per-command model override**: optional `model:` key per command in config
-
-## Requirements
-
-### System packages
-
-```bash
-# Wayland
-sudo apt-get install wl-clipboard libnotify-bin
-
-# X11
-sudo apt-get install xclip libnotify-bin
+```text
+COUNT: hello
+COUNT: a much longer paragraph with enough words to produce a real reading estimate
 ```
 
-### Python dependencies
+Short text now shows `< 5 sec`, `~10 sec`, `~20 sec`, or `< 1 min` when appropriate instead of always showing `~1 min`.
 
-```bash
-pip install -r action-middleware/requirements.txt
+### `ESCAPE:` / `ESC:`
+
+`ESCAPE:` is now explicit and predictable. By default it uses JSON-style string escaping, which is a good fit for safe insertion into code strings.
+
+Supported modes:
+
+- `ESCAPE:json: say "hello"`
+- `ESCAPE:python: can't`
+- `ESCAPE:regex: a+b?`
+- `ESCAPE:html: <b>hello</b>`
+- `ESCAPE:shell: hello world`
+- `ESCAPE:sql: O'Reilly`
+
+If no mode is provided, `json` is used.
+
+### `CLIP:`
+
+`CLIP:` is an internal named text store, not a replacement for `Ctrl+C`.
+
+Supported operations:
+
+```text
+CLIP:save:draft: hello world
+CLIP:load:draft
+CLIP:list
+CLIP:delete:draft
+CLIP:clear
 ```
 
-| Package | Purpose |
-|---------|---------|
-| `keyboard` | Global hotkey detection (requires root on Linux) |
-| `pyperclip` | Clipboard (macOS/Windows fallback) |
-| `plyer` | Notifications (macOS/Windows fallback) |
-| `pyyaml` | Config parsing |
-| `openai` | LLM client (supports all providers via base_url) |
-| `watchdog` | Config hot-reload on file change |
-| `dateparser` | Natural language date parsing |
-| `langdetect` | Automatic language detection |
-| `pystray` | System tray icon |
-| `Pillow` | System tray icon rendering |
+Behavior:
 
-## Usage
+- `save` stores the given text under a stable name
+- `load` inserts the saved text back into the focused app
+- `list` shows saved clip names and sizes
+- `delete` removes one named clip
+- `clear` removes all saved clips
+
+### `STACK:` / `PUSH:` / `POP:`
+
+These commands now behave as a strict LIFO stack.
+
+Examples:
+
+```text
+STACK: first item
+PUSH: second item
+POP:
+```
+
+Behavior:
+
+- `STACK:` / `PUSH:` adds text to the stack
+- `POP:` returns the most recently pushed item
+- empty stack errors are explicit instead of silently doing the wrong thing
+
+### `CMD:` / `RUN:` / `EXEC:`
+
+`CMD:` runs an allowlisted system command and returns the real stdout or stderr. Chained shell operators, pipes, and redirects are blocked.
+
+Examples:
+
+```text
+CMD: echo hello
+CMD: dir
+CMD: ls
+```
+
+Notes:
+
+- `dir` is supported on Windows
+- `ls` is supported on Linux
+- output is no longer mixed with stale results from previous commands
+
+### `WIKI:`
+
+`WIKI:` now tries to be useful on ambiguous queries.
+
+Behavior:
+
+- answers in the same language as the query text
+- Russian query text prefers Russian Wikipedia results
+- English query text uses English Wikipedia results
+- if the query resolves cleanly, it returns a short summary
+- if the query is ambiguous, it prefers a likely non-disambiguation page
+- if ambiguity is still significant, it returns a short list of likely pages instead of raw disambiguation noise
+
+Example:
+
+```text
+WIKI: Python
+WIKI: питон
+```
+
+### `DEFINE:`
+
+`DEFINE:` now prefers safe, common definitions and filters obviously offensive or slang-first meanings by default.
+
+Behavior:
+
+- answers in the same language as the query text
+- Russian queries return Russian definitions
+- English queries return English definitions
+- shows the most useful safe definition first
+- includes a short list of alternative normal meanings when helpful
+- avoids surfacing weird or NSFW definitions as the default result
+
+Example:
+
+```text
+DEFINE: python
+DEFINE: питон
+```
+
+### `EXP:` / `EXPLAIN:`
+
+`EXP:` is now a real explain-mode command. It should explain, simplify, and expand meaning when needed instead of merely echoing the source with tiny edits.
+
+Example:
+
+```text
+EXP: HTTP cache
+```
+
+### `EMAIL:`
+
+`EMAIL:` now aims for a clean, single-language draft.
+
+Behavior:
+
+- keeps the email in the source language unless you explicitly ask for another one
+- avoids mixed-language subject/body output
+- strips assistant-style framing
+
+### `HAIKU:`
+
+`HAIKU:` turns the source idea into a short haiku-style poem and returns only the poem, usually in three short lines.
+
+Example:
+
+```text
+HAIKU: a calm morning while coding
+```
+
+### `FILL:`
+
+`FILL:` fills template placeholders such as `{{name}}` and `{{role}}`.
+
+Preferred syntax:
+
+```text
+FILL:name=Aldiyar|role=founder: My name is {{name}} and I am a {{role}}
+```
+
+Behavior:
+
+- explicit assignments are applied deterministically
+- unresolved placeholders are treated as an error when the command had enough information
+- output is only the completed text
+
+### Rewrite Examples
+
+`RW:` is intended to do real paraphrasing, not just punctuation cleanup. The default rewrite strength is `strong`, which means short or underwritten text is allowed to expand slightly into a better-formed sentence while preserving meaning and language.
+
+Examples:
+
+- before: `RW:программирование это легко`
+- after: `Программирование может быть гораздо проще, чем кажется на первый взгляд, особенно если изучать его последовательно и на понятных примерах.`
+- before: `RW:Programming is easy`
+- after: `Programming can be much easier to learn and practice than many people expect, especially when concepts are explained clearly and approached step by step.`
+
+Rewrite strength can be configured in `config.yaml`:
+
+```yaml
+commands:
+  rewrite:
+    strength: strong
+```
+
+Supported levels are `light`, `normal`, and `strong`.
+
+## Prefix Parsing
+
+Explicit prefix commands bypass the picker and execute immediately. Examples:
+
+```text
+RW: rough draft
+TRANS:JA: Good morning
+TR:EN: Privet
+TONE:formal: hey there
+FILL:name=Aldiyar|role=founder: Hello {{name}} from {{role}}
+```
+
+The picker is only shown when the selected text does not already contain a recognized command prefix or pipeline.
+
+## Pipelines
+
+Examples:
+
+```text
+TR:EN:|SUM: grubyj dlinnyj chernovik
+SANITIZE:|COUNT: <b>messy</b> text
+TRANS:EN:|TONE:formal: privet brat
+```
+
+Each stage receives the output of the previous stage.
+
+## Install
+
+### Windows
+
+```powershell
+cd C:\Users\aldiy\Desktop\watashigpt-main\action-middleware
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\Scripts\pip.exe install -r requirements.txt
+```
+
+If `python` or `pip` still point to Microsoft Store aliases, disable:
+
+`Settings -> Apps -> Advanced app settings -> App execution aliases -> turn off python.exe and py.exe`
+
+### Linux
 
 ```bash
 cd action-middleware
+pip install -r requirements.txt
+sudo apt-get install wl-clipboard xclip libnotify-bin
+```
 
-# Run (requires root for keyboard access, -E preserves session env vars)
-sudo -E python main.py
+Optional Wayland helper for more reliable paste:
 
-# Keep full ASCII banner permanently
-sudo -E python main.py --banner
+```bash
+sudo apt-get install wtype
+```
 
-# Run without system tray icon
-sudo -E python main.py --no-tray
+## Run
 
-# Browse history (last 50 entries)
+### Windows
+
+```powershell
+cd C:\Users\aldiy\Desktop\watashigpt-main\action-middleware
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\python.exe main.py
+```
+
+For a no-console Windows launcher, use:
+
+```powershell
+cd C:\Users\aldiy\Desktop\watashigpt-main\action-middleware
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\pythonw.exe ActionFlow.pyw
+```
+
+If the tray does not appear or startup fails, check:
+
+- `~/.actionflow_startup.log` for launcher and tray startup steps
+- the fallback main window, which now opens when tray startup is unavailable
+- whether `pystray`, `Pillow`, and `tkinter` are available in the current Python install
+
+### Linux
+
+```bash
+cd action-middleware
+python main.py
+```
+
+### Debug Console Mode
+
+The legacy console-first runtime is still available when you want full terminal diagnostics:
+
+```powershell
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\python.exe main.py --debug-console
+```
+
+```bash
+python main.py --debug-console
+```
+
+Optional console flags only apply in debug console mode:
+
+```powershell
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\python.exe main.py --no-tray
+```
+
+```powershell
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\python.exe main.py --debug-console --banner
+```
+
+Explicit mock mode:
+
+```powershell
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\python.exe main.py --mock-llm
+```
+
+History:
+
+```bash
 python main.py --history
-python main.py --history --grep TR    # filter by command
-
-# Install as systemd service
-sudo -E python main.py --install
+python main.py --history --grep TR
 ```
 
-## Architecture
+## Desktop App
 
+Normal launch is now GUI/background-first.
+
+What you get after startup:
+
+- tray icon / system tray menu
+- background hotkey listener
+- GUI main window with `Status`, `Settings`, `History`, `Logs`, and `Commands / Help`
+- GUI setup dialogs for missing LLM or image credentials
+- GUI command picker when selected text has no explicit prefix
+- GUI result windows for commands such as `COUNT`, `WIKI`, and `DEFINE`
+
+Tray menu:
+
+- `Open`
+- `Quick Command`
+- `Settings`
+- `History`
+- `Logs`
+- `Restart Hotkeys`
+- `About`
+- `Exit`
+
+Closing the main window does not exit the app. Full shutdown is done from tray `Exit`.
+
+Startup tracing:
+
+- GUI and windowless startup write to `~/.actionflow_startup.log`
+- `python main.py` keeps console output visible and also writes startup steps there
+- `pythonw.exe ActionFlow.pyw` has no console, so the startup log is the first place to inspect
+- normal runtime activity such as hotkey registration, hotkey callbacks, selection capture, and command execution is written to `~/.actionflow.log`
+- `Status` now reports `Ready` only when hotkeys are registered and background runtime polling is active
+- `Partial` means the shell is up but hotkeys or runtime wiring need attention
+
+## Hotkeys
+
+Default hotkeys are in `action-middleware/config.yaml.example`:
+
+- `Ctrl+Alt+X` intercept selected text
+- `Ctrl+Alt+Z` undo last replacement
+- `Ctrl+Alt+S` toggle silent mode
+
+Copy `config.yaml.example` to `config.yaml` to customize providers, personal commands, hotkeys, or per-command settings.
+
+## UI Modes
+
+ActionFlow now has a centralized UX/notification layer with three modes:
+
+- `silent`
+  - default for MVP
+  - console logs stay visible
+  - no success toasts
+  - no transient popup/toast notifications for normal command success
+  - diagnostics go to the log file instead of user-facing noise
+- `minimal`
+  - console logs stay visible
+  - only important user-facing notices
+  - useful for setup problems, critical failures, and optional image-save alerts
+- `debug`
+  - full terminal diagnostics, activity feed, result popups, and noisy development feedback
+
+Default UI config:
+
+```yaml
+ui:
+  mode: silent
+  show_success_notifications: false
+  show_error_popups: false
+  show_result_popups: false
+  log_level: info
+  notify_on_image_save: true
+  log_path: ~/.actionflow.log
 ```
-Hotkey (Ctrl+Alt+X)
-    │
-    ├─ Callback fires on keyboard listener thread
-    │  └─ Spawns worker thread (non-blocking)
-    │
-    ├─ Worker thread:
-    │  ├─ Read selection (wl-paste on Wayland / Ctrl+C on X11)
-    │  ├─ Detect app context (terminal/browser/IDE/chat/docs)
-    │  ├─ Analyze text (language, code, formality, type)
-    │  └─ Queue popup for main thread
-    │
-    ├─ Main thread:
-    │  ├─ Show command picker popup (tkinter Toplevel)
-    │  ├─ Smart suggestions ranked by context + learned patterns
-    │  ├─ Route: prefix match → keyword → LLM classify → fallback
-    │  ├─ Process text through handler
-    │  └─ Replace selection (clipboard + wtype paste)
-    │
-    └─ TUI output (thread-safe, timestamped, color-coded)
+
+Notes:
+
+- `Ctrl+Alt+S` toggles runtime UX between `silent` and `minimal`
+- `debug` mode is best enabled in config when you want full diagnostics
+- logs are written to `~/.actionflow.log` by default
+- startup and runtime console logs remain visible in all modes
+- picker UI still opens when no explicit command prefix is present
+- command result UI such as `COUNT`, `WIKI`, `DEFINE`, and other result viewers remains enabled
+- setup dialogs and picker UI remain enabled
+- successful commands like `RW`, `TRANS`, `SUM`, `EMAIL`, `CMD`, and normal inline replacements now run quietly in MVP mode
+- ordinary popup notifications are off by default; command result windows are not treated as notifications
+
+## Settings And Tokens
+
+Use tray `Settings` or the `Settings` tab in the main window to edit:
+
+- LLM provider
+- LLM model
+- LLM API key
+- image provider / model / image API key
+- hotkeys
+- UI mode
+- log path
+- launch at startup
+- debug console preference
+
+Token handling:
+
+- API keys are entered through GUI fields with password masking
+- keys are stored in `~/.actionflow_secrets.yaml`
+- non-secret settings stay in `action-middleware/config.yaml`
+- logs never print raw secrets
+
+## First-Run Setup
+
+On first launch, if an LLM provider or API key is missing, the app opens a setup dialog instead of failing silently.
+
+The setup flow lets you:
+
+- choose provider
+- paste API key
+- choose model
+- optionally add image API key
+- skip setup for now
+- use mock mode temporarily
+
+If setup is skipped, the app keeps running in background mode and affected commands honestly report that setup is still required.
+
+## Logs And History
+
+- `History` tab shows recent commands with input/output summaries and status
+- `Logs` tab shows the recent log file contents
+- default log file: `~/.actionflow.log`
+- history file: `~/.actionflow_history.jsonl`
+
+## Autostart
+
+The `Launch at startup` setting writes a platform-specific autostart entry:
+
+- Windows: Startup folder batch launcher
+- Linux: `~/.config/autostart/actionflow.desktop`
+
+## LLM Setup
+
+LLM-backed commands no longer default to fake placeholders. The runtime now has three honest states:
+
+- `LLM ready`: provider + model + API key are available, so commands call the real API
+- `LLM setup required`: no working key/backend is configured yet, so the first LLM command opens setup
+- `LLM mock mode (explicit)`: only enabled via config, env, or `--mock-llm`
+
+You can configure LLM access in three ways:
+
+1. `ACTIONFLOW_API_KEY` environment variable
+2. `config.yaml` for provider/model and `~/.actionflow_secrets.yaml` for the key
+3. first-run setup prompt triggered by the first LLM command
+
+Example config:
+
+```yaml
+llm:
+  mode: auto
+  provider: groq
+  model: llama-3.3-70b-versatile
 ```
 
-### Key design decisions
+Explicit mock mode options:
 
-- **Config-driven**: all commands defined in `config.yaml`, no hardcoding
-- **3-tier routing**: prefix match → keyword match → LLM classification → fallback
-- **Non-blocking callbacks**: hotkey callbacks spawn threads and return immediately
-- **Primary selection on Wayland**: reads highlighted text directly via `wl-paste`
-- **wtype for paste**: reliable paste on GNOME Wayland instead of uinput
-- **`sudo -E` with `_run_as_user()`**: runs as root for `/dev/input` access but clipboard/notification commands run as the original user
-- **Pattern learning**: `PatternLearner` reads history, computes usage-frequency weights per app context after 20+ samples
-- **Safe math eval**: `CALC:` uses `ast.parse()` + AST node whitelisting — never raw `eval()`
+- CLI: `python main.py --mock-llm`
+- env: `ACTIONFLOW_LLM_MODE=mock`
+- config: `llm.mode: mock`
 
-## Project Structure
+To verify that real LLM calls are active, start the app and look for `LLM ready` in the header/status box.
 
-```
-watashigpt/
-├── action-middleware/
-│   ├── main.py              # All application code (~4000 lines)
-│   ├── config.yaml.example  # Example config with all commands and settings
-│   └── requirements.txt     # Python dependencies
-├── .gitignore
-└── README.md
+Image backend example:
+
+```yaml
+image_generation:
+  provider: pollinations
+  base_url: https://gen.pollinations.ai/image
+  model: flux
 ```
 
-## TUI
+Optional image key sources:
 
-- **Collapsible banner**: full ASCII art for 2s at startup, collapses to single-line header (`--banner` to keep)
-- **Environment panel**: mode (LIVE/MOCK), learning sample count
-- **LLM panel**: green border in live mode, yellow in mock
-- **Commands panel**: `[LLM]`/`[FAST]` badges, live usage counters
-- **Activity feed**: color-coded rows with timestamps and duration
-- **Micro-log**: rolling 3-line status bar
-- **System tray**: color status icon (green=live, yellow=mock, grey=silent), right-click menu
+- `ACTIONFLOW_IMAGE_API_KEY`
+- `POLLINATIONSAI_API_KEY`
+- `~/.actionflow_secrets.yaml` after the interactive image setup prompt
+
+## Selection Capture
+
+On Windows, ActionFlow captures the current selection by:
+
+1. snapshotting the current clipboard text and clipboard sequence number
+2. sending `Ctrl+C` to the focused app
+3. waiting for a clipboard sequence update instead of only checking whether the text changed
+4. reading the copied text once the clipboard reports a real update
+5. restoring the user clipboard after capture and after replacement
+
+This avoids the old failure mode where capture was treated as failed just because the copied text matched the previous clipboard text.
+
+## Tests
+
+```bash
+cd action-middleware
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\Scripts\pip.exe install -r requirements-dev.txt
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\python.exe -m pytest
+```
+
+Linux can run the same test suite with `python -m pytest`.
+
+Regression suite for transform commands:
+
+```bash
+cd action-middleware
+C:\Users\aldiy\AppData\Local\Programs\Python\Python312\python.exe run_regression_suite.py
+```
+
+Covered areas:
+
+- registry
+- pipeline parsing/execution
+- history learner
+- stack/clip store
+- LLM state resolution and setup decisions
+- clipboard capture / paste-restore flow
+- transform command parsing
+- transform output cleaning / validation / retry
+- explicit prefix bypass for picker
+- safe math evaluator
+- text helper commands
+- platform service stubs
+
+## Safety Notes
+
+- `CALC:` uses an AST-based safe evaluator, not raw `eval`.
+- `CMD:` / `RUN:` / `EXEC:` remain explicitly allowlisted and platform execution stays behind the platform/system layer.
+- Clipboard capture restores and reuses clipboard state carefully, especially on Windows where selection capture uses `Ctrl+C`.
+- API keys are read from env/config/secrets, never echoed back in the TUI, and are redacted from config logging helpers.
+- Linux-only tools are isolated in `platform/linux.py`; the shared core no longer depends on `xclip`, `wl-copy`, `xdotool`, `swaymsg`, or `wtype`.
+
+## Known Limitations
+
+- Windows text capture still depends on target apps honoring `Ctrl+C`; some privileged or custom-rendered apps may block it.
+- Hotkey changes in config are loaded from file, but active listeners still require app restart to rebind.
+- If the OpenAI-compatible backend package is missing or the provider rejects the key, setup will fail honestly instead of silently falling back to placeholders.
+- Linux service installation is still `systemd`-only; Windows has no autostart installer yet.
+- `keyboard` may need elevation on some locked-down Windows or Linux environments.
+- Some commands such as `review`, `meeting`, or `eli5` intentionally allow multi-line output, but they still use the same no-chat transform contract.
+
+## Entry Points
+
+- Compatibility launcher: `action-middleware/main.py`
+- Package entry: `actionflow.app.main`
