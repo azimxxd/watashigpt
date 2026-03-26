@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ActionFlow
+Comment=ActionFlow desktop background app
+Exec={{EXEC}}
+Icon={{ICON}}
+Terminal=false
+Categories=Utility;Office;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

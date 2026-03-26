@@ -10,6 +10,8 @@ import threading
 import time
 from typing import Callable
 
+from actionflow.app.paths import runtime_log_path
+
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
@@ -22,7 +24,7 @@ class NotificationSettings:
     show_result_popups: bool = False
     log_level: str = "info"
     notify_on_image_save: bool = True
-    log_path: Path = Path.home() / ".actionflow.log"
+    log_path: Path = runtime_log_path()
     error_dedupe_window_seconds: float = 8.0
 
 
@@ -67,7 +69,7 @@ class NotificationManager:
         if mode not in {"silent", "minimal", "debug"}:
             mode = "silent"
 
-        log_path_value = ui_cfg.get("log_path", str(Path.home() / ".actionflow.log"))
+        log_path_value = ui_cfg.get("log_path", str(runtime_log_path()))
         log_path = Path(log_path_value).expanduser()
 
         settings = NotificationSettings(

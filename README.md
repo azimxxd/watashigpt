@@ -412,7 +412,15 @@ TRANS:EN:|TONE:formal: privet brat
 
 Each stage receives the output of the previous stage.
 
-## Install
+## Recommended End-User Launch Path
+
+The primary UX is now a packaged desktop app, not a terminal command.
+
+- Windows: launch `ActionFlow.exe`
+- Linux: launch the packaged desktop app through a `.desktop` entry or launcher script
+- `python main.py` and `python main.py --debug-console` remain available for development and debugging
+
+## Install / Setup
 
 ### Windows
 
@@ -439,9 +447,64 @@ Optional Wayland helper for more reliable paste:
 sudo apt-get install wtype
 ```
 
+## Distribution
+
+Windows release output:
+
+- `action-middleware/dist/ActionFlow/ActionFlow.exe`
+
+Linux release output:
+
+- `action-middleware/dist/ActionFlow/ActionFlow`
+- `action-middleware/dist/linux/actionflow.desktop`
+- `action-middleware/dist/linux/actionflow.png`
+
+Build helpers:
+
+- `action-middleware/scripts/build_windows.ps1`
+- `action-middleware/scripts/build_windows.bat`
+- `action-middleware/scripts/build_linux.sh`
+- `action-middleware/scripts/install_linux_desktop.sh`
+
 ## Run
 
-### Windows
+### Windows Packaged Desktop App
+
+Build or distribute the packaged app, then launch:
+
+```powershell
+action-middleware\dist\ActionFlow\ActionFlow.exe
+```
+
+Expected MVP behavior:
+
+- no console window
+- tray icon appears
+- first-run setup opens if credentials are missing
+- `Settings`, `History`, and `Logs` are available from the tray or main window
+
+### Linux Packaged Desktop App
+
+Build and install the launcher:
+
+```bash
+cd action-middleware
+./scripts/build_linux.sh
+./scripts/install_linux_desktop.sh
+```
+
+Then launch ActionFlow from the desktop menu / application launcher.
+
+Expected MVP behavior:
+
+- no terminal is required for ordinary use
+- tray/background app starts
+- first-run setup opens in GUI if credentials are missing
+- `Settings`, `History`, and `Logs` are available from the tray or main window
+
+### Source / Development Launch Paths
+
+#### Windows
 
 ```powershell
 cd C:\Users\aldiy\Desktop\watashigpt-main\action-middleware
@@ -461,7 +524,7 @@ If the tray does not appear or startup fails, check:
 - the fallback main window, which now opens when tray startup is unavailable
 - whether `pystray`, `Pillow`, and `tkinter` are available in the current Python install
 
-### Linux
+#### Linux
 
 ```bash
 cd action-middleware
@@ -505,7 +568,7 @@ python main.py --history --grep TR
 
 ## Desktop App
 
-Normal launch is now GUI/background-first.
+Normal launch is now GUI/background-first, and packaged launch is the preferred end-user path.
 
 What you get after startup:
 
@@ -537,6 +600,69 @@ Startup tracing:
 - normal runtime activity such as hotkey registration, hotkey callbacks, selection capture, and command execution is written to `~/.actionflow.log`
 - `Status` now reports `Ready` only when hotkeys are registered and background runtime polling is active
 - `Partial` means the shell is up but hotkeys or runtime wiring need attention
+
+## Build / Release Workflow
+
+### Build Windows `.exe`
+
+```powershell
+cd action-middleware
+scripts\build_windows.bat
+```
+
+or:
+
+```powershell
+cd action-middleware
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+```
+
+The Windows build flow:
+
+- generates branded `.png` and `.ico` assets
+- installs `PyInstaller` if needed
+- builds the packaged desktop app
+- writes output to `action-middleware/dist/ActionFlow/`
+
+### Build Linux Desktop Launcher
+
+```bash
+cd action-middleware
+./scripts/build_linux.sh
+./scripts/install_linux_desktop.sh
+```
+
+The Linux build flow:
+
+- generates branded icons
+- builds the packaged desktop binary
+- creates `dist/linux/actionflow.desktop`
+- installs the desktop launcher into the user's applications directory
+
+### Debug / Development
+
+Use these only for development or investigation:
+
+- `python main.py --debug-console`
+- `python main.py`
+
+## Logs, Config, History
+
+### Windows
+
+- config: `%APPDATA%\ActionFlow\config.yaml`
+- secrets: `%APPDATA%\ActionFlow\actionflow_secrets.yaml`
+- runtime log: `%LOCALAPPDATA%\ActionFlow\logs\actionflow.log`
+- startup log: `%LOCALAPPDATA%\ActionFlow\logs\actionflow_startup.log`
+- history: `%LOCALAPPDATA%\ActionFlow\actionflow_history.jsonl`
+
+### Linux
+
+- config: `~/.config/actionflow/config.yaml`
+- secrets: `~/.config/actionflow/actionflow_secrets.yaml`
+- runtime log: `~/.local/state/actionflow/logs/actionflow.log`
+- startup log: `~/.local/state/actionflow/logs/actionflow_startup.log`
+- history: `~/.local/state/actionflow/actionflow_history.jsonl`
 
 ## Hotkeys
 

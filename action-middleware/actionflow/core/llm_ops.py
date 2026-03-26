@@ -8,6 +8,8 @@ from typing import Any, Callable
 
 import yaml
 
+from actionflow.app.paths import secrets_path
+
 
 PROVIDER_BASE_URLS = {
     "groq": "https://api.groq.com/openai/v1",
@@ -28,7 +30,7 @@ LLM_STATE_READY = "ready"
 LLM_STATE_NEEDS_SETUP = "needs_setup"
 LLM_STATE_MOCK = "mock"
 
-SECRETS_PATH = Path.home() / ".actionflow_secrets.yaml"
+SECRETS_PATH = secrets_path()
 
 
 @dataclass(frozen=True)

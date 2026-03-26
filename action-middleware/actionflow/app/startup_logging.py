@@ -5,8 +5,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
 
+from actionflow.app.paths import startup_log_path
 
-STARTUP_LOG_PATH = Path.home() / ".actionflow_startup.log"
+STARTUP_LOG_PATH = startup_log_path()
 
 
 def configure_startup_log_path(path: Path) -> None:

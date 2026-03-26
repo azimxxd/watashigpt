@@ -12,7 +12,9 @@ def test_windows_autostart_file_can_be_created(monkeypatch, tmp_path):
     target = autostart.configure_launch_at_startup(True)
 
     assert target.exists()
-    assert "main.py" in target.read_text(encoding="utf-8")
+    text = target.read_text(encoding="utf-8")
+    assert "ActionFlow.pyw" in text
+    assert "pythonw.exe" in text
 
 
 def test_linux_autostart_file_can_be_created(monkeypatch, tmp_path):

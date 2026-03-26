@@ -6,9 +6,10 @@ from typing import Any
 
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-EXAMPLE_CONFIG_PATH = PROJECT_ROOT / "config.yaml.example"
-USER_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+from actionflow.app.paths import example_config_path, runtime_log_path, user_config_path
+
+EXAMPLE_CONFIG_PATH = example_config_path()
+USER_CONFIG_PATH = user_config_path()
 
 BASE_CONFIG: dict[str, Any] = {
     "hotkeys": {"intercept": "ctrl+alt+x", "undo": "ctrl+alt+z", "silent_toggle": "ctrl+alt+s"},
@@ -22,7 +23,7 @@ BASE_CONFIG: dict[str, Any] = {
         "show_result_popups": False,
         "log_level": "info",
         "notify_on_image_save": True,
-        "log_path": str(Path.home() / ".actionflow.log"),
+        "log_path": str(runtime_log_path()),
         "error_dedupe_window_seconds": 8.0,
     },
     "platform": {"clipboard_backend": "auto", "window_backend": "auto"},

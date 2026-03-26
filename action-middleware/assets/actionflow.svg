@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title>ActionFlow Icon</title>
+  <desc>Green circular ActionFlow desktop app icon with a vertical white pulse mark.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" x2="100%" y1="0%" y2="100%">
+      <stop offset="0%" stop-color="#0dbd8b"/>
+      <stop offset="100%" stop-color="#06745e"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="#0b1114"/>
+  <circle cx="128" cy="128" r="86" fill="url(#bg)"/>
+  <path d="M118 62h20v44l22-14v28l-22 14v60h-20v-48l-22 14v-28l22-14z" fill="#f7fbfc"/>
+</svg>

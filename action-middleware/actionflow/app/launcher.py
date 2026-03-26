@@ -440,15 +440,23 @@ class DesktopAppLauncher:
             self.main_window.show_tab("logs")
 
     def open_about(self) -> None:
+        about_text = (
+            f"ActionFlow / WatashiGPT\n"
+            f"Version {runtime.__version__}\n\n"
+            "Desktop background app MVP with tray startup, global hotkeys, "
+            "GUI settings, history/log viewers, setup dialogs, and result windows.\n\n"
+            f"Startup log: {STARTUP_LOG_PATH}\n"
+            f"Runtime log: {runtime.get_log_path()}"
+        )
         if self.use_qt or self.headless_test_mode:
             self.result_windows.show_result(
                 "About ActionFlow",
-                "ActionFlow / WatashiGPT\n\nDesktop background app with hotkeys, picker, result windows, settings, history, logs, and startup tracing.",
+                about_text,
             )
         else:
             runtime._show_result_popup(
                 "About ActionFlow",
-                "ActionFlow / WatashiGPT\n\nDesktop background app with hotkeys, picker, result windows, settings, history, logs, and startup tracing.",
+                about_text,
             )
 
     def open_quick_command(self) -> None:

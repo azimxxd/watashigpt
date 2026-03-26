@@ -39,6 +39,7 @@ from dataclasses import dataclass
 
 from actionflow.app.hotkeys import register_hotkeys
 from actionflow.app.notifications import notifications
+from actionflow.app.paths import clips_path, history_path, project_root, runtime_log_path, secrets_path, user_config_path
 from actionflow.app.startup_logging import get_startup_logger
 from actionflow.core.clipboard_flow import ClipboardCaptureConfig, capture_selection_via_clipboard, paste_with_clipboard_restore
 from actionflow.app.tray import start_tray_thread
@@ -126,9 +127,8 @@ except ImportError:
 # Config Loading
 # ============================================================
 
-_APP_DIR = Path(__file__).resolve().parent
-_PROJECT_ROOT = _APP_DIR.parents[1]
-_CONFIG_PATH = _PROJECT_ROOT / "config.yaml"
+_PROJECT_ROOT = project_root()
+_CONFIG_PATH = user_config_path()
 
 _DEFAULT_CONFIG = CORE_DEFAULT_CONFIG
 
@@ -184,7 +184,7 @@ _MICRO_LOG_MAX = 3
 _start_time: float = time.time()
 
 _last_command: dict | None = None  # For REPEAT: stores {"name": ..., "config": ...}
-_CLIPS_PATH = Path.home() / ".actionflow_clips.json"
+_CLIPS_PATH = clips_path()
 _clip_store = NamedClipsStore(_CLIPS_PATH, max_clips=100)
 _clipboard_stack = ClipboardStack(max_items=50)
 _pending_undo_entry: dict | None = None
@@ -1119,7 +1119,7 @@ def _start_config_watcher() -> None:
                     _reload_config()
 
         observer = Observer()
-        observer.schedule(ConfigHandler(), str(_PROJECT_ROOT), recursive=False)
+        observer.schedule(ConfigHandler(), str(_CONFIG_PATH.parent), recursive=False)
         observer.daemon = True
         observer.start()
         _config_watcher_started = True
@@ -3808,7 +3808,7 @@ def handle_trans(text: str, full_text: str, cmd_config: dict) -> None:
 # ============================================================
 
 _IMAGE_DIR = Path(tempfile.gettempdir()) / "actionflow_images"
-_SECRETS_PATH = Path.home() / ".actionflow_secrets.yaml"
+_SECRETS_PATH = secrets_path()
 
 
 def _clipboard_copy_image(image_path: str) -> bool:
@@ -4323,7 +4323,7 @@ _BUILTIN_HANDLERS = {
 # History Log
 # ============================================================
 
-_HISTORY_PATH = Path.home() / ".actionflow_history.jsonl"
+_HISTORY_PATH = history_path()
 
 # Commands whose input/output must never be logged in plaintext
 _SENSITIVE_COMMANDS = frozenset({"password", "redact", "command"})
@@ -4807,7 +4807,7 @@ def _command_search() -> None:
 def _session_export() -> None:
     """Dump the full activity log for the current session to a markdown file."""
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    export_path = Path.home() / f"actionflow_session_{ts}.md"
+    export_path = _HISTORY_PATH.parent / f"actionflow_session_{ts}.md"
 
     lines = [
         f"# ActionFlow Session Export",
@@ -5433,7 +5433,7 @@ def _check_for_updates() -> None:
 
 def show_history(grep_filter: str | None = None) -> None:
     """Print last 50 history entries as a formatted table. Optionally filter by command."""
-    history_path = Path.home() / ".actionflow_history.jsonl"
+    history_path = _HISTORY_PATH
     if not history_path.exists():
         print(f"{TUI.YELLOW}No history file found at {history_path}{TUI.RESET}")
         return
