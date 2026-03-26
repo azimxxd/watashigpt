@@ -421,10 +421,9 @@ commands:
     llm_required: true
     prefixes:
     - 'TRANS:'
-  translate:
-    description: Convert rude text to professional
+  polite:
+    description: Rewrite rude/blunt text politely (phrase lookup + LLM)
     keywords:
-    - translate
     - polite
     - rephrase
     - professional
@@ -455,7 +454,8 @@ commands:
       why isn't this done yet: Could we review the current blockers together?
       you don't know what you're doing: Perhaps we could pair on this together?
     prefixes:
-    - 'TR:'
+    - 'POL:'
+    - 'POLITE:'
   tweet:
     description: Shorten text to 280 chars (LLM)
     keywords:
@@ -491,7 +491,7 @@ context_priorities:
   - review
   browser:
   - summarize
-  - translate
+  - polite
   - rewrite
   - bullets
   - title
@@ -505,7 +505,7 @@ context_priorities:
   chat:
   - rewrite
   - tone
-  - translate
+  - polite
   - tweet
   docs:
   - rewrite
@@ -526,6 +526,10 @@ personal_commands: {}
   #         **Blockers:** None
 command_security:
   allowed_commands: [ls, cat, grep, find, git, echo, date, python, node, curl, wc, head, tail, sort, uniq, diff, file, stat, whoami, hostname, uname, env, printenv, which, type]
+image_api:
+  api_key: ''  # Use env var ACTIONFLOW_IMAGE_API_KEY instead
+  model: seedream
+  provider: pollinations
 llm:
   api_key: ''  # Use env var ACTIONFLOW_API_KEY instead
   fallback:

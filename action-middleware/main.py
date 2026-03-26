@@ -93,7 +93,7 @@ _DEFAULT_CONFIG = {
         },
     },
     "llm": {"provider": "", "api_key": "", "model": ""},
-    "image_api": {"provider": "pollinations", "api_key": "", "model": "seedream"},
+    "image_api": {"provider": "pollinations", "api_key": "", "model": "flux"},
 }
 
 
@@ -204,12 +204,17 @@ def _start_paste_helper() -> bool:
 
 def _portal_send(command: str) -> bool:
     """Send a command to the paste helper. Returns True on success."""
+    return _portal_send_raw(command) is not None
+
+
+def _portal_send_raw(command: str) -> str | None:
+    """Send a command to the paste helper. Returns response data on OK, None on error."""
     global _paste_helper_proc
     import select as _sel
     with _paste_helper_lock:
         if _paste_helper_proc is None or _paste_helper_proc.poll() is not None:
             _paste_helper_proc = None
-            return False
+            return None
         try:
             _paste_helper_proc.stdin.write(command + "\n")
             _paste_helper_proc.stdin.flush()
@@ -217,13 +222,17 @@ def _portal_send(command: str) -> bool:
             ready, _, _ = _sel.select([_paste_helper_proc.stdout], [], [], 3)
             if not ready:
                 TUI.warn("Portal helper response timeout")
-                return False
+                return None
             response = _paste_helper_proc.stdout.readline().strip()
-            return response == "OK"
+            if response == "OK":
+                return ""
+            if response.startswith("OK:"):
+                return response[3:]
+            return None
         except Exception as exc:
             TUI.warn(f"Portal send error: {exc}")
             _paste_helper_proc = None
-            return False
+            return None
 
 _undo_stack: list[dict] = []
 _undo_lock = threading.Lock()
@@ -342,25 +351,38 @@ def detect_active_window() -> AppContext:
     title = ""
     try:
         if _IS_WAYLAND:
-            # Try kdotool (KDE Wayland)
-            try:
-                proc = _run_as_user(["kdotool", "getactivewindow", "getwindowname"],
-                                    capture_output=True, text=True, timeout=2)
-                if proc.returncode == 0:
-                    title = proc.stdout.strip().lower()
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                # Try swaymsg (Sway)
+            # GNOME Wayland: try AT-SPI via paste helper first
+            if _paste_helper_proc is not None:
                 try:
-                    proc = _run_as_user(["swaymsg", "-t", "get_tree"],
-                                        capture_output=True, text=True, timeout=2)
-                    if proc.returncode == 0:
-                        tree = json.loads(proc.stdout)
-                        focused = _find_focused_sway(tree)
-                        if focused:
-                            title = (focused.get("name", "") or
-                                     focused.get("app_id", "")).lower()
+                    resp = _portal_send_raw("GETFOCUSED")
+                    if resp:
+                        parts = resp.split(":", 2)
+                        if len(parts) == 3:
+                            _app_name, _pid_str, b64_title = parts
+                            import base64 as _b64
+                            title = _b64.b64decode(b64_title).decode("utf-8").lower()
                 except Exception:
                     pass
+            if not title:
+                # Try kdotool (KDE Wayland)
+                try:
+                    proc = _run_as_user(["kdotool", "getactivewindow", "getwindowname"],
+                                        capture_output=True, text=True, timeout=2)
+                    if proc.returncode == 0:
+                        title = proc.stdout.strip().lower()
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    # Try swaymsg (Sway)
+                    try:
+                        proc = _run_as_user(["swaymsg", "-t", "get_tree"],
+                                            capture_output=True, text=True, timeout=2)
+                        if proc.returncode == 0:
+                            tree = json.loads(proc.stdout)
+                            focused = _find_focused_sway(tree)
+                            if focused:
+                                title = (focused.get("name", "") or
+                                         focused.get("app_id", "")).lower()
+                    except Exception:
+                        pass
         else:
             # X11: xdotool
             try:
@@ -390,6 +412,18 @@ def _get_active_window_id() -> str | None:
     """Return the active window ID so we can refocus it later."""
     try:
         if _IS_WAYLAND:
+            # GNOME Wayland: use AT-SPI via paste helper (Shell.Eval disabled since GNOME 45+)
+            if _paste_helper_proc is not None:
+                try:
+                    resp = _portal_send_raw("GETFOCUSED")
+                    if resp:
+                        # Response: "app_name:pid:b64_title"
+                        parts = resp.split(":", 2)
+                        if len(parts) == 3:
+                            app_name, pid_str, _ = parts
+                            return f"atspi:{pid_str}:{app_name}"
+                except Exception:
+                    pass
             # GNOME: use gdbus to get the focused window's stable_sequence
             try:
                 proc = _run_as_user(
@@ -461,6 +495,17 @@ def _focus_window(window_id: str) -> bool:
             ok, value = _parse_gdbus_eval_output(proc.stdout)
             # gdbus output: (true, 'ok') when focus activation succeeded
             return ok and value.strip().lower() == "ok"
+        elif kind == "atspi":
+            # wid format: "pid:app_name"
+            pid_str = wid.split(":", 1)[0]
+            if _paste_helper_proc is not None:
+                try:
+                    resp = _portal_send(f"ACTIVATE:{pid_str}")
+                    if resp:
+                        return True
+                except Exception:
+                    pass
+            return False
         elif kind == "kde":
             proc = _run_as_user(["kdotool", "windowactivate", wid],
                                 capture_output=True, timeout=2)
@@ -573,7 +618,7 @@ def analyze_text(text: str) -> TextAnalysis:
         result.looks_like = "error"
     elif _re.search(r'^\d{4}-\d{2}-\d{2}.*\[', stripped, _re.MULTILINE):
         result.looks_like = "log"
-    elif _re.search(r'(dear |hi |hello |subject:|re:)', stripped.lower()[:100]):
+    elif _re.search(r'(dear\s+\w+[,\n]|(?:hi|hello)\s+\w+[,\n]|^subject:\s|^re:\s)', stripped.lower()[:200], _re.MULTILINE):
         result.looks_like = "email_draft"
 
     # --- Basic error detection ---
@@ -1016,7 +1061,7 @@ def _image_api_setup_prompt() -> None:
 
     CONFIG["image_api"]["provider"] = provider
     CONFIG["image_api"]["api_key"] = api_key
-    image_model = image_cfg.get("model", "").strip() or "seedream"
+    image_model = image_cfg.get("model", "").strip() or "flux"
     CONFIG["image_api"]["model"] = image_model
     _save_image_api_config(provider, api_key, image_model)
 
@@ -1033,7 +1078,7 @@ def _init_image_api() -> None:
     image_cfg = CONFIG.get("image_api", {})
     provider = image_cfg.get("provider", "").strip().lower()
     api_key = image_cfg.get("api_key", "").strip()
-    model = image_cfg.get("model", "").strip() or "seedream"
+    model = image_cfg.get("model", "").strip() or "flux"
 
     env_key = os.environ.get("ACTIONFLOW_IMAGE_API_KEY", "").strip()
     if env_key:
@@ -3728,91 +3773,51 @@ def _pollinations_generate(prompt: str, max_retries: int = 3) -> bytes | None:
     """Try to generate an image via Pollinations.ai with retries and seed rotation.
 
     Returns raw image bytes on success, None on failure.
+    Uses image.pollinations.ai/prompt/ endpoint (free, no auth headers needed).
     """
     encoded_prompt = urllib.parse.quote(prompt)
-    headers = {"User-Agent": "ActionFlow/1.0"}
-    model = (_image_api_model or "").strip() or "seedream"
-    if _image_api_key:
-        # Send both common header styles for provider compatibility.
-        headers["Authorization"] = f"Bearer {_image_api_key}"
-        headers["X-API-Key"] = _image_api_key
-    
-    def _extract_allowed_models(err_text: str) -> list[str]:
-        text = err_text.replace('\\"', '"')
-        try:
-            maybe_json = json.loads(text)
-            if isinstance(maybe_json, dict) and "message" in maybe_json:
-                text = str(maybe_json["message"])
-        except Exception:
-            pass
-        m = _re.search(r"expected one of\s+(.+)", text, flags=_re.IGNORECASE)
-        if not m:
-            return []
-        tail = m.group(1)
-        models = _re.findall(r'"([A-Za-z0-9._-]+)"', tail)
-        # Preserve order while deduplicating
-        seen = set()
-        out = []
-        for name in models:
-            if name not in seen:
-                seen.add(name)
-                out.append(name)
-        return out
+    model = (_image_api_model or "").strip() or "flux"
+
+    use_key = _image_api_key  # local — cleared on 402 to fall back to free tier
 
     for attempt in range(max_retries):
         seed = int(time.time()) + attempt * 7
-        params = {
-            "model": model,
+        params: dict[str, str | int] = {
             "width": 1024,
             "height": 1024,
             "seed": seed,
+            "nologo": "true",
+            "model": model,
         }
-        if _image_api_key:
-            # Query fallback to survive intermediary/proxy header stripping.
-            params["key"] = _image_api_key
+        if use_key:
+            params["key"] = use_key
         query = urllib.parse.urlencode(params)
-        url = (f"https://gen.pollinations.ai/image/{encoded_prompt}"
-               f"?{query}")
-        req = urllib.request.Request(url, headers=headers)
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?{query}"
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "ActionFlow/1.0", "Accept": "image/*"},
+        )
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = resp.read(10 * 1024 * 1024 + 1)
                 if len(data) > 10 * 1024 * 1024:
                     continue
                 content_type = resp.headers.get("Content-Type", "")
-                if "image" in content_type:
+                if "image" in content_type.lower():
                     return data
                 TUI.warn(
                     f"IMAGE: attempt {attempt + 1}/{max_retries} unexpected content-type: {content_type}"
                 )
         except urllib.error.HTTPError as exc:
-            err_detail = ""
-            try:
-                err_body = exc.read().decode("utf-8", errors="ignore")
-                err_detail = err_body[:180].replace("\n", " ").strip()
-            except Exception:
-                pass
-            if err_detail:
-                TUI.warn(
-                    f"IMAGE: attempt {attempt + 1}/{max_retries} failed "
-                    f"(HTTP {exc.code}): {err_detail}"
-                )
-            else:
-                TUI.warn(f"IMAGE: attempt {attempt + 1}/{max_retries} failed (HTTP {exc.code})")
-
-            # If model is restricted by key, switch to an allowed model and retry.
-            if exc.code == 400 and err_detail:
-                allowed = _extract_allowed_models(err_detail)
-                if allowed and model not in allowed:
-                    model = allowed[0]
-                    TUI.warn(f"IMAGE: switching model to '{model}' based on API response")
-                    continue
-
-            # Auth/config errors won't recover via retries.
-            if exc.code in (400, 401, 403):
+            TUI.warn(f"IMAGE: attempt {attempt + 1}/{max_retries} failed (HTTP {exc.code})")
+            # Balance exhausted — drop the key and retry on free tier.
+            if exc.code == 402 and use_key:
+                TUI.warn("IMAGE: balance exhausted — switching to free tier (no key)")
+                use_key = ""
+                continue
+            if exc.code in (401, 403):
                 break
             if exc.code == 429:
-                time.sleep(3)  # rate limit — wait before retry
+                time.sleep(3)
             else:
                 time.sleep(1)
         except Exception:
@@ -4723,8 +4728,11 @@ def _start_tray() -> None:
     try:
         import pystray
         from pystray import MenuItem
-    except ImportError:
-        TUI.warn("pystray not installed — tray icon disabled (pip install pystray Pillow)")
+        # Force-check that the backend actually loads (catches missing GIR bindings)
+        pystray.Icon("_test")
+    except Exception as exc:
+        TUI.warn(f"Tray icon unavailable: {exc}")
+        TUI.warn("Fix: sudo apt install gir1.2-ayatanaappindicator3-0.1")
         return
 
     icon_img = _create_tray_icon_image(

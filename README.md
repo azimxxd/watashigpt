@@ -13,7 +13,7 @@ OS-level background assistant that intercepts selected text via global hotkeys, 
 
 1. Select any text in any application
 2. Press `Ctrl+Alt+X` — a command picker popup appears
-3. Pick a command (or type a prefix like `TR:hello`) — the text is processed and replaced in-place
+3. Pick a command (or type a prefix like `POL:hello`) — the text is processed and replaced in-place
 4. Press `Ctrl+Alt+Z` to undo
 
 ```
@@ -32,7 +32,7 @@ OS-level background assistant that intercepts selected text via global hotkeys, 
 
 | Prefix | Action | Notes |
 |--------|--------|-------|
-| `TR:` | Rude → professional text | Phrase lookup from config |
+| `POL:` / `POLITE:` | Rewrite rude/blunt text politely | Phrase lookup, LLM fallback |
 | `CMD:` / `RUN:` | Execute shell command | Dangerous pattern blocking |
 | `TEST:` / `PING:` | Pipeline verification | |
 | `FMT:` / `FORMAT:` | Auto-format JSON/XML | JSON first, XML fallback |
@@ -84,7 +84,7 @@ OS-level background assistant that intercepts selected text via global hotkeys, 
 Chain multiple commands by separating with `|`:
 
 ```
-TR:|SUM: rude long text   →  translates to professional, then summarizes
+POL:|SUM: rude long text   →  rewrites politely, then summarizes
 ```
 
 ### Personal Commands
@@ -129,11 +129,11 @@ Configured via interactive selector at first startup, or directly in `config.yam
 ### System packages
 
 ```bash
-# Wayland
-sudo apt-get install wl-clipboard libnotify-bin
+# Wayland (GNOME/KDE/Sway)
+sudo apt-get install wl-clipboard libnotify-bin python3-gi gir1.2-atspi-2.0
 
 # X11
-sudo apt-get install xclip libnotify-bin
+sudo apt-get install xclip xdotool libnotify-bin
 ```
 
 ### Python dependencies
@@ -154,11 +154,17 @@ pip install -r action-middleware/requirements.txt
 | `langdetect` | Automatic language detection |
 | `pystray` | System tray icon |
 | `Pillow` | System tray icon rendering |
+| `dbus-python` | D-Bus session bus (paste helper, used by system Python) |
+| `PyGObject` | GLib mainloop + AT-SPI accessibility (paste helper) |
 
 ## Usage
 
 ```bash
 cd action-middleware
+
+# Optional: set API keys before launch
+export ACTIONFLOW_API_KEY="your_llm_key"
+export ACTIONFLOW_IMAGE_API_KEY="your_image_key"   # optional, for IMG: command
 
 # Run (requires root for keyboard access, -E preserves session env vars)
 sudo -E python main.py
@@ -172,9 +178,6 @@ sudo -E python main.py --no-tray
 # Browse history (last 50 entries)
 python main.py --history
 python main.py --history --grep TR    # filter by command
-
-# Install as systemd service
-sudo -E python main.py --install
 ```
 
 ## Architecture
@@ -186,17 +189,23 @@ Hotkey (Ctrl+Alt+X)
     │  └─ Spawns worker thread (non-blocking)
     │
     ├─ Worker thread:
-    │  ├─ Read selection (wl-paste on Wayland / Ctrl+C on X11)
-    │  ├─ Detect app context (terminal/browser/IDE/chat/docs)
+    │  ├─ Read selection (wl-paste --primary on Wayland / Ctrl+C on X11)
+    │  ├─ Detect app context via AT-SPI / xdotool (terminal/browser/IDE/chat/docs)
     │  ├─ Analyze text (language, code, formality, type)
-    │  └─ Queue popup for main thread
+    │  └─ Queue popup for main thread (or execute prefix command directly)
     │
     ├─ Main thread:
     │  ├─ Show command picker popup (tkinter Toplevel)
     │  ├─ Smart suggestions ranked by context + learned patterns
     │  ├─ Route: prefix match → keyword → LLM classify → fallback
     │  ├─ Process text through handler
-    │  └─ Replace selection (clipboard + wtype paste)
+    │  └─ Replace selection (clipboard + portal Ctrl+V paste)
+    │
+    ├─ Paste helper (separate user-space process):
+    │  ├─ xdg-desktop-portal RemoteDesktop session for key injection
+    │  ├─ AT-SPI window detection (focused window app/PID/title)
+    │  ├─ D-Bus window activation (refocus source window after popup)
+    │  └─ Clipboard read/write via wl-copy/wl-paste
     │
     └─ TUI output (thread-safe, timestamped, color-coded)
 ```
@@ -206,8 +215,9 @@ Hotkey (Ctrl+Alt+X)
 - **Config-driven**: all commands defined in `config.yaml`, no hardcoding
 - **3-tier routing**: prefix match → keyword match → LLM classification → fallback
 - **Non-blocking callbacks**: hotkey callbacks spawn threads and return immediately
-- **Primary selection on Wayland**: reads highlighted text directly via `wl-paste`
-- **wtype for paste**: reliable paste on GNOME Wayland instead of uinput
+- **Primary selection on Wayland**: reads highlighted text directly via `wl-paste --primary`
+- **Portal-based paste**: uses xdg-desktop-portal RemoteDesktop to inject Ctrl+V — works on GNOME Wayland without wtype or uinput
+- **AT-SPI window tracking**: detects focused window via accessibility bus, activates via D-Bus — works on GNOME 45+ where Shell.Eval is disabled
 - **`sudo -E` with `_run_as_user()`**: runs as root for `/dev/input` access but clipboard/notification commands run as the original user
 - **Pattern learning**: `PatternLearner` reads history, computes usage-frequency weights per app context after 20+ samples
 - **Safe math eval**: `CALC:` uses `ast.parse()` + AST node whitelisting — never raw `eval()`
@@ -217,7 +227,8 @@ Hotkey (Ctrl+Alt+X)
 ```
 watashigpt/
 ├── action-middleware/
-│   ├── main.py              # All application code (~4000 lines)
+│   ├── main.py              # All application code (~5100 lines)
+│   ├── paste_helper.py      # Portal paste + AT-SPI window detection (runs as user)
 │   ├── config.yaml.example  # Example config with all commands and settings
 │   └── requirements.txt     # Python dependencies
 ├── .gitignore

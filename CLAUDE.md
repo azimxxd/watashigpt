@@ -72,7 +72,7 @@ No automated test suite. Manual testing:
 - **`_run_as_user()`**: runs subprocess commands as the real user when executing under `sudo`
 - **Provider registry**: `_PROVIDER_BASE_URLS` and `_PROVIDER_DEFAULT_MODELS` dicts for clean multi-provider support
 - **Config persistence**: `_save_llm_config()` writes provider/key/model to `config.yaml` so subsequent runs skip the interactive selector
-- **Pipe chains**: `TR:|SUM: text` chains multiple commands, passing output of each step to the next
+- **Pipe chains**: `POL:|SUM: text` chains multiple commands, passing output of each step to the next
 - **REPEAT tracking**: `dispatch()` stores `_last_command` for the `REPEAT:` command (skips tracking repeat itself)
 - **Named clips**: `~/.actionflow_clips.json` persists named clipboard slots across restarts
 - **Clipboard stack**: in-memory `_clipboard_stack` list for `STACK:`/`POP:` push/pop operations
@@ -117,7 +117,7 @@ No automated test suite. Manual testing:
 
 | Prefix | Action | Notes |
 |--------|--------|-------|
-| `TR:` | Rude → professional text | Phrase lookup from config |
+| `POL:` / `POLITE:` | Rewrite rude/blunt text politely | Phrase lookup + LLM fallback |
 | `CMD:` / `RUN:` | Execute shell command | Dangerous pattern blocking |
 | `TEST:` / `PING:` | Pipeline verification | |
 | `FMT:` / `FORMAT:` | Auto-format JSON/XML | JSON first, XML fallback |
