@@ -480,3 +480,101 @@ class HotkeyListener:
         if self._loop is not None:
             import Quartz
             Quartz.CFRunLoopStop(self._loop)
+
+
+# ============================================================
+# Menu bar (NSStatusItem)
+# ============================================================
+
+_menu_target_class = None
+
+
+def _menu_target_cls():
+    """NSObject subclass that forwards menu clicks to Python callbacks.
+    Defined lazily (and once — ObjC class names are process-global)."""
+    global _menu_target_class
+    if _menu_target_class is None:
+        from Foundation import NSObject
+
+        class ActionFlowMenuTarget(NSObject):
+            def onItem_(self, sender):
+                callback = self.callbacks.get(int(sender.tag()))
+                if callback is not None:
+                    try:
+                        callback()
+                    except Exception as exc:  # never let an exception reach AppKit
+                        print(f"Menu action failed: {exc}")
+
+        _menu_target_class = ActionFlowMenuTarget
+    return _menu_target_class
+
+
+class StatusBar:
+    """Menu bar icon with a dropdown menu.
+
+    Must be created on the main thread. Clicks are delivered while the main
+    thread pumps Cocoa events (Tk's update() does that). Callbacks run on the
+    main thread — keep them short or hand work to a queue.
+    """
+
+    SYMBOL = "wand.and.stars"
+
+    def __init__(self, tooltip: str = "ActionFlow") -> None:
+        from AppKit import NSMenu, NSStatusBar, NSVariableStatusItemLength
+        self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        self._menu = NSMenu.alloc().init()
+        self._menu.setAutoenablesItems_(False)
+        self._item.setMenu_(self._menu)
+        self._target = _menu_target_cls().alloc().init()
+        self._target.callbacks = {}
+        self._next_tag = 1
+        button = self._item.button()
+        button.setToolTip_(tooltip)
+        self._set_symbol(self.SYMBOL)
+
+    def _set_symbol(self, name: str) -> None:
+        from AppKit import NSImage
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, "ActionFlow")
+        button = self._item.button()
+        if image is not None:
+            image.setTemplate_(True)  # adapts to light/dark menu bar
+            button.setImage_(image)
+        else:
+            button.setTitle_("AF")
+
+    def add_item(self, title: str, callback: Callable[[], None] | None = None,
+                 key: str = ""):
+        """Add a menu item; without a callback it is a disabled label."""
+        from AppKit import NSMenuItem
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            title, "onItem:" if callback else None, key)
+        if callback is not None:
+            tag = self._next_tag
+            self._next_tag += 1
+            item.setTag_(tag)
+            item.setTarget_(self._target)
+            self._target.callbacks[tag] = callback
+        else:
+            item.setEnabled_(False)
+        self._menu.addItem_(item)
+        return item
+
+    def add_separator(self) -> None:
+        from AppKit import NSMenuItem
+        self._menu.addItem_(NSMenuItem.separatorItem())
+
+    @staticmethod
+    def set_title(item, title: str) -> None:
+        item.setTitle_(title)
+
+    @staticmethod
+    def set_checked(item, checked: bool) -> None:
+        item.setState_(1 if checked else 0)
+
+    def set_dimmed(self, dimmed: bool) -> None:
+        """Grey out the icon (used for silent mode)."""
+        self._item.button().setAppearsDisabled_(dimmed)
+
+    def remove(self) -> None:
+        from AppKit import NSStatusBar
+        NSStatusBar.systemStatusBar().removeStatusItem_(self._item)

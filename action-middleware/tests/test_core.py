@@ -241,3 +241,39 @@ def test_parse_hotkey():
 def test_format_hotkey():
     assert platform_mac.format_hotkey("ctrl+alt+x") == "⌃⌥X"
     assert platform_mac.format_hotkey("cmd+shift+f5") == "⌘⇧F5"
+
+
+# ── API keys / history / autostart ─────────────────────────
+
+def test_resolve_api_key_order(monkeypatch):
+    store = {"llm:groq": "from-keychain"}
+    monkeypatch.setattr(main, "_secret_get", lambda account: store.get(account, ""))
+    monkeypatch.delenv("ACTIONFLOW_API_KEY", raising=False)
+    assert main._resolve_api_key("llm", "groq") == "from-keychain"
+    assert main._resolve_api_key("llm", "Groq ", "from-config") == "from-config"
+    monkeypatch.setenv("ACTIONFLOW_API_KEY", "from-env")
+    assert main._resolve_api_key("llm", "groq", "from-config") == "from-env"
+    monkeypatch.delenv("ACTIONFLOW_API_KEY")
+    assert main._resolve_api_key("llm", "openai") == ""
+
+
+def test_history_hides_text_by_default(tmp_path, monkeypatch):
+    path = tmp_path / "history.jsonl"
+    monkeypatch.setattr(main, "_HISTORY_PATH", path)
+    monkeypatch.setattr(main, "CONFIG", {**main.CONFIG, "history": {}})
+    main._log_history("summarize", "my secret text", "short", 5)
+    monkeypatch.setattr(main, "CONFIG", {**main.CONFIG, "history": {"log_text": True}})
+    main._log_history("summarize", "visible", "out", 5)
+    main._log_history("password", "x", "hunter2", 5)
+    lines = [__import__("json").loads(l) for l in path.read_text().splitlines()]
+    assert (lines[0]["input"], lines[0]["output"]) == ("[14 chars]", "[5 chars]")
+    assert (lines[1]["input"], lines[1]["output"]) == ("visible", "out")
+    assert lines[2]["output"] == "[REDACTED]"
+
+
+def test_launch_agent_plist():
+    import plistlib
+    data = plistlib.loads(plistlib.dumps(main._launch_agent_plist()))
+    assert data["Label"] == "com.watashigpt.actionflow"
+    assert data["ProgramArguments"][1].endswith("main.py")
+    assert data["KeepAlive"] == {"SuccessfulExit": False}

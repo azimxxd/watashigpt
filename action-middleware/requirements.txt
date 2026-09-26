@@ -4,6 +4,7 @@ openai>=1.0
 watchdog>=4.0
 dateparser>=1.1
 langdetect>=1.0.9
+keyring>=24.0          # API keys in macOS Keychain / Linux Secret Service
 
 # Linux: global hotkeys via /dev/input (needs root) + tray icon
 keyboard>=0.13.5; sys_platform == "linux"

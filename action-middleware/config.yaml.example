@@ -3,6 +3,9 @@ interaction_mode: both
 # When the popup is unavailable, guess the command for un-prefixed text from
 # keywords / LLM intent. Off by default: it can rewrite text you didn't mean to.
 smart_routing: false
+history:
+  # Store selected text in ~/.actionflow_history.jsonl (off = only lengths).
+  log_text: false
 silent_mode: false
 commands:
   b64:

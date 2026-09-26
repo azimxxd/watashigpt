@@ -330,10 +330,28 @@ _silent_mode_lock = threading.Lock()
 
 
 _tray_icon = None  # pystray icon, set in _start_tray()
+_mac_menubar = None  # platform_mac.StatusBar, set in _start_mac_menubar()
+_mac_menubar_silent_item = None
+
+
+_main_thread_calls: queue.Queue = queue.Queue()  # drained by the main loop
+
+
+def _run_on_main(fn) -> None:
+    """Run fn on the main thread (AppKit/Tk objects must not be touched elsewhere)."""
+    if threading.current_thread() is threading.main_thread():
+        fn()
+    else:
+        _main_thread_calls.put(fn)
 
 
 def _update_tray_color(color: str) -> None:
-    """Update tray icon color. No-op if tray not running."""
+    """Update tray icon color (Linux) / menu bar icon (macOS). No-op if absent."""
+    if _mac_menubar is not None:
+        def _update_menubar() -> None:
+            _mac_menubar.set_dimmed(color == "grey")
+            _mac_menubar.set_checked(_mac_menubar_silent_item, color == "grey")
+        _run_on_main(_update_menubar)
     if _tray_icon is None:
         return
     try:
@@ -981,11 +999,65 @@ def _save_image_api_config(provider: str, api_key: str, model: str) -> None:
         TUI.warn(f"Could not save image API config: {exc}")
 
 
+# ── API key storage ──
+# Lookup order: env var → config.yaml → system keychain (macOS Keychain /
+# Linux Secret Service via `keyring`). The keychain is what makes autostart
+# (LaunchAgent/systemd) work — those don't see your shell's exports.
+
+_KEYRING_SERVICE = "ActionFlow"
+_KEY_ENV_VARS = {"llm": "ACTIONFLOW_API_KEY", "image": "ACTIONFLOW_IMAGE_API_KEY"}
+
+
+def _secret_get(account: str) -> str:
+    try:
+        import keyring
+        return keyring.get_password(_KEYRING_SERVICE, account) or ""
+    except Exception:
+        return ""
+
+
+def _secret_set(account: str, value: str) -> bool:
+    try:
+        import keyring
+        keyring.set_password(_KEYRING_SERVICE, account, value)
+        return True
+    except Exception as exc:
+        TUI.warn(f"Could not save key to the system keychain: {exc}")
+        return False
+
+
+def _resolve_api_key(kind: str, provider: str, config_value: str = "") -> str:
+    """API key for `kind` ("llm" | "image") and provider, or ""."""
+    env_value = os.environ.get(_KEY_ENV_VARS[kind], "").strip()
+    if env_value:
+        return env_value
+    if (config_value or "").strip():
+        return config_value.strip()
+    if provider:
+        return _secret_get(f"{kind}:{provider.strip().lower()}")
+    return ""
+
+
+def _offer_keychain_save(kind: str, provider: str, api_key: str, env_var: str) -> None:
+    """Ask whether to store a freshly entered key in the keychain."""
+    d, g, r = TUI.DIM, TUI.GREEN, TUI.RESET
+    store = "Keychain" if _IS_MAC else "system keyring"
+    try:
+        answer = input(f"  Save key in {store} so you don't need to re-enter it? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+    if answer in ("", "y", "yes", "д", "да") and _secret_set(f"{kind}:{provider}", api_key):
+        print(f"  {g}✓ Saved to {store}{r}\n")
+    else:
+        print(f"  {d}Tip: add  export {env_var}=<your key>  to your shell profile{r}")
+        print(f"  {d}API keys are never saved to config.yaml for security.{r}\n")
+
+
 def _llm_setup_prompt() -> None:
     """Interactive terminal prompt for LLM configuration with arrow-key selection."""
     llm_cfg = CONFIG.get("llm", {})
     has_provider = bool(llm_cfg.get("provider", "").strip())
-    has_key = bool(llm_cfg.get("api_key", "").strip()) or bool(os.environ.get("ACTIONFLOW_API_KEY", "").strip())
+    has_key = bool(_resolve_api_key("llm", llm_cfg.get("provider", ""), llm_cfg.get("api_key", "")))
     if has_provider and (has_key or llm_cfg["provider"].strip().lower() in _LOCAL_PROVIDERS):
         return
 
@@ -1068,17 +1140,15 @@ def _llm_setup_prompt() -> None:
 
     print(f"\n  {g}✓ LLM configured: {provider}/{model}{r}")
     if api_key:
-        print(f"  {d}Tip: add  export ACTIONFLOW_API_KEY=<your key>  to your shell profile{r}")
-        print(f"  {d}API keys are never saved to config.yaml for security.{r}\n")
+        _offer_keychain_save("llm", provider, api_key, "ACTIONFLOW_API_KEY")
 
 
 def _image_api_setup_prompt() -> None:
     """Interactive image API setup using the same pattern as LLM setup."""
     image_cfg = CONFIG.get("image_api", {})
     has_provider = bool(image_cfg.get("provider", "").strip())
-    has_key = bool(image_cfg.get("api_key", "").strip()) or bool(
-        os.environ.get("ACTIONFLOW_IMAGE_API_KEY", "").strip()
-    )
+    has_key = bool(_resolve_api_key("image", image_cfg.get("provider", ""),
+                                    image_cfg.get("api_key", "")))
     if has_provider and has_key:
         return
 
@@ -1089,6 +1159,8 @@ def _image_api_setup_prompt() -> None:
     g = TUI.GREEN
 
     existing_provider = image_cfg.get("provider", "").strip()
+    if existing_provider.lower() == "pollinations":
+        return  # key is optional (free tier); set one with: main.py --set-key image:pollinations
 
     print()
 
@@ -1145,8 +1217,7 @@ def _image_api_setup_prompt() -> None:
     _save_image_api_config(provider, api_key, image_model)
 
     print(f"\n  {g}✓ Image API configured: {provider}{r}")
-    print(f"  {d}Tip: add  export ACTIONFLOW_IMAGE_API_KEY=<your key>  to your shell profile{r}")
-    print(f"  {d}Image API keys are never saved to config.yaml for security.{r}\n")
+    _offer_keychain_save("image", provider, api_key, "ACTIONFLOW_IMAGE_API_KEY")
 
 
 def _init_image_api() -> None:
@@ -1155,12 +1226,8 @@ def _init_image_api() -> None:
 
     image_cfg = CONFIG.get("image_api", {})
     provider = image_cfg.get("provider", "").strip().lower()
-    api_key = image_cfg.get("api_key", "").strip()
+    api_key = _resolve_api_key("image", provider, image_cfg.get("api_key", ""))
     model = image_cfg.get("model", "").strip() or "flux"
-
-    env_key = os.environ.get("ACTIONFLOW_IMAGE_API_KEY", "").strip()
-    if env_key:
-        api_key = env_key
 
     _image_api_provider = provider
     _image_api_key = api_key
@@ -1233,13 +1300,8 @@ def _init_llm() -> None:
 
     llm_cfg = CONFIG.get("llm", {})
     provider = llm_cfg.get("provider", "").strip().lower()
-    api_key = llm_cfg.get("api_key", "").strip()
     model = llm_cfg.get("model", "").strip()
-
-    # Env var takes priority over config (config should never store keys)
-    env_key = os.environ.get("ACTIONFLOW_API_KEY", "").strip()
-    if env_key:
-        api_key = env_key
+    api_key = _resolve_api_key("llm", provider, llm_cfg.get("api_key", ""))
 
     if not provider or (not api_key and provider not in _LOCAL_PROVIDERS):
         _llm_ready = False
@@ -1259,8 +1321,8 @@ def _init_llm() -> None:
     fb_api_key = fb_cfg.get("api_key", "").strip() if isinstance(fb_cfg, dict) else ""
     fb_model = fb_cfg.get("model", "").strip() if isinstance(fb_cfg, dict) else ""
 
-    if not fb_api_key:
-        fb_api_key = api_key  # reuse primary key if not specified
+    if not fb_api_key and fb_provider:
+        fb_api_key = _secret_get(f"llm:{fb_provider}") or api_key  # else reuse primary key
 
     if fb_provider and fb_provider != provider:
         fb_client, fb_resolved = _init_llm_client(fb_provider, fb_api_key, fb_model)
@@ -1381,6 +1443,13 @@ def _llm_classify(text: str, commands: dict) -> dict | None:
 # ============================================================
 
 class TUI:
+    @classmethod
+    def disable_colors(cls) -> None:
+        """Plain output for log files (no terminal attached)."""
+        for name, value in list(vars(cls).items()):
+            if isinstance(value, str) and value.startswith("\033["):
+                setattr(cls, name, "")
+
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
@@ -2290,13 +2359,6 @@ if _TKINTER_AVAILABLE:
                 return
             name, cmd = items[idx]
 
-            # MOCK mode: block LLM commands
-            is_llm = cmd.get("llm_required", False)
-            if is_llm and LLM_MODE == "mock":
-                self._result = None
-                self._root.destroy()
-                return
-
             # Tone submenu
             if name == "tone":
                 self._submenu = "tone"
@@ -2365,7 +2427,7 @@ def _handle_popup(text: str, source_window: str | None = None) -> None:
 
     # Mock mode notification for LLM commands
     if is_llm and LLM_MODE == "mock":
-        notify(APP_NAME, "LLM not configured — enable a provider at startup")
+        notify(APP_NAME, f"'{cmd_name}' needs an LLM — set llm.provider in config.yaml and restart")
         TUI.warn("LLM not configured — command not applied")
         if source_window:
             _focus_window(source_window)
@@ -4308,6 +4370,10 @@ def _log_history(command: str, input_text: str, output_text: str, duration_ms: i
         if command in _SENSITIVE_COMMANDS:
             input_text = f"[{len(input_text)} chars]"
             output_text = "[REDACTED]"
+        elif not (CONFIG.get("history") or {}).get("log_text", False):
+            # Selected text often contains private data — only lengths by default
+            input_text = f"[{len(input_text)} chars]"
+            output_text = f"[{len(output_text)} chars]"
 
         provider = _last_llm_provider_used or _llm_provider or "builtin"
         entry = json.dumps({
@@ -4880,6 +4946,55 @@ def _create_tray_icon_image(color: str = "green"):
     return img
 
 
+def _recent_history_text(limit: int = 20) -> str:
+    """Last `limit` history entries as plain text lines."""
+    lines = []
+    try:
+        if _HISTORY_PATH.exists():
+            with open(_HISTORY_PATH, "r") as f:
+                entries = [json.loads(l) for l in f if l.strip().startswith("{")]
+            for e in entries[-limit:]:
+                inp = e.get("input", "")[:40].replace("\n", " ")
+                out = e.get("output", "")[:40].replace("\n", " ")
+                lines.append(f"{e.get('ts', '?')[:19]}  {e.get('command', '?'):<12}  {inp}  →  {out}")
+    except Exception as exc:
+        lines.append(f"Error reading history: {exc}")
+    return "\n".join(lines) or "No history yet."
+
+
+def _start_mac_menubar() -> None:
+    """Menu bar icon on macOS (the pystray tray is Linux-only)."""
+    global _mac_menubar, _mac_menubar_silent_item
+    try:
+        bar = mac.StatusBar()
+    except Exception as exc:
+        TUI.warn(f"Menu bar icon unavailable: {exc}")
+        return
+
+    mode = f"live · {_llm_provider}/{_llm_model}" if LLM_MODE == "live" else "mock mode (no LLM)"
+    bar.add_item(f"ActionFlow — {mode}")
+    bar.add_item(f"{mac.format_hotkey(HOTKEY)}  process selection   "
+                 f"{mac.format_hotkey(UNDO_HOTKEY)}  undo")
+    bar.add_separator()
+
+    def toggle_silent() -> None:
+        _toggle_silent_mode()
+
+    _mac_menubar_silent_item = bar.add_item("Silent mode", toggle_silent)
+    bar.set_checked(_mac_menubar_silent_item, _silent_mode)
+    bar.set_dimmed(_silent_mode)
+    bar.add_item("Recent history…", lambda: _result_queue.put(("History (last 20)",
+                                                                _recent_history_text())))
+    bar.add_separator()
+    bar.add_item("Open config.yaml", lambda: mac.open_path(str(_CONFIG_PATH)))
+    bar.add_item("Reload config", _reload_config)
+    bar.add_item("Open images folder", lambda: mac.open_path(str(_IMAGE_DIR))
+                 if _IMAGE_DIR.exists() else notify(APP_NAME, "No generated images yet"))
+    bar.add_separator()
+    bar.add_item("Quit ActionFlow", _exit_event.set, key="q")
+    _mac_menubar = bar
+
+
 def _show_history_dialog() -> None:
     """Show a small tkinter window with recent history entries."""
     if not _TKINTER_AVAILABLE:
@@ -5032,6 +5147,21 @@ def _start_mac_hotkeys(bindings: list) -> bool:
 # Main Entry Point
 # ============================================================
 
+_instance_lock_file = None  # kept open for the process lifetime
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Two instances would both grab the hotkey and paste twice."""
+    global _instance_lock_file
+    import fcntl
+    try:
+        _instance_lock_file = open(Path.home() / ".actionflow.lock", "w")
+        fcntl.flock(_instance_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
 def _ensure_user_config() -> None:
     """First run: copy config.yaml.example → config.yaml so the setup prompt
     (which saves provider/model) doesn't create a config with no commands."""
@@ -5046,9 +5176,17 @@ def _ensure_user_config() -> None:
 def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     global _start_time, _pattern_learner, _silent_mode
     _start_time = time.time()
+    if not _acquire_single_instance_lock():
+        print("ActionFlow is already running (another terminal or the login agent).")
+        return
+    interactive_out = sys.stdout.isatty()
+    if not interactive_out:
+        TUI.disable_colors()
+        keep_banner = True  # nothing to collapse in a log file
     _ensure_user_config()
 
-    print("\033[2J\033[3J\033[H", end="", flush=True)
+    if interactive_out:
+        print("\033[2J\033[3J\033[H", end="", flush=True)
 
     TUI.banner()
 
@@ -5133,6 +5271,9 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     # Initialize silent mode from config
     _silent_mode = CONFIG.get("silent_mode", False)
 
+    if _IS_MAC and _TKINTER_AVAILABLE and not no_tray:
+        _start_mac_menubar()
+
     # Register personal commands from config
     _register_personal_commands()
 
@@ -5198,6 +5339,12 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
                     elif ch in ('S', 's'):
                         _session_export()
 
+                while not _main_thread_calls.empty():
+                    try:
+                        _main_thread_calls.get_nowait()()
+                    except Exception as exc:
+                        TUI.warn(f"Main-thread task failed: {exc}")
+
                 # Keep Tk's event loop alive between popups (otherwise macOS
                 # marks the process as "not responding")
                 if _tk_root is not None:
@@ -5245,6 +5392,8 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
 
     if _mac_hotkeys is not None:
         _mac_hotkeys.stop()
+    if _mac_menubar is not None:
+        _mac_menubar.remove()
 
     # Clean up portal paste helper
     if _paste_helper_proc is not None:
@@ -5417,17 +5566,98 @@ WantedBy=graphical-session.target
     print(f"  View logs:       {TUI.CYAN}journalctl -u actionflow -f{TUI.RESET}")
 
 
+_LAUNCH_AGENT_LABEL = "com.watashigpt.actionflow"
+_LAUNCH_AGENT_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCH_AGENT_LABEL}.plist"
+_MAC_LOG_PATH = Path.home() / "Library" / "Logs" / "ActionFlow.log"
+
+
+def _launch_agent_plist() -> dict:
+    return {
+        "Label": _LAUNCH_AGENT_LABEL,
+        "ProgramArguments": [sys.executable, str(Path(__file__).resolve())],
+        "WorkingDirectory": str(_SCRIPT_DIR),
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},  # restart after crashes, not after Quit
+        "ThrottleInterval": 10,
+        "ProcessType": "Interactive",
+        "StandardOutPath": str(_MAC_LOG_PATH),
+        "StandardErrorPath": str(_MAC_LOG_PATH),
+        "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                                 "PYTHONUNBUFFERED": "1"},
+    }
+
+
+def install_launch_agent() -> None:
+    """macOS: start ActionFlow at login (menu bar icon, no terminal window)."""
+    import plistlib
+    _LAUNCH_AGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _MAC_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_LAUNCH_AGENT_PATH, "wb") as f:
+        plistlib.dump(_launch_agent_plist(), f)
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", domain, str(_LAUNCH_AGENT_PATH)], capture_output=True)
+    proc = subprocess.run(["launchctl", "bootstrap", domain, str(_LAUNCH_AGENT_PATH)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"{TUI.RED}launchctl failed: {proc.stderr.strip()}{TUI.RESET}")
+        sys.exit(1)
+    python_bin = os.path.realpath(sys.executable)
+    print(f"{TUI.GREEN}✓{TUI.RESET} Installed {_LAUNCH_AGENT_PATH}")
+    print(f"  ActionFlow now starts at login and lives in the menu bar.")
+    print(f"  Logs: {_MAC_LOG_PATH}")
+    print()
+    print(f"  {TUI.YELLOW}Grant Accessibility + Input Monitoring to this Python binary{TUI.RESET}")
+    print(f"  (System Settings → Privacy & Security → '+', ⌘⇧G to paste the path):")
+    print(f"    {python_bin}")
+    print(f"  API keys must be in the Keychain:  python main.py --set-key <provider>")
+    print(f"  Remove with:  python main.py --uninstall")
+
+
+def uninstall_launch_agent() -> None:
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(_LAUNCH_AGENT_PATH)],
+                   capture_output=True)
+    if _LAUNCH_AGENT_PATH.exists():
+        _LAUNCH_AGENT_PATH.unlink()
+        print(f"{TUI.GREEN}✓{TUI.RESET} Removed {_LAUNCH_AGENT_PATH}")
+    else:
+        print("Login agent was not installed.")
+
+
+def set_key_cli(name: str) -> None:
+    """Store an API key in the system keychain: `groq` or `image:pollinations`."""
+    import getpass
+    account = name.lower() if ":" in name else f"llm:{name.lower()}"
+    if account.split(":", 1)[0] not in _KEY_ENV_VARS:
+        print(f"{TUI.RED}Use a provider name (e.g. groq) or image:<provider>{TUI.RESET}")
+        sys.exit(1)
+    try:
+        value = getpass.getpass(f"API key for {account} (input hidden): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if value and _secret_set(account, value):
+        print(f"{TUI.GREEN}✓{TUI.RESET} Saved {account} to {'Keychain' if _IS_MAC else 'system keyring'}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ActionFlow by WatashiGPT")
-    parser.add_argument("--install", action="store_true", help="Install as a systemd service")
+    parser.add_argument("--install", action="store_true",
+                        help="Start at login (macOS LaunchAgent / Linux systemd service)")
+    parser.add_argument("--uninstall", action="store_true", help="Remove the macOS login agent")
+    parser.add_argument("--set-key", metavar="PROVIDER",
+                        help="Save an API key in the system keychain (e.g. groq, image:pollinations)")
     parser.add_argument("--banner", action="store_true", help="Keep the full ASCII banner permanently")
     parser.add_argument("--history", action="store_true", help="Browse last 50 history entries")
     parser.add_argument("--grep", type=str, default=None, help="Filter history by command name (use with --history)")
     parser.add_argument("--no-tray", action="store_true", help="Disable system tray icon")
     args = parser.parse_args()
 
-    if args.install:
-        install_systemd_service()
+    if args.set_key:
+        set_key_cli(args.set_key)
+    elif args.install:
+        install_launch_agent() if _IS_MAC else install_systemd_service()
+    elif args.uninstall:
+        uninstall_launch_agent()
     elif args.history:
         show_history(grep_filter=args.grep)
     else:
