@@ -19,12 +19,12 @@ Select text. Choose an action. Review the changes. Put it back.
 <br>
 
 <p align="center">
-  <a href="https://github.com/azimxxd/watashigpt/raw/macos-support/docs/media/actionflow-demo.mp4">
+  <a href="docs/media/actionflow-demo.mp4?raw=true">
     <img src="docs/media/actionflow-demo.webp" alt="ActionFlow demo: a message with typos is selected, ⌃⌥X opens the palette, Fix mistakes shows a red/green diff, the fix replaces the text in the chat, then a custom instruction translates it to Kazakh" width="820">
   </a>
 </p>
 
-<p align="center"><sub>20-second demo — real ActionFlow UI and real AI answers. <a href="https://github.com/azimxxd/watashigpt/raw/macos-support/docs/media/actionflow-demo.mp4">⬇ Download the MP4 with sound</a><br>
+<p align="center"><sub>20-second demo — real ActionFlow UI and real AI answers. <a href="docs/media/actionflow-demo.mp4?raw=true">⬇ Download the MP4 with sound</a><br>
 Linux follows the same workflow in a Tk window.</sub></p>
 
 ## Four actions. Your own instructions.
