@@ -1,11 +1,16 @@
 # ActionFlow — OS-level background assistant
 #
-# Run with: sudo -E python main.py
-#   -E preserves DISPLAY, WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS
+# Run with:
+#   Linux:  sudo -E python main.py
+#           (-E preserves DISPLAY, WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS)
+#   macOS:  python main.py
+#           (grant Accessibility + Input Monitoring to your terminal app)
 #
 # Config: edit config.yaml to add commands, set hotkeys, configure LLM
 
-__version__ = "1.0.0"
+from __future__ import annotations
+
+__version__ = "1.1.0"
 
 import os
 import sys
@@ -13,12 +18,12 @@ import time
 import threading
 import subprocess
 import platform
-import keyboard
 import shutil
 import json
 import base64
 import hashlib
 import yaml
+import copy
 import tty
 import termios
 import select
@@ -46,6 +51,12 @@ try:
 except ImportError:
     _TKINTER_AVAILABLE = False
 
+# Apple's bundled Tk 8.5 (/usr/bin/python3) hangs as soon as a window is
+# shown on modern macOS — treat it as unavailable and use prefix mode.
+_TK_TOO_OLD = _TKINTER_AVAILABLE and sys.platform == "darwin" and tk.TkVersion < 8.6
+if _TK_TOO_OLD:
+    _TKINTER_AVAILABLE = False
+
 # Persistent hidden tk root — tkinter only allows one Tk() instance per process.
 # All popups must use Toplevel(). This root is created lazily on first use.
 _tk_root: "tk.Tk | None" = None
@@ -56,9 +67,45 @@ def _get_tk_root() -> "tk.Tk":
     if _tk_root is None or not _tk_root.winfo_exists():
         _tk_root = tk.Tk()
         _tk_root.withdraw()
+        if sys.platform == "darwin":
+            import platform_mac
+            platform_mac.hide_dock_icon()
     return _tk_root
 
-if platform.system() != "Linux":
+
+def _popup_fonts() -> tuple:
+    """(regular, bold, small) monospace fonts that exist on this platform."""
+    if sys.platform == "darwin":
+        family, size = "Menlo", 13
+    else:
+        family, size = "DejaVu Sans Mono", 10
+    if family not in tkfont.families():
+        family = "Courier"
+    return (tkfont.Font(family=family, size=size),
+            tkfont.Font(family=family, size=size, weight="bold"),
+            tkfont.Font(family=family, size=size - 1))
+
+
+def _present_popup(win: "tk.Toplevel") -> None:
+    """Show a popup and give it keyboard focus."""
+    win.deiconify()
+    if sys.platform == "darwin":
+        # A background process' window only gets key events once the
+        # process itself is the active app.
+        import platform_mac
+        platform_mac.activate_self()
+        win.lift()
+    win.focus_force()
+
+_IS_MAC: bool = sys.platform == "darwin"
+_IS_LINUX: bool = sys.platform.startswith("linux")
+
+if _IS_LINUX:
+    import keyboard
+elif _IS_MAC:
+    import platform_mac as mac
+else:
+    import keyboard
     import pyperclip
     from plyer import notification
 
@@ -68,6 +115,7 @@ if platform.system() != "Linux":
 
 _SCRIPT_DIR = Path(__file__).parent
 _CONFIG_PATH = _SCRIPT_DIR / "config.yaml"
+_CONFIG_EXAMPLE_PATH = _SCRIPT_DIR / "config.yaml.example"
 
 _DEFAULT_CONFIG = {
     "hotkeys": {"intercept": "ctrl+alt+x", "undo": "ctrl+alt+z"},
@@ -97,28 +145,39 @@ _DEFAULT_CONFIG = {
 }
 
 
-def load_config() -> dict:
-    """Load config.yaml, falling back to defaults if missing or invalid."""
-    if _CONFIG_PATH.exists():
-        try:
-            with open(_CONFIG_PATH, "r") as f:
-                user_cfg = yaml.safe_load(f) or {}
-            # Merge: user config overrides defaults
-            cfg = {**_DEFAULT_CONFIG}
-            if "hotkeys" in user_cfg:
-                cfg["hotkeys"] = {**cfg["hotkeys"], **user_cfg["hotkeys"]}
-            if "commands" in user_cfg:
-                cfg["commands"] = user_cfg["commands"]
-            if "llm" in user_cfg:
-                cfg["llm"] = {**cfg["llm"], **user_cfg["llm"]}
-            if "image_api" in user_cfg:
-                cfg["image_api"] = {**cfg["image_api"], **user_cfg["image_api"]}
-            return cfg
-        except Exception as exc:
-            print(f"  Warning: Failed to load config.yaml: {exc}")
-            print(f"  Falling back to defaults.")
-            return _DEFAULT_CONFIG
-    return _DEFAULT_CONFIG
+# Sections merged key-by-key with defaults; every other top-level key
+# (commands, personal_commands, context_priorities, ...) is taken as-is.
+_MERGED_SECTIONS = ("hotkeys", "llm", "image_api")
+
+
+def load_config(path: Path | None = None) -> dict:
+    """Load config.yaml, falling back to defaults if missing or invalid.
+
+    Always returns a fresh deep copy so runtime mutations (API keys, personal
+    commands) never leak into _DEFAULT_CONFIG.
+    """
+    path = path or _CONFIG_PATH
+    if not path.exists() and path == _CONFIG_PATH and _CONFIG_EXAMPLE_PATH.exists():
+        path = _CONFIG_EXAMPLE_PATH  # full command set until the user creates a config
+    cfg = copy.deepcopy(_DEFAULT_CONFIG)
+    if not path.exists():
+        return cfg
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            user_cfg = yaml.safe_load(f) or {}
+        if not isinstance(user_cfg, dict):
+            raise ValueError("top level must be a mapping")
+    except Exception as exc:
+        print(f"  Warning: Failed to load config.yaml: {exc}")
+        print(f"  Falling back to defaults.")
+        return cfg
+
+    for key, value in user_cfg.items():
+        if key in _MERGED_SECTIONS and isinstance(value, dict):
+            cfg[key] = {**cfg.get(key, {}), **value}
+        elif value is not None:
+            cfg[key] = value
+    return cfg
 
 
 CONFIG = load_config()
@@ -298,16 +357,21 @@ class AppContext:
 
     APP_PATTERNS = {
         "terminal": ["terminal", "konsole", "alacritty", "kitty", "wezterm",
-                      "gnome-terminal", "xterm", "foot", "tilix", "tmux"],
+                      "gnome-terminal", "xterm", "foot", "tilix", "tmux",
+                      "iterm", "warp", "ghostty", "hyper", "tabby"],
         "browser":  ["firefox", "chrome", "chromium", "brave", "vivaldi",
-                      "edge", "safari", "opera", "zen browser"],
+                      "edge", "safari", "opera", "zen browser", "arc", "orion",
+                      "yandex"],
         "ide":      ["code", "vscode", "jetbrains", "intellij", "pycharm",
                       "webstorm", "clion", "rider", "neovim", "nvim", "vim",
-                      "emacs", "sublime", "zed", "cursor", "lapce"],
+                      "emacs", "sublime", "zed", "cursor", "lapce", "xcode",
+                      "android studio", "nova", "bbedit", "windsurf"],
         "chat":     ["slack", "discord", "telegram", "teams", "signal",
-                      "whatsapp", "element"],
+                      "whatsapp", "element", "messages", "skype", "zoom"],
         "docs":     ["libreoffice", "google docs", "notion", "obsidian",
-                      "logseq", "typora", "marktext", "writer", "word"],
+                      "logseq", "typora", "marktext", "writer", "word",
+                      "pages", "notes", "bear", "craft", "textedit", "mail",
+                      "outlook"],
     }
 
     def __init__(self, context_type: str = "unknown", window_title: str = "",
@@ -350,7 +414,12 @@ def detect_active_window() -> AppContext:
     """Detect the currently focused window. Uses xdotool (X11) or kdotool/swaymsg (Wayland)."""
     title = ""
     try:
-        if _IS_WAYLAND:
+        if _IS_MAC:
+            front = mac.frontmost_app()
+            if front:
+                name, _pid, bundle_id = front
+                title = f"{name} {bundle_id}".lower()
+        elif _IS_WAYLAND:
             # GNOME Wayland: try AT-SPI via paste helper first
             if _paste_helper_proc is not None:
                 try:
@@ -411,6 +480,9 @@ def detect_active_window() -> AppContext:
 def _get_active_window_id() -> str | None:
     """Return the active window ID so we can refocus it later."""
     try:
+        if _IS_MAC:
+            front = mac.frontmost_app()
+            return f"mac:{front[1]}" if front else None
         if _IS_WAYLAND:
             # GNOME Wayland: use AT-SPI via paste helper (Shell.Eval disabled since GNOME 45+)
             if _paste_helper_proc is not None:
@@ -468,6 +540,8 @@ def _focus_window(window_id: str) -> bool:
         return False
     try:
         kind, wid = window_id.split(":", 1)
+        if kind == "mac":
+            return mac.activate_app(int(wid))
         if kind == "gnome":
             proc = _run_as_user(
                 ["gdbus", "call", "--session",
@@ -801,10 +875,15 @@ class PatternLearner:
 # ============================================================
 
 def _reload_config() -> None:
-    """Reload config.yaml and update CONFIG commands in place."""
+    """Reload config.yaml and update CONFIG in place (LLM settings are kept —
+    they are only applied at startup)."""
     try:
         new_cfg = load_config()
-        CONFIG["commands"] = new_cfg.get("commands", CONFIG["commands"])
+        for key, value in new_cfg.items():
+            if key not in ("llm", "image_api", "hotkeys"):
+                CONFIG[key] = value
+        _register_personal_commands()
+        _refresh_command_security()
         # Initialize usage counters for any new commands
         for cmd_name in CONFIG["commands"]:
             if cmd_name not in _usage_counts:
@@ -907,7 +986,7 @@ def _llm_setup_prompt() -> None:
     llm_cfg = CONFIG.get("llm", {})
     has_provider = bool(llm_cfg.get("provider", "").strip())
     has_key = bool(llm_cfg.get("api_key", "").strip()) or bool(os.environ.get("ACTIONFLOW_API_KEY", "").strip())
-    if has_provider and has_key:
+    if has_provider and (has_key or llm_cfg["provider"].strip().lower() in _LOCAL_PROVIDERS):
         return
 
     c = TUI.CYAN
@@ -935,7 +1014,8 @@ def _llm_setup_prompt() -> None:
             f"  {b}Select a provider:{r}",
         ], TUI.CYAN)
 
-        options = ["groq", "openai", "gemini", "openrouter", "github", "skip → mock"]
+        options = ["groq", "openai", "gemini", "openrouter", "github", "ollama", "lmstudio",
+                   "skip → mock"]
 
         if sys.stdin.isatty():
             choice = TUI.selector(options)
@@ -955,26 +1035,23 @@ def _llm_setup_prompt() -> None:
 
         provider = options[choice]
 
-    print(f"  {d}Enter your {provider} API key:{r}")
-    try:
-        api_key = input(f"  {c}{b}API Key:{r} ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print(f"\n  {d}Cancelled. Launching in mock mode.{r}\n")
-        return
+    if provider in _LOCAL_PROVIDERS:
+        api_key = ""
+    else:
+        print(f"  {d}Enter your {provider} API key (input hidden):{r}")
+        try:
+            import getpass
+            api_key = getpass.getpass(f"  {c}{b}API Key:{r} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n  {d}Cancelled. Launching in mock mode.{r}\n")
+            return
 
-    if not api_key:
-        print(f"  {TUI.RED}No API key provided. Launching in mock mode.{r}\n")
-        return
+        if not api_key:
+            print(f"  {TUI.RED}No API key provided. Launching in mock mode.{r}\n")
+            return
 
-    _PROVIDER_DEFAULTS = {
-        "groq": "llama-3.3-70b-versatile",
-        "openai": "gpt-4o-mini",
-        "gemini": "gemini-2.0-flash",
-        "openrouter": "meta-llama/llama-3.3-70b-instruct",
-        "github": "gpt-4o-mini",
-    }
     existing_model = llm_cfg.get("model", "").strip()
-    default_model = existing_model or _PROVIDER_DEFAULTS.get(provider, "gpt-4o-mini")
+    default_model = existing_model or _PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o-mini")
     try:
         model = input(f"  {c}{b}Model{r} {d}[{default_model}]{r}{c}{b}:{r} ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -990,8 +1067,9 @@ def _llm_setup_prompt() -> None:
     _save_llm_config(provider, api_key, model)
 
     print(f"\n  {g}✓ LLM configured: {provider}/{model}{r}")
-    print(f"  {d}Tip: export ACTIONFLOW_API_KEY='{api_key}' in your shell profile{r}")
-    print(f"  {d}API keys are never saved to config.yaml for security.{r}\n")
+    if api_key:
+        print(f"  {d}Tip: add  export ACTIONFLOW_API_KEY=<your key>  to your shell profile{r}")
+        print(f"  {d}API keys are never saved to config.yaml for security.{r}\n")
 
 
 def _image_api_setup_prompt() -> None:
@@ -1050,7 +1128,8 @@ def _image_api_setup_prompt() -> None:
     print(f"  {d}Enter your {provider} image API key:{r}")
 
     try:
-        api_key = input(f"  {c}{b}Image API Key:{r} ").strip()
+        import getpass
+        api_key = getpass.getpass(f"  {c}{b}Image API Key (input hidden):{r} ").strip()
     except (EOFError, KeyboardInterrupt):
         print(f"\n  {d}Cancelled. Launching without image API key.{r}\n")
         return
@@ -1065,9 +1144,8 @@ def _image_api_setup_prompt() -> None:
     CONFIG["image_api"]["model"] = image_model
     _save_image_api_config(provider, api_key, image_model)
 
-    _image_api_key = api_key
     print(f"\n  {g}✓ Image API configured: {provider}{r}")
-    print(f"  {d}Tip: export ACTIONFLOW_IMAGE_API_KEY='{api_key}' in your shell profile{r}")
+    print(f"  {d}Tip: add  export ACTIONFLOW_IMAGE_API_KEY=<your key>  to your shell profile{r}")
     print(f"  {d}Image API keys are never saved to config.yaml for security.{r}\n")
 
 
@@ -1094,6 +1172,8 @@ _PROVIDER_BASE_URLS = {
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
     "openrouter": "https://openrouter.ai/api/v1",
     "github": "https://models.inference.ai.azure.com",
+    "ollama": "http://localhost:11434/v1",
+    "lmstudio": "http://localhost:1234/v1",
 }
 
 _PROVIDER_DEFAULT_MODELS = {
@@ -1102,7 +1182,16 @@ _PROVIDER_DEFAULT_MODELS = {
     "gemini": "gemini-2.0-flash",
     "openrouter": "meta-llama/llama-3.3-70b-instruct",
     "github": "gpt-4o-mini",
+    "ollama": "llama3.2",
+    "lmstudio": "local-model",
 }
+
+# Providers running on this machine — no API key required
+_LOCAL_PROVIDERS = frozenset({"ollama", "lmstudio"})
+
+
+class LLMError(Exception):
+    """Raised when every configured LLM provider failed for a request."""
 
 
 def _init_llm_client(provider: str, api_key: str, model: str):
@@ -1113,10 +1202,16 @@ def _init_llm_client(provider: str, api_key: str, model: str):
         default_model = _PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o-mini")
         resolved_model = model or default_model
 
+        llm_cfg = CONFIG.get("llm", {})
+        timeout = float(llm_cfg.get("timeout", 60))
+        base_url = (llm_cfg.get("base_url") or "").strip() or _PROVIDER_BASE_URLS.get(provider)
+        if provider in _LOCAL_PROVIDERS:
+            api_key = api_key or provider  # SDK requires a non-empty key
+
         if provider == "openai":
-            client = OpenAI(api_key=api_key)
-        elif provider in _PROVIDER_BASE_URLS:
-            client = OpenAI(api_key=api_key, base_url=_PROVIDER_BASE_URLS[provider])
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=1)
+        elif base_url:
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=1)
         else:
             TUI.warn(f"Unknown LLM provider: '{provider}'.")
             return None, ""
@@ -1146,7 +1241,7 @@ def _init_llm() -> None:
     if env_key:
         api_key = env_key
 
-    if not provider or not api_key:
+    if not provider or (not api_key and provider not in _LOCAL_PROVIDERS):
         _llm_ready = False
         return
 
@@ -1179,45 +1274,60 @@ def _init_llm() -> None:
 _last_llm_provider_used = ""
 
 
-def _llm_call(prompt: str, model: str = "") -> str:
-    """Send prompt to configured LLM with auto-fallback. Optional model overrides the global default."""
+def _chat(client, model: str, prompt: str, max_tokens: int, temperature: float) -> str:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    content = response.choices[0].message.content
+    if not content or not content.strip():
+        raise LLMError("empty response")
+    return content.strip()
+
+
+def _llm_call(prompt: str, model: str = "", *, max_tokens: int | None = None,
+              temperature: float | None = None) -> str:
+    """Send prompt to configured LLM with auto-fallback.
+
+    Optional model overrides the global default. Raises LLMError when every
+    provider fails — callers must never paste a placeholder over user text.
+    """
     global _last_llm_provider_used
 
     if not _llm_ready or not _llm_client:
         _last_llm_provider_used = "mock"
         return _mock_llm_call(prompt)
 
-    use_model = model or _llm_model
+    llm_cfg = CONFIG.get("llm", {})
+    if max_tokens is None:
+        max_tokens = int(llm_cfg.get("max_tokens", 2048))
+    if temperature is None:
+        temperature = float(llm_cfg.get("temperature", 0.7))
+
     try:
-        response = _llm_client.chat.completions.create(
-            model=use_model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            temperature=0.7,
-        )
+        result = _chat(_llm_client, model or _llm_model, prompt, max_tokens, temperature)
         _last_llm_provider_used = _llm_provider
-        return response.choices[0].message.content.strip()
+        return result
     except Exception as exc:
         TUI.warn(f"Primary LLM ({_llm_provider}) failed: {exc}")
+        last_exc = exc
 
-        # Auto-fallback to secondary provider
-        if _llm_fallback_ready and _llm_fallback_client:
-            fb_model = model or _llm_fallback_model
-            try:
-                TUI.status("🔄", f"Retrying with fallback ({_llm_fallback_provider})...", TUI.YELLOW)
-                response = _llm_fallback_client.chat.completions.create(
-                    model=fb_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=500,
-                    temperature=0.7,
-                )
-                _last_llm_provider_used = f"{_llm_fallback_provider} (fallback)"
-                return response.choices[0].message.content.strip()
-            except Exception as fb_exc:
-                TUI.error(f"Fallback LLM ({_llm_fallback_provider}) also failed: {fb_exc}")
+    # Auto-fallback to secondary provider
+    if _llm_fallback_ready and _llm_fallback_client:
+        try:
+            TUI.status("🔄", f"Retrying with fallback ({_llm_fallback_provider})...", TUI.YELLOW)
+            result = _chat(_llm_fallback_client, model or _llm_fallback_model, prompt,
+                           max_tokens, temperature)
+            _last_llm_provider_used = f"{_llm_fallback_provider} (fallback)"
+            return result
+        except Exception as fb_exc:
+            TUI.error(f"Fallback LLM ({_llm_fallback_provider}) also failed: {fb_exc}")
+            last_exc = fb_exc
 
-        _last_llm_provider_used = "mock"
-        return _mock_llm_call(prompt)
+    _last_llm_provider_used = ""
+    raise LLMError(str(last_exc)[:200]) from last_exc
 
 
 def _mock_llm_call(prompt: str) -> str:
@@ -1247,7 +1357,7 @@ def _llm_classify(text: str, commands: dict) -> dict | None:
     )
 
     try:
-        result = _llm_call(prompt).strip().lower()
+        result = _llm_call(prompt, max_tokens=20, temperature=0.0).strip().lower()
         # Parse "command_name:confidence" format
         if ":" in result:
             parts = result.split(":", 1)
@@ -1660,6 +1770,7 @@ if _TKINTER_AVAILABLE:
             self._sub_selected = 0
             self._custom_entry = None
             self._row_widgets: list = []
+            self._command_rows: dict[int, "tk.Frame"] = {}
             self._is_searching = False
 
             _get_tk_root()
@@ -1670,20 +1781,11 @@ if _TKINTER_AVAILABLE:
             self._root.configure(bg=self.BG, highlightbackground=self.BORDER_COLOR,
                                  highlightthickness=1)
 
-            # Font
-            try:
-                self._font = tkfont.Font(family="DejaVu Sans Mono", size=10)
-                self._font_bold = tkfont.Font(family="DejaVu Sans Mono", size=10, weight="bold")
-                self._font_small = tkfont.Font(family="DejaVu Sans Mono", size=9)
-            except Exception:
-                self._font = tkfont.Font(family="Courier", size=10)
-                self._font_bold = tkfont.Font(family="Courier", size=10, weight="bold")
-                self._font_small = tkfont.Font(family="Courier", size=9)
+            self._font, self._font_bold, self._font_small = _popup_fonts()
 
             self._build_ui()
             self._position_window()
-            self._root.deiconify()
-            self._root.focus_force()
+            _present_popup(self._root)
             self._search_var.set("")
             self._search_entry.focus_set()
 
@@ -1793,14 +1895,17 @@ if _TKINTER_AVAILABLE:
             self._root.bind("<MouseWheel>", self._on_mousewheel)
             self._root.bind("<Button-4>", lambda e: self._canvas.yview_scroll(-3, "units"))
             self._root.bind("<Button-5>", lambda e: self._canvas.yview_scroll(3, "units"))
+            # Bound on the entry (runs before the Entry class binding inserts
+            # the character): digits pick a command only while the search is empty.
             for i in range(1, 10):
-                self._root.bind(f"<Key-{i}>", self._on_number_key)
+                self._search_entry.bind(f"<Key-{i}>", self._on_number_key)
 
         def _populate_rows(self) -> None:
             """Fill the command list rows."""
             for w in self._row_widgets:
                 w.destroy()
             self._row_widgets.clear()
+            self._command_rows = {}
 
             if self._submenu == "tone":
                 self._populate_tone_submenu()
@@ -1854,6 +1959,7 @@ if _TKINTER_AVAILABLE:
             row = tk.Frame(self._inner_frame, bg=self.BG_ROW, cursor="hand2")
             row.pack(fill="x", padx=2, pady=1)
             self._row_widgets.append(row)
+            self._command_rows[idx] = row
 
             is_llm = cmd.get("llm_required", False)
             is_mock_llm = is_llm and LLM_MODE == "mock"
@@ -2057,8 +2163,9 @@ if _TKINTER_AVAILABLE:
                     self._sub_selected = (self._sub_selected - 1) % count
                     self._populate_rows()
             else:
-                if self._filtered:
-                    self._selected_idx = (self._selected_idx - 1) % len(self._filtered)
+                count = len(self._visible_items())
+                if count:
+                    self._selected_idx = (self._selected_idx - 1) % count
                     self._populate_rows()
                     self._ensure_visible()
 
@@ -2069,21 +2176,23 @@ if _TKINTER_AVAILABLE:
                     self._sub_selected = (self._sub_selected + 1) % count
                     self._populate_rows()
             else:
-                if self._filtered:
-                    self._selected_idx = (self._selected_idx + 1) % len(self._filtered)
+                count = len(self._visible_items())
+                if count:
+                    self._selected_idx = (self._selected_idx + 1) % count
                     self._populate_rows()
                     self._ensure_visible()
 
         def _on_number_key(self, event) -> None:
-            if self._submenu:
+            if self._submenu or self._search_var.get():
                 return
-            # Only act if search entry is not focused with text
             idx = int(event.char) - 1
-            if 0 <= idx < len(self._filtered):
+            if 0 <= idx < len(self._visible_items()):
                 self._select_command(idx)
+                return "break"  # don't also type the digit into the search box
 
         def _on_mousewheel(self, event) -> None:
-            self._canvas.yview_scroll(-1 * (event.delta // 120), "units")
+            delta = event.delta if sys.platform == "darwin" else event.delta // 120
+            self._canvas.yview_scroll(-delta, "units")
 
         def _on_focus_out(self, event) -> None:
             # Only close if focus left the root entirely
@@ -2103,9 +2212,9 @@ if _TKINTER_AVAILABLE:
 
         def _ensure_visible(self) -> None:
             """Scroll to keep the selected row visible."""
-            if not self._row_widgets or self._selected_idx >= len(self._row_widgets):
+            widget = self._command_rows.get(self._selected_idx)
+            if widget is None:
                 return
-            widget = self._row_widgets[self._selected_idx]
             self._canvas.update_idletasks()
             y = widget.winfo_y()
             h = widget.winfo_height()
@@ -2167,17 +2276,19 @@ if _TKINTER_AVAILABLE:
             self._search_entry.focus_set()
 
         # ── Selection ──
-        def _select_command(self, idx: int) -> None:
-            # Resolve name/cmd from suggestions or filtered list
+        def _visible_items(self) -> list[tuple[str, dict]]:
+            """Commands in the order they are displayed (index == row number)."""
             if self._suggestions and not self._is_searching:
-                all_items = [(n, c) for n, c, _s in self._suggestions]
-                if idx >= len(all_items):
-                    return
-                name, cmd = all_items[idx]
-            else:
-                if idx >= len(self._filtered):
-                    return
-                name, cmd = self._filtered[idx]
+                starred = [(n, c) for n, c, s in self._suggestions if s]
+                rest = [(n, c) for n, c, s in self._suggestions if not s]
+                return starred + rest
+            return self._filtered
+
+        def _select_command(self, idx: int) -> None:
+            items = self._visible_items()
+            if idx >= len(items):
+                return
+            name, cmd = items[idx]
 
             # MOCK mode: block LLM commands
             is_llm = cmd.get("llm_required", False)
@@ -2316,6 +2427,10 @@ def _run_as_user(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 # ============================================================
 
 def clipboard_copy(text: str) -> None:
+    if _IS_MAC:
+        if not mac.clipboard_set(text):
+            TUI.error("Clipboard copy failed")
+        return
     import base64 as _b64
     # On Wayland, prefer the paste helper (runs as real user — no nested-sudo hang)
     if _IS_WAYLAND and _paste_helper_proc is not None:
@@ -2324,7 +2439,7 @@ def clipboard_copy(text: str) -> None:
             return
         TUI.warn("Helper clipboard failed — falling back to wl-copy")
 
-    if platform.system() == "Linux":
+    if _IS_LINUX:
         if _IS_WAYLAND:
             cmd = ["wl-copy", "--", text]
         else:
@@ -2343,7 +2458,9 @@ def clipboard_copy(text: str) -> None:
 
 
 def clipboard_paste(timeout: float = 1.0) -> str:
-    if platform.system() == "Linux":
+    if _IS_MAC:
+        return mac.clipboard_get()
+    if _IS_LINUX:
         try:
             if _IS_WAYLAND:
                 cmd = ["wl-paste", "--no-newline"]
@@ -2375,6 +2492,11 @@ def _get_primary_selection() -> str:
 
 def _reset_keyboard_state() -> None:
     """Release all modifier keys and clear the keyboard library's internal state."""
+    if _IS_MAC:
+        # Nothing to reset — just don't inject keys while the user still
+        # holds the hotkey modifiers.
+        mac.wait_for_modifiers_released(timeout=0.5)
+        return
     for key in ('ctrl', 'alt', 'shift'):
         try:
             keyboard.release(key)
@@ -2424,6 +2546,13 @@ def _send_paste_keys() -> None:
     After pasting, always resets keyboard state to prevent stuck modifiers.
     """
     global _WTYPE_DISABLED, _YDOTOOL_DISABLED
+
+    if _IS_MAC:
+        mac.wait_for_modifiers_released()
+        if not mac.send_paste():
+            TUI.warn("Cmd+V failed — grant Accessibility to your terminal app")
+        time.sleep(0.08)
+        return
 
     # Release any lingering modifier keys from the hotkey combo
     _reset_keyboard_state()
@@ -2503,6 +2632,8 @@ def _send_paste_keys() -> None:
 
 def _focus_by_alt_tab() -> bool:
     """Fallback focus strategy for compositors where direct window activation is unavailable."""
+    if _IS_MAC:
+        return False  # activation by PID always works on macOS; no blind Cmd+Tab
     try:
         _reset_keyboard_state()
         time.sleep(0.04)
@@ -2556,14 +2687,7 @@ if _TKINTER_AVAILABLE:
             self._root.configure(bg=self.BG, highlightbackground=self.BORDER_COLOR,
                                  highlightthickness=1)
 
-            try:
-                self._font = tkfont.Font(family="DejaVu Sans Mono", size=10)
-                self._font_bold = tkfont.Font(family="DejaVu Sans Mono", size=10, weight="bold")
-                self._font_small = tkfont.Font(family="DejaVu Sans Mono", size=9)
-            except Exception:
-                self._font = tkfont.Font(family="Courier", size=10)
-                self._font_bold = tkfont.Font(family="Courier", size=10, weight="bold")
-                self._font_small = tkfont.Font(family="Courier", size=9)
+            self._font, self._font_bold, self._font_small = _popup_fonts()
 
             self._build_ui()
 
@@ -2576,8 +2700,7 @@ if _TKINTER_AVAILABLE:
             x = (sw - w) // 2
             y = (sh - h) // 2
             self._root.geometry(f"{w}x{h}+{x}+{y}")
-            self._root.deiconify()
-            self._root.focus_force()
+            _present_popup(self._root)
 
         def _build_ui(self) -> None:
             # Header
@@ -2643,7 +2766,8 @@ if _TKINTER_AVAILABLE:
 
             # Key bindings
             self._root.bind("<Escape>", lambda e: self._close())
-            self._root.bind("<Control-c>", lambda e: self._on_copy(copy_btn))
+            self._root.bind("<Command-c>" if sys.platform == "darwin" else "<Control-c>",
+                            lambda e: self._on_copy(copy_btn))
 
         def _on_copy(self, btn) -> None:
             """Copy result text to clipboard."""
@@ -2800,7 +2924,9 @@ def notify(title: str, message: str, is_error: bool = False) -> None:
     if not _should_notify(is_error=is_error):
         return
     try:
-        if platform.system() == "Linux":
+        if _IS_MAC:
+            mac.notify(title, message)
+        elif _IS_LINUX:
             _run_as_user(
                 ["notify-send", "-t", "5000",
                  _sanitize_for_notify(title), _sanitize_for_notify(message)],
@@ -2929,12 +3055,33 @@ def handle_polite(text: str, full_text: str, cmd_config: dict) -> None:
     TUI.action("📝", "POLITE", f"\"{normalised}\" → \"{result[:60]}\"")
 
 
-_CMD_ALLOWED_COMMANDS: list[str] = CONFIG.get("command_security", {}).get(
-    "allowed_commands",
-    ["ls", "cat", "grep", "find", "git", "echo", "date", "python", "node",
-     "curl", "wc", "head", "tail", "sort", "uniq", "diff", "file", "stat",
-     "whoami", "hostname", "uname", "env", "printenv", "which", "type"],
-)
+# Read-only tools only. Interpreters (python, node), env/printenv (leak API
+# keys into notifications), curl and find (-exec/-delete) are deliberately
+# absent; add them in config.yaml → command_security.allowed_commands at your
+# own risk.
+_CMD_DEFAULT_ALLOWED = [
+    "ls", "cat", "grep", "git", "echo", "date", "wc", "head", "tail", "sort",
+    "uniq", "diff", "file", "stat", "whoami", "hostname", "uname", "which",
+    "pwd", "df", "du", "uptime", "cal",
+]
+
+# Arguments that turn an otherwise harmless binary into arbitrary execution
+_CMD_BLOCKED_ARGS: dict[str, tuple[str, ...]] = {
+    "git": ("-c", "--config-env", "--exec-path", "-C", "--upload-pack",
+            "--receive-pack", "--ext-cmd"),
+    "find": ("-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fls"),
+}
+
+_CMD_ALLOWED_COMMANDS: list[str] = list(_CMD_DEFAULT_ALLOWED)
+
+
+def _refresh_command_security() -> None:
+    global _CMD_ALLOWED_COMMANDS
+    allowed = (CONFIG.get("command_security") or {}).get("allowed_commands")
+    _CMD_ALLOWED_COMMANDS = list(allowed) if isinstance(allowed, list) else list(_CMD_DEFAULT_ALLOWED)
+
+
+_refresh_command_security()
 
 
 def handle_command(text: str, full_text: str, cmd_config: dict) -> None:
@@ -2959,10 +3106,17 @@ def handle_command(text: str, full_text: str, cmd_config: dict) -> None:
 
     # Allowlist check: only the binary name (basename), not full paths
     binary = os.path.basename(parts[0])
-    if binary not in _CMD_ALLOWED_COMMANDS:
-        TUI.error(f"BLOCKED — '{binary}' not in allowed commands list")
+    if "/" in parts[0] or binary not in _CMD_ALLOWED_COMMANDS:
+        TUI.error(f"BLOCKED — '{parts[0]}' not in allowed commands list")
         notify("Security Block",
-               f"'{binary}' is not allowed. Allowed: {', '.join(_CMD_ALLOWED_COMMANDS[:10])}...")
+               f"'{parts[0]}' is not allowed. Allowed: {', '.join(_CMD_ALLOWED_COMMANDS[:10])}...")
+        return
+    blocked = _CMD_BLOCKED_ARGS.get(binary, ())
+    bad = next((a for a in parts[1:] if a in blocked or
+                any(a.startswith(b + "=") for b in blocked if b.startswith("--"))), None)
+    if bad:
+        TUI.error(f"BLOCKED — '{binary} {bad}' can execute arbitrary code")
+        notify("Security Block", f"'{bad}' is not allowed with {binary}")
         return
 
     try:
@@ -3004,6 +3158,27 @@ def handle_test(text: str, full_text: str, cmd_config: dict) -> None:
     TUI.action("🧪", "TEST", f"Input: \"{content}\"")
     TUI.success(f"Output: \"{result}\"")
     notify("Test", f"Pipeline OK: \"{content[:60]}\"")
+
+
+class _KeepMissing(dict):
+    """format_map helper: unknown {placeholders} are left as-is."""
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def _format_prompt(template: str, variables: dict) -> str:
+    """Fill a user-supplied prompt template without ever raising.
+
+    Unknown placeholders stay literal; malformed templates (stray braces,
+    positional fields) fall back to plain {text} substitution.
+    """
+    try:
+        return template.format_map(_KeepMissing(variables))
+    except (ValueError, IndexError, AttributeError):
+        result = template
+        for key, value in variables.items():
+            result = result.replace("{" + key + "}", str(value))
+        return result
 
 
 def handle_llm_command(text: str, full_text: str, cmd_config: dict,
@@ -3056,12 +3231,7 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict,
     else:
         fmt_vars["app_context"] = "unknown"
 
-    # Safely format the prompt — ignore missing keys
-    try:
-        prompt = prompt_template.format(**fmt_vars)
-    except KeyError:
-        # Fallback: only inject {text} if other vars are missing from template
-        prompt = prompt_template.format(text=text.strip())
+    prompt = _format_prompt(prompt_template, fmt_vars)
 
     cmd_model = cmd_config.get("model", "")
 
@@ -3281,10 +3451,11 @@ def handle_redact(text: str, full_text: str, cmd_config: dict) -> None:
 
 
 # ── Safe math patterns for CALC ──
+# Natural-language fragments rewritten in place before evaluation
+# ("15% of 340 + 1" → "(51.0) + 1")
 _CALC_NATURAL = [
-    (_re.compile(r"(\d+(?:\.\d+)?)\s*%\s*of\s*(\d+(?:\.\d+)?)"), lambda m: str(float(m.group(1)) / 100 * float(m.group(2)))),
-    (_re.compile(r"sqrt\((\d+(?:\.\d+)?)\)"), lambda m: str(math.sqrt(float(m.group(1))))),
-    (_re.compile(r"(\d+(?:\.\d+)?)\s*\*\*\s*(\d+(?:\.\d+)?)"), lambda m: str(float(m.group(1)) ** float(m.group(2)))),
+    (_re.compile(r"(\d+(?:\.\d+)?)\s*%\s*of\s*(\d+(?:\.\d+)?)", _re.IGNORECASE),
+     lambda m: repr(float(m.group(1)) / 100 * float(m.group(2)))),
 ]
 
 # Math function substitutions — pre-process before AST parse
@@ -3300,29 +3471,20 @@ _MATH_FUNCS = {
 
 def _safe_eval_math(expr: str) -> str | None:
     """Safely evaluate a math expression using ast. Returns result string or None."""
-    # First try natural language patterns
     for pattern, fn in _CALC_NATURAL:
-        m = pattern.search(expr)
-        if m:
-            try:
-                result = fn(m)
-                # Format: strip trailing zeros
-                f = float(result)
-                return str(int(f)) if f == int(f) else str(f)
-            except Exception:
-                pass
+        expr = pattern.sub(lambda m: f"({fn(m)})", expr)
 
     # Pre-process math functions: sin(45) → _RESULT_
     func_expr = expr
     for func_name, func_fn in _MATH_FUNCS.items():
-        pattern = _re.compile(rf'{func_name}\(([^)]+)\)', _re.IGNORECASE)
+        pattern = _re.compile(rf'\b{func_name}\(([^()]+)\)', _re.IGNORECASE)
         while pattern.search(func_expr):
             m = pattern.search(func_expr)
             try:
                 inner_val = _safe_eval_math(m.group(1))
                 if inner_val is not None:
                     func_result = func_fn(float(inner_val))
-                    func_expr = func_expr[:m.start()] + str(func_result) + func_expr[m.end():]
+                    func_expr = func_expr[:m.start()] + f"({func_result!r})" + func_expr[m.end():]
                 else:
                     break
             except (ValueError, OverflowError):
@@ -3330,8 +3492,10 @@ def _safe_eval_math(expr: str) -> str | None:
 
     # Clean the expression: keep only math chars
     cleaned = _re.sub(r"[^0-9+\-*/().%^ e]", "", func_expr)
-    cleaned = cleaned.replace("^", "**")
-    if not cleaned.strip():
+    # Keep "e" only as a scientific-notation exponent (1.5e-16), not from words
+    cleaned = _re.sub(r"(?<![\d.])e|e(?![\d+\-])", "", cleaned)
+    cleaned = cleaned.replace("^", "**").strip()  # leading space = IndentationError
+    if not cleaned:
         return None
 
     try:
@@ -3691,7 +3855,7 @@ def handle_trans(text: str, full_text: str, cmd_config: dict) -> None:
         return
 
     prompt_template = cmd_config.get("llm_prompt", "Translate to {lang}: {text}")
-    prompt = prompt_template.format(lang=lang_code, text=body)
+    prompt = _format_prompt(prompt_template, {"lang": lang_code, "text": body})
     cmd_model = cmd_config.get("model", "")
 
     TUI.status("🌐", f"Translating to {lang_code} with LLM...", TUI.CYAN)
@@ -3726,6 +3890,8 @@ _IMAGE_DIR = _get_effective_home() / "Pictures" / "ActionFlow_Generated"
 
 def _open_image_folder(path: Path) -> bool:
     """Open the generated images folder in the system file manager."""
+    if _IS_MAC:
+        return mac.open_path(str(path))
     try:
         proc = _run_as_user(
             ["xdg-open", str(path)],
@@ -3752,6 +3918,8 @@ def _clipboard_copy_image(image_path: str) -> bool:
     On X11: xclip -selection clipboard -t image/png -i file.png
     """
     try:
+        if _IS_MAC:
+            return mac.clipboard_set_image(image_path)
         if _IS_WAYLAND:
             with open(image_path, "rb") as f:
                 proc = _run_as_user(
@@ -4166,8 +4334,13 @@ def _log_history(command: str, input_text: str, output_text: str, duration_ms: i
 # Router — 3-tier: Prefix → Keyword → LLM → Fallback
 # ============================================================
 
-def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> None:
-    """Dispatch to the correct handler for a matched command."""
+def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> str | None:
+    """Dispatch to the correct handler for a matched command.
+
+    Returns the replacement text the handler produced, "" when the command
+    ran without replacing text (COUNT, WIKI, CMD, ...), or None on failure.
+    Errors are reported to the user here; they are never re-raised.
+    """
     global _last_command, _current_notify_level
 
     # Set per-command notification level (always | errors_only | never)
@@ -4182,36 +4355,40 @@ def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> N
 
     is_llm = cmd_config.get("llm_required", False) or cmd_name not in _BUILTIN_HANDLERS
     start_time = time.time()
+    with _undo_lock:
+        undo_depth = len(_undo_stack)
+    history_ctx = dict(
+        app_context=_current_app_context.context_type if _current_app_context else "",
+        text_length=len(payload),
+        text_language=_current_text_analysis.language if _current_text_analysis else "",
+        trigger=_popup_trigger,
+    )
 
     try:
-        if cmd_name in _BUILTIN_HANDLERS:
-            _BUILTIN_HANDLERS[cmd_name](payload, full_text, cmd_config)
-        elif cmd_config.get("llm_required"):
-            handle_llm_command(payload, full_text, cmd_config, cmd_key=cmd_name)
+        handler = _BUILTIN_HANDLERS.get(cmd_name)
+        if handler is not None:
+            handler(payload, full_text, cmd_config)
         else:
             handle_llm_command(payload, full_text, cmd_config, cmd_key=cmd_name)
-
-        duration = time.time() - start_time
-        with _undo_lock:
-            output = _undo_stack[-1]["replacement"] if _undo_stack else "(done)"
-        TUI.activity_entry(cmd_name, payload, output, duration, is_llm=is_llm,
-                           trigger=_popup_trigger)
-        _log_history(cmd_name, payload, output, int(duration * 1000),
-                     app_context=_current_app_context.context_type if _current_app_context else "",
-                     text_length=len(payload),
-                     text_language=_current_text_analysis.language if _current_text_analysis else "",
-                     trigger=_popup_trigger)
-
     except Exception as exc:
         duration = time.time() - start_time
+        label = "LLM request failed" if isinstance(exc, LLMError) else "Error"
         TUI.activity_entry(cmd_name, payload, str(exc), duration, is_error=True,
                            trigger=_popup_trigger)
-        _log_history(cmd_name, payload, f"ERROR: {exc}", int(duration * 1000),
-                     app_context=_current_app_context.context_type if _current_app_context else "",
-                     text_length=len(payload),
-                     text_language=_current_text_analysis.language if _current_text_analysis else "",
-                     trigger=_popup_trigger)
-        raise
+        _log_history(cmd_name, payload, f"ERROR: {exc}", int(duration * 1000), **history_ctx)
+        notify(APP_NAME, f"{cmd_name}: {label} — text left unchanged. {exc}"[:200],
+               is_error=True)
+        return None
+
+    duration = time.time() - start_time
+    with _undo_lock:
+        pushed = len(_undo_stack) > undo_depth
+        output = _undo_stack[-1]["replacement"] if pushed else ""
+    TUI.activity_entry(cmd_name, payload, output or "(no text change)", duration,
+                       is_llm=is_llm, trigger=_popup_trigger)
+    _log_history(cmd_name, payload, output or "(no text change)", int(duration * 1000),
+                 **history_ctx)
+    return output
 
 
 _chain_suppress_paste = False
@@ -4318,24 +4495,27 @@ def route(text: str) -> None:
             is_last = (i == len(chain) - 1)
             step_label = f"[{i+1}/{len(chain)}] {cmd_name}"
 
-            if not is_last:
-                # Suppress clipboard paste for intermediate steps
-                _chain_suppress_paste = True
-
+            # Suppress clipboard paste for intermediate steps
+            _chain_suppress_paste = not is_last
             try:
                 TUI.status("⛓", f"Step {step_label}...", TUI.CYAN)
-                dispatch(cmd_name, current_input, text, cmd_config)
-
-                # Get output from undo stack for next step
-                if not is_last:
-                    with _undo_lock:
-                        current_input = _undo_stack[-1]["replacement"] if _undo_stack else current_input
-            except Exception as exc:
-                TUI.error(f"Chain failed at step {step_label}: {exc}")
-                notify(APP_NAME, f"Chain failed at step {step_label}")
-                return
+                output = dispatch(cmd_name, current_input, text, cmd_config)
             finally:
                 _chain_suppress_paste = False
+
+            if is_last:
+                break
+            if not output:
+                TUI.error(f"Chain stopped at step {step_label}: no text output")
+                notify(APP_NAME, f"Chain stopped at step {step_label} — text left unchanged",
+                       is_error=True)
+                return
+            # Intermediate results are not undo points: undo must restore the
+            # originally selected text, not a half-processed one.
+            with _undo_lock:
+                if _undo_stack and _undo_stack[-1]["replacement"] == output:
+                    _undo_stack.pop()
+            current_input = output
 
         return
 
@@ -4440,7 +4620,17 @@ def _do_intercept() -> None:
         TUI.status("⌨", "Hotkey triggered — reading selection...", TUI.CYAN)
         TUI.micro_log(f"Hotkey triggered — reading selection...")
 
-        if _IS_WAYLAND:
+        if _IS_MAC:
+            text: str = mac.capture_selection()
+            if not text:
+                if mac.is_accessibility_trusted() is False:
+                    TUI.warn("Cmd+C was blocked — grant Accessibility to your terminal app")
+                    notify(APP_NAME, "Grant Accessibility permission to your terminal app.")
+                else:
+                    TUI.warn("No text copied from selection")
+                    notify(APP_NAME, "No text selected.")
+                return
+        elif _IS_WAYLAND:
             text: str = _get_primary_selection()
         else:
             old_clipboard: str = clipboard_paste(timeout=0.2)
@@ -4517,8 +4707,13 @@ def _do_intercept() -> None:
             TUI.micro_log(f"Opening command picker...")
             return
 
-        # Fallback if tkinter unavailable: route via prefix/keyword/LLM
-        TUI.warn("tkinter unavailable — falling back to prefix routing")
+        # No popup available. Guessing a command from keywords / LLM intent
+        # would rewrite ordinary selected text, so it is opt-in.
+        if not CONFIG.get("smart_routing", False):
+            TUI.warn("No command prefix in selection (popup unavailable)")
+            notify(APP_NAME, "No command prefix found — start the selection with e.g. SUM: or POL:")
+            return
+        TUI.warn("tkinter unavailable — using keyword/LLM routing (smart_routing: true)")
         _popup_trigger = "prefix"
         _current_source_window = _get_active_window_id()
         try:
@@ -4786,12 +4981,72 @@ def _start_tray() -> None:
 
 
 # ============================================================
+# macOS — Hotkeys & Permissions
+# ============================================================
+
+_mac_hotkeys = None  # platform_mac.HotkeyListener, set in _start_mac_hotkeys()
+
+
+def _start_mac_hotkeys(bindings: list) -> bool:
+    """Register global hotkeys on macOS, explaining missing permissions."""
+    global _mac_hotkeys
+    if os.geteuid() == 0:
+        TUI.warn("Don't run ActionFlow with sudo on macOS — it isn't needed and "
+                 "breaks clipboard/notification access. Run: python main.py")
+
+    if not mac.has_pyobjc():
+        TUI.error("PyObjC is missing — run: pip install -r requirements.txt")
+        return False
+
+    trusted = mac.is_accessibility_trusted()
+    listening = mac.has_input_monitoring()
+    if not trusted or not listening:
+        missing = [name for name, ok in (("Accessibility", trusted),
+                                         ("Input Monitoring", listening)) if not ok]
+        TUI.box("macOS permissions needed", [
+            f"  {TUI.YELLOW}Missing: {', '.join(missing)}{TUI.RESET}",
+            f"  {TUI.DIM}System Settings → Privacy & Security → enable your terminal app{TUI.RESET}",
+            f"  {TUI.DIM}(Terminal / iTerm2 / VS Code …) in both lists, then restart it.{TUI.RESET}",
+        ], TUI.YELLOW)
+        mac.request_permissions()
+        if not trusted:
+            mac.open_privacy_settings("Accessibility")
+
+    listener = mac.HotkeyListener()
+    try:
+        for spec, callback in bindings:
+            listener.add_hotkey(spec, callback)
+    except ValueError as exc:
+        TUI.error(f"Invalid hotkey in config.yaml: {exc}")
+        return False
+    if not listener.start():
+        TUI.error(f"Global hotkeys unavailable: {listener.error}")
+        return False
+    if listener.listen_only:
+        TUI.warn("Hotkeys work but are not swallowed (no Accessibility permission yet)")
+    _mac_hotkeys = listener
+    return True
+
+
+# ============================================================
 # Main Entry Point
 # ============================================================
+
+def _ensure_user_config() -> None:
+    """First run: copy config.yaml.example → config.yaml so the setup prompt
+    (which saves provider/model) doesn't create a config with no commands."""
+    if not _CONFIG_PATH.exists() and _CONFIG_EXAMPLE_PATH.exists():
+        try:
+            shutil.copyfile(_CONFIG_EXAMPLE_PATH, _CONFIG_PATH)
+            TUI.micro_log(f"Created {_CONFIG_PATH.name} from config.yaml.example")
+        except OSError as exc:
+            TUI.warn(f"Could not create config.yaml: {exc}")
+
 
 def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     global _start_time, _pattern_learner, _silent_mode
     _start_time = time.time()
+    _ensure_user_config()
 
     print("\033[2J\033[3J\033[H", end="", flush=True)
 
@@ -4861,8 +5116,12 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     # Background auto-update check
     threading.Thread(target=_check_for_updates, daemon=True).start()
 
-    # Start system tray icon
-    if not no_tray:
+    # Start system tray icon. On macOS both pystray and Tk need the main
+    # thread's run loop, so the tray is Linux-only for now.
+    if _IS_MAC:
+        if _TKINTER_AVAILABLE:
+            _get_tk_root()  # create Tk (and its NSApplication) on the main thread
+    elif not no_tray:
         threading.Thread(target=_start_tray, daemon=True).start()
 
     # Initialize PatternLearner
@@ -4887,12 +5146,25 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
             TUI.warn("Install ydotool as fallback: sudo apt install ydotool")
 
     # Register hotkeys
-    keyboard.add_hotkey(HOTKEY, on_hotkey_triggered)
-    keyboard.add_hotkey(UNDO_HOTKEY, on_undo_triggered)
-    keyboard.add_hotkey(
-        CONFIG.get("hotkeys", {}).get("silent_toggle", "ctrl+alt+s"),
-        on_silent_triggered
-    )
+    silent_hotkey = CONFIG.get("hotkeys", {}).get("silent_toggle", "ctrl+alt+s")
+    hotkey_bindings = [
+        (HOTKEY, on_hotkey_triggered),
+        (UNDO_HOTKEY, on_undo_triggered),
+        (silent_hotkey, on_silent_triggered),
+    ]
+    if _IS_MAC:
+        if _TK_TOO_OLD:
+            TUI.box("Popup disabled", [
+                f"  {TUI.YELLOW}This Python uses Apple's Tk {tk.TkVersion}, which hangs on modern macOS.{TUI.RESET}",
+                f"  {TUI.DIM}Prefix commands still work: select \"SUM: text\" and press the hotkey.{TUI.RESET}",
+                f"  {TUI.DIM}For the command picker use Python 3.11+ from python.org or{TUI.RESET}",
+                f"  {TUI.DIM}Homebrew (brew install python-tk@3.12) and recreate the venv.{TUI.RESET}",
+            ], TUI.YELLOW)
+        if not _start_mac_hotkeys(hotkey_bindings):
+            return
+    else:
+        for spec, callback in hotkey_bindings:
+            keyboard.add_hotkey(spec, callback)
 
     notify(
         "ActionFlow Active",
@@ -4907,13 +5179,17 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     TUI.micro_log(f"{TUI.DIM}/ = search  S = export session  Ctrl+C = exit{TUI.RESET}")
     print()
 
+    interactive = sys.stdin.isatty()
     try:
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        tty.setcbreak(fd)
+        old_settings = termios.tcgetattr(fd) if interactive else None
+        if interactive:
+            tty.setcbreak(fd)
         try:
             while not _exit_event.is_set():
-                if select.select([sys.stdin], [], [], 0.1)[0]:
+                if not interactive:
+                    time.sleep(0.1)  # no terminal (launchd/systemd) — just pump queues
+                elif select.select([sys.stdin], [], [], 0.1)[0]:
                     ch = sys.stdin.read(1)
                     if ch == '\x03':  # Ctrl+C
                         break
@@ -4922,37 +5198,53 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
                     elif ch in ('S', 's'):
                         _session_export()
 
+                # Keep Tk's event loop alive between popups (otherwise macOS
+                # marks the process as "not responding")
+                if _tk_root is not None:
+                    try:
+                        _tk_root.update()
+                    except Exception:
+                        pass
+
                 # Check popup queue — command picker triggered by hotkey
                 try:
                     popup_text, source_window = _popup_queue.get_nowait()
                     # Restore terminal for tkinter popup
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    if interactive:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                     try:
                         _handle_popup(popup_text, source_window=source_window)
                     except Exception as exc:
                         TUI.error(f"Popup error: {exc}")
                     # Restore cbreak for TUI
-                    tty.setcbreak(fd)
+                    if interactive:
+                        tty.setcbreak(fd)
                 except queue.Empty:
                     pass
 
                 # Check result queue — display-only popups (wiki, define, count)
                 try:
                     result_title, result_text = _result_queue.get_nowait()
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    if interactive:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                     try:
                         if _TKINTER_AVAILABLE:
                             result_popup = ResultPopup(result_title, result_text)
                             result_popup.run()
                     except Exception as exc:
                         TUI.error(f"Result popup error: {exc}")
-                    tty.setcbreak(fd)
+                    if interactive:
+                        tty.setcbreak(fd)
                 except (queue.Empty, ValueError):
                     pass
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if interactive:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     except KeyboardInterrupt:
         pass
+
+    if _mac_hotkeys is not None:
+        _mac_hotkeys.stop()
 
     # Clean up portal paste helper
     if _paste_helper_proc is not None:
@@ -4978,7 +5270,7 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
 def _check_for_updates() -> None:
     """Silently check GitHub releases for a newer version tag. Runs in background thread."""
     try:
-        url = "https://api.github.com/repos/azimxxd/actionflow/releases/latest"
+        url = "https://api.github.com/repos/azimxxd/watashigpt/releases/latest"
         req = urllib.request.Request(url, headers={"User-Agent": "ActionFlow"})
         data = json.loads(_safe_url_read(req, timeout=5).decode())
         latest_tag = data.get("tag_name", "").lstrip("v")
@@ -5077,6 +5369,9 @@ def show_history(grep_filter: str | None = None) -> None:
 
 def install_systemd_service() -> None:
     """Generate and install a systemd unit file for ActionFlow."""
+    if not _IS_LINUX:
+        print(f"{TUI.RED}Error: --install (systemd) is Linux-only.{TUI.RESET}")
+        sys.exit(1)
     if os.geteuid() != 0:
         print(f"{TUI.RED}Error: --install must be run as root (sudo).{TUI.RESET}")
         sys.exit(1)

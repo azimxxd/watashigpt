@@ -1,5 +1,8 @@
 confidence_threshold: 0.7
 interaction_mode: both
+# When the popup is unavailable, guess the command for un-prefixed text from
+# keywords / LLM intent. Off by default: it can rewrite text you didn't mean to.
+smart_routing: false
 silent_mode: false
 commands:
   b64:
@@ -525,16 +528,25 @@ personal_commands: {}
   #         **Today:** Fixing bug #123
   #         **Blockers:** None
 command_security:
-  allowed_commands: [ls, cat, grep, find, git, echo, date, python, node, curl, wc, head, tail, sort, uniq, diff, file, stat, whoami, hostname, uname, env, printenv, which, type]
+  # CMD:/RUN: only runs these binaries (no shell). Avoid interpreters (python,
+  # node), env/printenv (they would leak API keys) and curl/find.
+  allowed_commands: [ls, cat, grep, git, echo, date, wc, head, tail, sort, uniq, diff, file, stat, whoami, hostname, uname, which, pwd, df, du, uptime, cal]
 image_api:
   api_key: ''  # Use env var ACTIONFLOW_IMAGE_API_KEY instead
   model: seedream
   provider: pollinations
 llm:
+  # groq | openai | gemini | openrouter | github | ollama | lmstudio
+  # (ollama / lmstudio run locally and need no API key).
+  # Leave empty to pick interactively on first launch.
+  provider: ''
+  model: ''
   api_key: ''  # Use env var ACTIONFLOW_API_KEY instead
+  # base_url: http://localhost:11434/v1   # optional: any OpenAI-compatible endpoint
+  max_tokens: 2048   # upper bound on response length
+  temperature: 0.7
+  timeout: 60        # seconds per request
   fallback:
     api_key: ''
     model: ''
     provider: ''
-  model: llama-3.3-70b-versatile
-  provider: groq

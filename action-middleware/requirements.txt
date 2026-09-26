@@ -1,10 +1,20 @@
-keyboard>=0.13.5
-pyperclip>=1.8.2
-plyer>=2.1.0
+# Core
 pyyaml>=6.0
 openai>=1.0
 watchdog>=4.0
 dateparser>=1.1
 langdetect>=1.0.9
-pystray>=0.19
-Pillow>=10.0
+
+# Linux: global hotkeys via /dev/input (needs root) + tray icon
+keyboard>=0.13.5; sys_platform == "linux"
+pystray>=0.19; sys_platform != "darwin"
+Pillow>=10.0; sys_platform != "darwin"
+
+# macOS: event tap hotkeys, Cmd+C/V injection, NSPasteboard, NSWorkspace
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0; sys_platform == "darwin"
+
+# Windows (untested)
+keyboard>=0.13.5; sys_platform == "win32"
+pyperclip>=1.8.2; sys_platform == "win32"
+plyer>=2.1.0; sys_platform == "win32"
