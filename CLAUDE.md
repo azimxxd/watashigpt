@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-OS-level background assistant that intercepts selected text via global hotkeys, routes it through a 3-tier command system (prefix → keyword → LLM → fallback), and applies transformations. Single-file Python CLI with rich TUI, context-aware intelligence, and system tray support. 38+ commands (19 built-in + 19 LLM + personal commands).
+OS-level background assistant that intercepts selected text via global hotkeys, routes it through a 3-tier command system (prefix → keyword → LLM → fallback), and applies transformations. Python CLI with rich TUI, context-aware intelligence, and system tray support (Linux). Runs on Linux (X11/Wayland) and macOS. 40+ commands (built-in + LLM + personal commands).
 
 **Developer: WatashiGPT**
 
@@ -11,15 +11,23 @@ OS-level background assistant that intercepts selected text via global hotkeys, 
 ```
 watashigpt/
 ├── action-middleware/
-│   ├── main.py           # All application code (~3900 lines)
-│   ├── config.yaml       # Commands, hotkeys, LLM settings (auto-saved on provider setup)
-│   └── requirements.txt  # Python dependencies
+│   ├── main.py             # Application code (~5400 lines)
+│   ├── platform_mac.py     # macOS backend — all PyObjC/osascript code lives here
+│   ├── paste_helper.py     # Linux/GNOME Wayland portal helper (runs as the real user)
+│   ├── config.yaml.example # Copied to config.yaml (gitignored) on first run
+│   ├── requirements.txt    # Platform markers: keyboard (Linux), pyobjc (macOS)
+│   └── tests/test_core.py  # pytest — pure logic, no GUI/hotkeys/network
 └── README.md
 ```
 
 ## Running
 
 ```bash
+# macOS — no sudo; grant Accessibility + Input Monitoring to the terminal app
+cd action-middleware && python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && python main.py
+# Needs Tk 8.6+ for the popup: Apple's /usr/bin/python3 (Tk 8.5) hangs → prefix mode only
+
 # Install system deps (Wayland)
 sudo apt-get install wl-clipboard libnotify-bin
 
@@ -43,16 +51,22 @@ sudo -E python main.py --no-tray
 
 ## Testing
 
-No automated test suite. Manual testing:
-1. Run the app with `sudo -E python main.py`
+```bash
+cd action-middleware && pip install -r requirements-dev.txt && python -m pytest tests
+```
+
+Tests cover config loading, routing/chains, LLM failure handling, CALC, CMD security,
+suggestions and hotkey parsing. Monkeypatch `main._replace_selection` / `main.notify`
+instead of touching the real clipboard. End-to-end check (manual):
+1. Run the app (`python main.py` on macOS, `sudo -E python main.py` on Linux)
 2. Select `TEST:hello world` in any app, press `Ctrl+Alt+X`
 3. Expect: `[TEST OK] "hello world" | session=... | wayland=... | llm=mock`
 
 ## Tech Stack
 
-- **Python 3.10+** — single-file architecture
-- **keyboard** — global hotkey detection (requires root on Linux)
-- **pyperclip / plyer** — clipboard and notifications (macOS/Windows fallback)
+- **Python 3.9+** — `from __future__ import annotations` keeps `X | None` hints working on 3.9
+- **keyboard** — global hotkey detection on Linux (requires root)
+- **PyObjC (Quartz, ApplicationServices)** — macOS hotkeys (CGEventTap), key injection, NSPasteboard, NSWorkspace
 - **pyyaml** — config parsing
 - **openai** — LLM client (supports Groq, OpenAI, Gemini, OpenRouter, GitHub Models via base_url)
 - **dateparser** — natural language date parsing (for `DATE:` command)
@@ -68,11 +82,16 @@ No automated test suite. Manual testing:
 - **Confidence gating**: LLM classifier returns a confidence score; if below `confidence_threshold` (default `0.7` in config.yaml), the command is NOT applied — user sees a notification suggesting to use the prefix directly
 - **Threading**: main thread runs cbreak stdin loop + TUI; hotkey callbacks spawn worker threads
 - **Handler pattern**: `_BUILTIN_HANDLERS` dict maps command names → `handle_<command>()` functions. LLM commands route through `handle_llm_command()` automatically.
-- **Platform abstraction**: auto-detects Wayland vs X11, uses native clipboard commands
-- **`_run_as_user()`**: runs subprocess commands as the real user when executing under `sudo`
+- **Platform abstraction**: `_IS_MAC` / `_IS_LINUX` / `_IS_WAYLAND` branches in the OS-facing functions (`clipboard_copy`, `_send_paste_keys`, `detect_active_window`, `_focus_window`, `notify`, ...). macOS implementations live in `platform_mac.py` (imported as `mac`); keep PyObjC imports lazy there so tests import on any OS
+- **macOS hotkeys**: `platform_mac.HotkeyListener` matches physical keycodes + exact modifier set (layout-independent), swallows the event when Accessibility is granted, runs callbacks on new threads
+- **macOS Tk**: Tk must stay on the main thread; the main loop calls `_tk_root.update()` every tick; `_present_popup()` activates our own process so the popup gets keyboard focus
+- **`_run_as_user()`**: runs subprocess commands as the real user when executing under `sudo` (Linux only; never run with sudo on macOS)
 - **Provider registry**: `_PROVIDER_BASE_URLS` and `_PROVIDER_DEFAULT_MODELS` dicts for clean multi-provider support
-- **Config persistence**: `_save_llm_config()` writes provider/key/model to `config.yaml` so subsequent runs skip the interactive selector
+- **Config loading**: `load_config()` deep-copies defaults; `hotkeys`/`llm`/`image_api` are merged key-by-key, every other top-level key is taken as-is. Falls back to `config.yaml.example` when `config.yaml` is missing
+- **Config persistence**: `_save_llm_config()` writes provider/model (never the API key) to `config.yaml` so subsequent runs skip the interactive selector
 - **Pipe chains**: `POL:|SUM: text` chains multiple commands, passing output of each step to the next
+- **dispatch() contract**: returns the replacement text, `""` when nothing was replaced, `None` on failure (errors are notified there and not re-raised). Chains use the return value and pop intermediate undo entries so undo restores the original selection
+- **LLM failures**: `_llm_call()` raises `LLMError` after primary + fallback fail — never paste placeholder text over user input
 - **REPEAT tracking**: `dispatch()` stores `_last_command` for the `REPEAT:` command (skips tracking repeat itself)
 - **Named clips**: `~/.actionflow_clips.json` persists named clipboard slots across restarts
 - **Clipboard stack**: in-memory `_clipboard_stack` list for `STACK:`/`POP:` push/pop operations
@@ -89,7 +108,6 @@ No automated test suite. Manual testing:
 - **Smart suggestions**: `get_smart_suggestions()` scores commands by app context + text type + learned patterns
 - **PatternLearner**: reads history JSONL, computes usage-frequency weights per context; influences suggestion order after 20+ samples
 - **Personal commands**: `personal_commands:` in config.yaml with few-shot examples, `[ME]` badge in popup, `handle_personal_command()` handler
-- **Refinement dialog**: `RefinementDialog` (tkinter) shown after LLM commands for iterative refinement (max 3 iterations)
 - **System tray**: `pystray` icon with color status (green=live, yellow=mock, grey=silent), right-click menu for history/settings/reload/exit
 - **Silent mode**: `Ctrl+Alt+S` toggles notification suppression; `silent_mode:` in config.yaml
 
@@ -118,7 +136,7 @@ No automated test suite. Manual testing:
 | Prefix | Action | Notes |
 |--------|--------|-------|
 | `POL:` / `POLITE:` | Rewrite rude/blunt text politely | Phrase lookup + LLM fallback |
-| `CMD:` / `RUN:` | Execute shell command | Dangerous pattern blocking |
+| `CMD:` / `RUN:` | Execute a command (no shell) | `command_security.allowed_commands` + `_CMD_BLOCKED_ARGS` |
 | `TEST:` / `PING:` | Pipeline verification | |
 | `FMT:` / `FORMAT:` | Auto-format JSON/XML | JSON first, XML fallback |
 | `COUNT:` / `STATS:` | Word/char/line stats + reading time | Notification only, no clipboard |
@@ -181,3 +199,5 @@ Supported providers (configured via interactive selector or `config.yaml`):
 | gemini | `generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.0-flash` |
 | openrouter | `openrouter.ai/api/v1` | `meta-llama/llama-3.3-70b-instruct` |
 | github | `models.inference.ai.azure.com` | `gpt-4o-mini` |
+| ollama | `localhost:11434/v1` (no key) | `llama3.2` |
+| lmstudio | `localhost:1234/v1` (no key) | `local-model` |

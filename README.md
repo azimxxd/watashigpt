@@ -4,17 +4,17 @@ OS-level background assistant that intercepts selected text via global hotkeys, 
 
 **by WatashiGPT**
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue)
-![Platform](https://img.shields.io/badge/Platform-Linux-green)
+![Python](https://img.shields.io/badge/Python-3.9+-blue)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-green)
 ![Wayland](https://img.shields.io/badge/Wayland-Supported-purple)
 ![X11](https://img.shields.io/badge/X11-Supported-orange)
 
 ## How It Works
 
 1. Select any text in any application
-2. Press `Ctrl+Alt+X` — a command picker popup appears
+2. Press `Ctrl+Alt+X` (`⌃⌥X` on macOS) — a command picker popup appears
 3. Pick a command (or type a prefix like `POL:hello`) — the text is processed and replaced in-place
-4. Press `Ctrl+Alt+Z` to undo
+4. Press `Ctrl+Alt+Z` (`⌃⌥Z`) to undo
 
 ```
   ╭──────────────────────────────────────╮
@@ -33,7 +33,7 @@ OS-level background assistant that intercepts selected text via global hotkeys, 
 | Prefix | Action | Notes |
 |--------|--------|-------|
 | `POL:` / `POLITE:` | Rewrite rude/blunt text politely | Phrase lookup, LLM fallback |
-| `CMD:` / `RUN:` | Execute shell command | Dangerous pattern blocking |
+| `CMD:` / `RUN:` | Execute a command (no shell) | Binary allowlist + blocked exec flags |
 | `TEST:` / `PING:` | Pipeline verification | |
 | `FMT:` / `FORMAT:` | Auto-format JSON/XML | JSON first, XML fallback |
 | `COUNT:` / `STATS:` | Word/char/line stats + reading time | Notification only, no clipboard |
@@ -118,13 +118,45 @@ Configured via interactive selector at first startup, or directly in `config.yam
 | Gemini | `gemini-2.0-flash` |
 | OpenRouter | `meta-llama/llama-3.3-70b-instruct` |
 | GitHub Models | `gpt-4o-mini` |
+| Ollama (local, no key) | `llama3.2` |
+| LM Studio (local, no key) | `local-model` |
+
+Any other OpenAI-compatible endpoint works via `llm.base_url` in `config.yaml`.
 
 - **Mock mode**: runs without any LLM provider — built-in commands work, LLM commands return `[MOCK]` placeholders
 - **Confidence gating**: LLM classifier confidence below threshold (default `0.7`) skips the command with a notification
 - **Fallback**: if primary provider errors, auto-retries with secondary provider from `config.yaml`
+- **Failure safety**: if every provider fails, your text is left untouched and you get an error notification
+- **Tuning**: `llm.max_tokens` (default 2048), `llm.temperature`, `llm.timeout` (seconds)
 - **Per-command model override**: optional `model:` key per command in config
 
-## Requirements
+## macOS
+
+No root, no system packages. Needs Python 3.9+ with **Tk 8.6+** for the command picker
+(Apple's `/usr/bin/python3` ships Tk 8.5, which hangs — use python.org or Homebrew Python).
+
+```bash
+cd action-middleware
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
+
+On first launch grant your terminal app (Terminal, iTerm2, VS Code, …) two permissions in
+**System Settings → Privacy & Security**, then restart the terminal:
+
+| Permission | Why |
+|------------|-----|
+| **Accessibility** | Send ⌘C / ⌘V to the focused app, swallow the hotkey |
+| **Input Monitoring** | Listen for the global hotkey |
+
+How it works on macOS: a Quartz event tap matches hotkeys by physical key (works with any
+keyboard layout, e.g. Russian), the selection is captured with ⌘C while the full clipboard
+(including images and rich text) is snapshotted and restored, the source app is re-activated
+by PID via `NSRunningApplication`, and notifications go through Notification Center.
+The tray icon is Linux-only for now.
+
+## Linux
 
 ### System packages
 
@@ -142,11 +174,12 @@ sudo apt-get install xclip xdotool libnotify-bin
 pip install -r action-middleware/requirements.txt
 ```
 
+`requirements.txt` uses platform markers, so the same file works on Linux and macOS.
+
 | Package | Purpose |
 |---------|---------|
-| `keyboard` | Global hotkey detection (requires root on Linux) |
-| `pyperclip` | Clipboard (macOS/Windows fallback) |
-| `plyer` | Notifications (macOS/Windows fallback) |
+| `keyboard` | Global hotkey detection (Linux, requires root) |
+| `pyobjc-framework-Quartz` / `-ApplicationServices` | Hotkeys, key injection, clipboard, app focus (macOS) |
 | `pyyaml` | Config parsing |
 | `openai` | LLM client (supports all providers via base_url) |
 | `watchdog` | Config hot-reload on file change |
@@ -157,7 +190,7 @@ pip install -r action-middleware/requirements.txt
 | `dbus-python` | D-Bus session bus (paste helper, used by system Python) |
 | `PyGObject` | GLib mainloop + AT-SPI accessibility (paste helper) |
 
-## Usage
+## Usage (Linux)
 
 ```bash
 cd action-middleware
@@ -221,16 +254,20 @@ Hotkey (Ctrl+Alt+X)
 - **`sudo -E` with `_run_as_user()`**: runs as root for `/dev/input` access but clipboard/notification commands run as the original user
 - **Pattern learning**: `PatternLearner` reads history, computes usage-frequency weights per app context after 20+ samples
 - **Safe math eval**: `CALC:` uses `ast.parse()` + AST node whitelisting — never raw `eval()`
+- **Explicit intent**: without the popup, only prefixed text is processed (`smart_routing: true` enables keyword/LLM guessing)
 
 ## Project Structure
 
 ```
 watashigpt/
 ├── action-middleware/
-│   ├── main.py              # All application code (~5100 lines)
-│   ├── paste_helper.py      # Portal paste + AT-SPI window detection (runs as user)
-│   ├── config.yaml.example  # Example config with all commands and settings
-│   └── requirements.txt     # Python dependencies
+│   ├── main.py              # Application code (~5400 lines)
+│   ├── platform_mac.py      # macOS backend (hotkeys, clipboard, focus, notifications)
+│   ├── paste_helper.py      # Linux: portal paste + AT-SPI window detection (runs as user)
+│   ├── config.yaml.example  # Example config — copied to config.yaml on first run
+│   ├── requirements.txt     # Python dependencies (platform markers)
+│   ├── requirements-dev.txt # + pytest
+│   └── tests/               # pytest suite: python -m pytest tests
 ├── .gitignore
 └── README.md
 ```
