@@ -277,3 +277,69 @@ def test_launch_agent_plist():
     assert data["Label"] == "com.watashigpt.actionflow"
     assert data["ProgramArguments"][1].endswith("main.py")
     assert data["KeepAlive"] == {"SuccessfulExit": False}
+
+
+# ── Command palette controller (macOS UI logic, no AppKit needed) ──
+
+def _controller(text="some text here"):
+    cmds = main.load_config(main._CONFIG_EXAMPLE_PATH)["commands"]
+    ctx = main.AppContext("chat", "telegram", "telegram", "Telegram")
+    sugg = main.get_smart_suggestions(ctx, main.analyze_text(text), cmds)
+    return main._PaletteController(text, cmds, sugg), cmds
+
+
+def test_palette_items_sections_and_search():
+    ctl, cmds = _controller()
+    rows = ctl.items("", None)
+    assert rows[0] == {"header": True, "title": "Suggested"}
+    assert sum(1 for r in rows if not r.get("header")) == len(cmds)
+    assert ctl.items("summ", None)[0]["id"] == "summarize"
+    assert ctl.items("b64", None)[0]["id"] == "b64"          # by prefix
+    sentence = ctl.items("make it shorter", None)
+    assert sentence[0]["id"] == "custom" and sentence[0]["instruction"] == "make it shorter"
+    assert ctl.items("zzzz", None)[0]["id"] == "custom"
+
+
+def test_palette_actions(monkeypatch):
+    ctl, _ = _controller("hello world")
+    monkeypatch.setattr(main, "LLM_MODE", "mock")
+    assert ctl.activate({"id": "summarize", "title": "Summarize", "icon": "x", "tint": "purple"}, "")["kind"] == "message"
+    assert ctl.activate({"id": "b64"}, "")["kind"] == "run"
+    assert ctl.activate({"id": "count"}, "")["kind"] == "run"
+    assert ctl.activate({"id": "tone"}, "")["kind"] == "submenu"
+
+    monkeypatch.setattr(main, "LLM_MODE", "live")
+    seen = {}
+    monkeypatch.setattr(main, "_llm_stream", lambda prompt, model="": seen.setdefault("prompt", prompt) and iter(["ok"]))
+    action = ctl.activate({"id": "tone:casual", "title": "Casual"}, "")
+    assert action["kind"] == "stream" and action["cmd_name"] == "tone"
+    list(action["factory"]())
+    assert "casual tone" in seen["prompt"] and "hello world" in seen["prompt"]
+    custom = ctl.activate({"id": "custom", "instruction": "in French"}, "in French")
+    assert custom["kind"] == "stream"
+    assert ctl.items("", "trans")[0]["id"].startswith("trans:")
+    assert ctl.items("Kazakh", "trans")[-1]["id"] == "trans:Kazakh"
+
+
+def test_polite_phrase_runs_instantly():
+    ctl, _ = _controller("this sucks")
+    assert ctl.activate({"id": "polite", "title": "Make Polite", "icon": "x", "tint": "pink"}, "")["kind"] == "run"
+
+
+def test_llm_stream_falls_back_before_first_token(monkeypatch):
+    class Chunk:
+        def __init__(self, t):
+            self.choices = [type("C", (), {"delta": type("D", (), {"content": t})()})()]
+
+    class Good:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kw):
+                    return iter([Chunk("Hel"), Chunk("lo")])
+
+    monkeypatch.setattr(main, "_llm_ready", True)
+    monkeypatch.setattr(main, "_llm_client", _FailingClient)
+    monkeypatch.setattr(main, "_llm_fallback_ready", True)
+    monkeypatch.setattr(main, "_llm_fallback_client", Good)
+    assert "".join(main._llm_stream("hi")) == "Hello"

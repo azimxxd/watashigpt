@@ -151,6 +151,21 @@ On first launch grant your terminal app (Terminal, iTerm2, VS Code, …) two per
 | **Accessibility** | Send ⌘C / ⌘V to the focused app, swallow the hotkey |
 | **Input Monitoring** | Listen for the global hotkey |
 
+**Command palette** — a native Spotlight-style panel (AppKit, not Tk): vibrancy, SF Symbols,
+light/dark mode. It never steals focus from the app you're typing in, so results are pasted
+straight back.
+
+| Key | In the list | In the result preview |
+|-----|-------------|-----------------------|
+| type | search commands — or write any instruction (“make it shorter, in English”) | refine the result |
+| `↵` | run command / instruction | replace the selection (or apply the refinement) |
+| `↑` `↓` / `⌘1`–`⌘9` | navigate / pick | — |
+| `⇥` | — | regenerate |
+| `⌘C` | — | copy instead of replacing |
+| `esc` | close | back to the list |
+
+AI results stream into the preview first — nothing touches your text until you press `↵`.
+
 **Menu bar icon** (✨): mode, silent toggle, recent history, open/reload config, quit.
 
 **API keys** are stored in the macOS Keychain — the first-run setup offers it, or:
@@ -283,6 +298,7 @@ watashigpt/
 ├── action-middleware/
 │   ├── main.py              # Application code (~5400 lines)
 │   ├── platform_mac.py      # macOS backend (hotkeys, clipboard, focus, notifications)
+│   ├── mac_ui.py            # macOS command palette + result view (AppKit)
 │   ├── paste_helper.py      # Linux: portal paste + AT-SPI window detection (runs as user)
 │   ├── config.yaml.example  # Example config — copied to config.yaml on first run
 │   ├── requirements.txt     # Python dependencies (platform markers)

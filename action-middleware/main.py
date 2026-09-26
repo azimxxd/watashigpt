@@ -99,15 +99,23 @@ def _present_popup(win: "tk.Toplevel") -> None:
 
 _IS_MAC: bool = sys.platform == "darwin"
 _IS_LINUX: bool = sys.platform.startswith("linux")
+_NATIVE_UI: bool = False  # macOS AppKit palette (mac_ui.py) instead of Tk
 
 if _IS_LINUX:
     import keyboard
 elif _IS_MAC:
     import platform_mac as mac
+    try:
+        import mac_ui
+        _NATIVE_UI = True
+    except ImportError:  # PyObjC missing → Tk popup (if usable)
+        mac_ui = None
 else:
     import keyboard
     import pyperclip
     from plyer import notification
+
+_POPUP_AVAILABLE: bool = _NATIVE_UI or _TKINTER_AVAILABLE
 
 # ============================================================
 # Config Loading
@@ -393,10 +401,11 @@ class AppContext:
     }
 
     def __init__(self, context_type: str = "unknown", window_title: str = "",
-                 app_name: str = ""):
+                 app_name: str = "", display_name: str = ""):
         self.context_type = context_type
         self.window_title = window_title
         self.app_name = app_name
+        self.display_name = display_name  # e.g. "Telegram" (macOS)
 
     def __repr__(self) -> str:
         return f"AppContext({self.context_type}, app={self.app_name})"
@@ -431,11 +440,13 @@ def _parse_gdbus_eval_output(output: str) -> tuple[bool, str]:
 def detect_active_window() -> AppContext:
     """Detect the currently focused window. Uses xdotool (X11) or kdotool/swaymsg (Wayland)."""
     title = ""
+    display_name = ""
     try:
         if _IS_MAC:
             front = mac.frontmost_app()
             if front:
                 name, _pid, bundle_id = front
+                display_name = name
                 title = f"{name} {bundle_id}".lower()
         elif _IS_WAYLAND:
             # GNOME Wayland: try AT-SPI via paste helper first
@@ -486,9 +497,9 @@ def detect_active_window() -> AppContext:
     for ctx_type, patterns in AppContext.APP_PATTERNS.items():
         for pattern in patterns:
             if pattern in title:
-                return AppContext(ctx_type, title, pattern)
+                return AppContext(ctx_type, title, pattern, display_name)
 
-    return AppContext(AppContext.UNKNOWN, title, "")
+    return AppContext(AppContext.UNKNOWN, title, "", display_name)
 
 
 # ============================================================
@@ -1389,6 +1400,52 @@ def _llm_call(prompt: str, model: str = "", *, max_tokens: int | None = None,
             last_exc = fb_exc
 
     _last_llm_provider_used = ""
+    raise LLMError(str(last_exc)[:200]) from last_exc
+
+
+def _llm_stream(prompt: str, model: str = ""):
+    """Yield response text chunks as they arrive (primary, then fallback).
+
+    Falls back only if the primary fails before producing any output; a
+    failure mid-stream raises LLMError (the partial text is never pasted).
+    """
+    global _last_llm_provider_used
+    if not _llm_ready or not _llm_client:
+        raise LLMError("No LLM configured — set llm.provider in config.yaml")
+
+    llm_cfg = CONFIG.get("llm", {})
+    max_tokens = int(llm_cfg.get("max_tokens", 2048))
+    temperature = float(llm_cfg.get("temperature", 0.7))
+    candidates = [(_llm_client, model or _llm_model, _llm_provider)]
+    if _llm_fallback_ready and _llm_fallback_client:
+        candidates.append((_llm_fallback_client, model or _llm_fallback_model,
+                           f"{_llm_fallback_provider} (fallback)"))
+
+    last_exc: Exception | None = None
+    for client, use_model, provider in candidates:
+        produced = False
+        try:
+            stream = client.chat.completions.create(
+                model=use_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    produced = True
+                    yield delta
+            if not produced:
+                raise LLMError("empty response")
+            _last_llm_provider_used = provider
+            return
+        except Exception as exc:
+            if produced:
+                raise LLMError(f"connection lost mid-response: {exc}"[:200]) from exc
+            TUI.warn(f"LLM ({provider}) failed: {exc}")
+            last_exc = exc
     raise LLMError(str(last_exc)[:200]) from last_exc
 
 
@@ -2385,9 +2442,288 @@ if _TKINTER_AVAILABLE:
             return self._result
 
 
+# ============================================================
+# Command Palette — macOS native UI (mac_ui.py)
+# ============================================================
+
+# name → (title, SF Symbol, tint). Commands not listed get a generic look.
+_COMMAND_META: dict[str, tuple[str, str, str]] = {
+    "summarize": ("Summarize", "text.append", "purple"),
+    "rewrite": ("Rewrite", "pencil.line", "purple"),
+    "explain": ("Explain", "lightbulb", "yellow"),
+    "tone": ("Change Tone", "theatermasks", "pink"),
+    "trans": ("Translate", "globe", "teal"),
+    "polite": ("Make Polite", "hand.wave", "pink"),
+    "bullets": ("Bullet Points", "list.bullet", "purple"),
+    "title": ("Headline", "textformat.size", "purple"),
+    "tweet": ("Shorten to Tweet", "bubble.left", "blue"),
+    "email": ("Draft Email", "envelope", "blue"),
+    "meeting": ("Meeting Notes", "person.3", "indigo"),
+    "todo": ("Action Items", "checklist", "indigo"),
+    "eli5": ("Explain Simply", "face.smiling", "yellow"),
+    "haiku": ("Haiku", "leaf", "green"),
+    "roast": ("Roast", "flame", "red"),
+    "fill": ("Fill Placeholders", "square.and.pencil", "purple"),
+    "regex": ("Generate Regex", "asterisk", "orange"),
+    "docstring": ("Docstring", "doc.text", "orange"),
+    "review": ("Code Review", "checkmark.seal", "orange"),
+    "gitcommit": ("Commit Message", "arrow.triangle.branch", "orange"),
+    "fmt": ("Format JSON / YAML / XML", "curlybraces", "orange"),
+    "b64": ("Base64 Encode", "lock", "orange"),
+    "decode": ("Base64 Decode", "lock.open", "orange"),
+    "hash": ("SHA-256 Hash", "number.square", "orange"),
+    "escape": ("Escape Characters", "chevron.left.forwardslash.chevron.right", "orange"),
+    "calc": ("Calculate", "plus.forwardslash.minus", "blue"),
+    "date": ("Parse Date", "calendar", "blue"),
+    "count": ("Word Count", "number", "blue"),
+    "redact": ("Redact Personal Data", "eye.slash", "blue"),
+    "sanitize": ("Strip Formatting", "eraser", "blue"),
+    "mock": ("Mocking Case", "textformat.abc", "gray"),
+    "wiki": ("Wikipedia", "book", "green"),
+    "define": ("Define Word", "character.book.closed", "green"),
+    "image": ("Generate Image", "photo", "green"),
+    "command": ("Run Shell Command", "terminal", "gray"),
+    "password": ("Generate Password", "key", "gray"),
+    "repeat": ("Repeat Last Command", "arrow.clockwise", "gray"),
+    "clip": ("Clipboard Slots", "paperclip", "gray"),
+    "stack": ("Push to Clipboard Stack", "tray.and.arrow.down", "gray"),
+    "pop": ("Pop Clipboard Stack", "tray.and.arrow.up", "gray"),
+    "test": ("Test Pipeline", "stethoscope", "gray"),
+}
+
+# LLM-ish commands that still run immediately (their output isn't a text replacement)
+_PREVIEW_EXCLUDED = frozenset({"count", "define", "wiki", "image"})
+
+
+def _command_subtitle(cmd: dict) -> str:
+    desc = cmd.get("description", "")
+    return _re.sub(r"\s*\((?:LLM|notification only|phrase lookup \+ LLM|Pollinations\.ai)\)\s*$",
+                   "", desc).strip()
+
+
+def _fuzzy_score(query: str, name: str, cmd: dict, title: str) -> float:
+    """Rank a command for a search query (0 = no match)."""
+    q = query.lower().strip()
+    t = title.lower()
+    if t.startswith(q) or name.startswith(q):
+        return 100
+    if any(w.startswith(q) for w in t.split()):
+        return 80
+    if any(p.lower().rstrip(":").startswith(q) for p in cmd.get("prefixes", [])):
+        return 70
+    if q in t or q in name:
+        return 60
+    if any(q in k.lower() for k in cmd.get("keywords", [])):
+        return 40
+    if q in cmd.get("description", "").lower():
+        return 20
+    it = iter(t)
+    if len(q) >= 2 and all(ch in it for ch in q):  # subsequence: "sm" → "Summarize"
+        return 10
+    return 0
+
+
+class _PaletteController:
+    """Supplies items and actions to mac_ui.CommandPalette."""
+
+    def __init__(self, text: str, commands: dict, suggestions: list | None) -> None:
+        self.text = text
+        self.commands = commands
+        self.suggestions = suggestions or [(n, c, False) for n, c in sorted(commands.items())]
+
+    # ── items ──
+    def _item(self, name: str, cmd: dict) -> dict:
+        title, icon, tint = _COMMAND_META.get(name, (name.replace("_", " ").title(), "command", "gray"))
+        if cmd.get("_personal"):
+            title = name.replace("personal_", "").replace("_", " ").title()
+            icon, tint = "person.crop.circle", "pink"
+        item = {"id": name, "title": title, "icon": icon, "tint": tint,
+                "subtitle": _command_subtitle(cmd)}
+        if cmd.get("llm_required") or name == "polite":
+            live = LLM_MODE == "live"
+            item["tag"], item["tag_tint"] = ("AI", "purple") if live else ("No LLM", "gray")
+        return item
+
+    def _custom_item(self, query: str) -> dict:
+        return {"id": "custom", "title": f"Ask AI: {query}", "icon": "sparkles", "tint": "purple",
+                "subtitle": "Run as a custom instruction", "tag": "AI" if LLM_MODE == "live" else "No LLM",
+                "tag_tint": "purple" if LLM_MODE == "live" else "gray", "instruction": query}
+
+    def items(self, query: str, submenu: str | None) -> list[dict]:
+        query = query.strip()
+        if submenu == "tone":
+            styles = [st for st in _TONE_STYLES if query.lower() in st.lower()]
+            rows = [{"id": f"tone:{st}", "title": st.title(), "icon": "theatermasks", "tint": "pink",
+                     "subtitle": f"Rewrite in a {st} tone"} for st in styles]
+            if query and not any(st.lower() == query.lower() for st in styles):
+                rows.append({"id": f"tone:{query}", "title": query.title(), "icon": "plus",
+                             "tint": "pink", "subtitle": "Custom tone"})
+            return rows
+        if submenu == "trans":
+            langs = [l for l in _TRANS_LANGS if query.lower() in l[0].lower() or query.lower() == l[1].lower()]
+            rows = [{"id": f"trans:{code}", "title": name, "icon": "globe", "tint": "teal",
+                     "subtitle": f"{flag}  {code}"} for name, code, flag in langs]
+            if query and not langs:
+                rows.append({"id": f"trans:{query}", "title": f"Translate to {query}", "icon": "globe",
+                             "tint": "teal", "subtitle": "Custom language"})
+            return rows
+
+        if not query:
+            starred = [self._item(n, c) for n, c, star in self.suggestions if star]
+            rest = [self._item(n, c) for n, c, star in self.suggestions if not star]
+            if not starred:
+                return rest
+            return ([{"header": True, "title": "Suggested"}] + starred +
+                    [{"header": True, "title": "All Commands"}] + rest)
+
+        scored = []
+        for name, cmd in self.commands.items():
+            item = self._item(name, cmd)
+            score = _fuzzy_score(query, name, cmd, item["title"])
+            if score:
+                scored.append((score, item["title"], item))
+        matches = [item for _s, _t, item in sorted(scored, key=lambda x: (-x[0], x[1]))]
+        custom = self._custom_item(query)
+        # A sentence is an instruction; a word is probably a search.
+        if " " in query or not matches:
+            return [custom] + matches
+        return matches + [custom]
+
+    # ── actions ──
+    def _stream_action(self, cmd_name: str, cmd_config: dict, payload: str, title: str,
+                       icon: str, tint: str) -> dict:
+        if LLM_MODE != "live":
+            return {"kind": "message", "title": title,
+                    "text": "This command needs an LLM.\n\nSet llm.provider in config.yaml "
+                            "(or run setup on start) and save the API key with\n"
+                            "  python main.py --set-key <provider>"}
+        try:
+            prompt, model = _llm_prompt_for(cmd_name, cmd_config, payload)
+        except ValueError as exc:
+            return {"kind": "message", "title": title, "text": str(exc)}
+        return {"kind": "stream", "title": title, "icon": icon, "tint": tint,
+                "cmd_name": cmd_name, "cmd_config": cmd_config,
+                "factory": lambda: _llm_stream(prompt, model)}
+
+    def activate(self, item: dict, query: str) -> dict:
+        item_id = item["id"]
+        if item_id == "custom":
+            return self._stream_action("custom", {"instruction": item["instruction"], "llm_required": True},
+                                       self.text, f"Ask AI · {item['instruction']}", "sparkles", "purple")
+        if item_id.startswith("tone:"):
+            return self._stream_action("tone", self.commands.get("tone", {}),
+                                       f"{item_id[5:]}: {self.text}", f"Tone · {item['title']}",
+                                       "theatermasks", "pink")
+        if item_id.startswith("trans:"):
+            code = item_id[6:]
+            return self._stream_action("trans", self.commands.get("trans", {}), f"{code}: {self.text}",
+                                       f"Translate · {item['title']}", "globe", "teal")
+        if item_id == "tone":
+            return {"kind": "submenu", "id": "tone", "title": "Choose a tone…"}
+        if item_id == "trans":
+            return {"kind": "submenu", "id": "trans", "title": "Translate to… (type any language)"}
+
+        cmd = self.commands.get(item_id, {})
+        if item_id == "polite" and self.text.strip().lower() in cmd.get("phrases", {}):
+            return {"kind": "run"}  # instant phrase lookup
+        if (cmd.get("llm_required") or item_id == "polite") and item_id not in _PREVIEW_EXCLUDED:
+            return self._stream_action(item_id, cmd, self.text, item["title"], item["icon"], item["tint"])
+        return {"kind": "run"}
+
+    def refine(self, result_text: str, instruction: str) -> dict:
+        cfg = {"instruction": instruction, "llm_required": True}
+        action = self._stream_action("custom", cfg, result_text, f"Refined · {instruction}",
+                                     "sparkles", "purple")
+        return action
+
+
+def _palette_context_line(text: str) -> str:
+    preview = " ".join(text.split())
+    preview = preview[:70] + ("…" if len(preview) > 70 else "")
+    parts = [f"“{preview}”", f"{len(text)} chars"]
+    ta, ctx = _current_text_analysis, _current_app_context
+    if ta and ta.language:
+        parts.append(ta.language.upper())
+    if ta and ta.is_code:
+        parts.append(f"code · {ta.code_language}" if ta.code_language else "code")
+    if ctx and (ctx.display_name or ctx.context_type != "unknown"):
+        parts.append(ctx.display_name or ctx.context_type)
+    return "  ·  ".join(parts)
+
+
+def _palette_status_line() -> str:
+    if LLM_MODE == "live":
+        return f"{_llm_provider} · {_llm_model}"
+    return "Mock mode — no LLM configured"
+
+
+def _commit_generated(cmd_name: str, cmd_config: dict, text: str, result: str,
+                      seconds: float) -> None:
+    """Paste an accepted palette result and record it like dispatch() does."""
+    global _last_command
+    with _usage_lock:
+        _usage_counts[cmd_name] = _usage_counts.get(cmd_name, 0) + 1
+    _last_command = {"name": cmd_name, "config": cmd_config}
+    _push_undo(text, result)
+    _replace_selection(result, announce=False)
+    TUI.activity_entry(cmd_name, text, result, seconds, is_llm=True, trigger="popup")
+    _log_history(cmd_name, text, result, int(seconds * 1000),
+                 app_context=_current_app_context.context_type if _current_app_context else "",
+                 text_length=len(text),
+                 text_language=_current_text_analysis.language if _current_text_analysis else "",
+                 trigger="popup")
+
+
+def _handle_native_palette(text: str, source_window: str | None) -> None:
+    global _popup_trigger, _dispatch_busy, _current_source_window
+    commands = CONFIG.get("commands", {})
+    suggestions = None
+    if _current_app_context and _current_text_analysis:
+        pattern_scores = (_pattern_learner.get_scores(_current_app_context.context_type)
+                          if _pattern_learner else {})
+        suggestions = get_smart_suggestions(_current_app_context, _current_text_analysis,
+                                            commands, pattern_scores=pattern_scores)
+
+    controller = _PaletteController(text, commands, suggestions)
+    palette = mac_ui.CommandPalette(controller, context=_palette_context_line(text),
+                                    status=_palette_status_line())
+    outcome = palette.run()
+    if not outcome:
+        TUI.micro_log("Command palette closed")
+        return
+    if outcome["kind"] == "copied":
+        TUI.micro_log("Result copied to clipboard")
+        return
+
+    _popup_trigger = "popup"
+    _dispatch_busy = True
+    _current_source_window = source_window
+    try:
+        if outcome["kind"] == "replace":
+            spec = palette._stream_spec or {}
+            cmd_name = spec.get("cmd_name", outcome["item"]["id"])
+            TUI.status("🎯", f"Palette → {cmd_name}", TUI.GREEN)
+            _commit_generated(cmd_name, spec.get("cmd_config", {}), text,
+                              outcome["text"], outcome["seconds"])
+        else:  # "run": instant built-in command
+            name = outcome["item"]["id"]
+            TUI.status("🎯", f"Palette → {name}", TUI.GREEN)
+            dispatch(name, text, text, commands.get(name, {}))
+    except Exception as exc:
+        TUI.error(f"Palette action failed: {exc}")
+        notify(APP_NAME, f"Failed: {exc}", is_error=True)
+    finally:
+        _dispatch_busy = False
+        _current_source_window = None
+
+
 def _handle_popup(text: str, source_window: str | None = None) -> None:
     """Show the command picker popup and dispatch the chosen command."""
     global _popup_trigger, _dispatch_busy, _current_source_window
+
+    if _NATIVE_UI:
+        _handle_native_palette(text, source_window)
+        return
 
     if not _TKINTER_AVAILABLE:
         TUI.warn("tkinter not available — cannot show popup")
@@ -2928,7 +3264,7 @@ def _refocus_source_window_for_paste() -> None:
         _focus_by_alt_tab()
 
 
-def _replace_selection(new_text: str) -> None:
+def _replace_selection(new_text: str, announce: bool = True) -> None:
     if _chain_suppress_paste:
         # Intermediate chain step — store result but don't paste
         TUI.success("Chain step complete (output passed to next step)")
@@ -2956,8 +3292,9 @@ def _replace_selection(new_text: str) -> None:
 
     TUI.success("Text replaced in-place")
     TUI.micro_log("Paste sequence complete")
-    truncated = new_text[:60] + ("..." if len(new_text) > 60 else "")
-    notify(APP_NAME, f"Done: \"{truncated}\"")
+    if announce:
+        truncated = new_text[:60] + ("..." if len(new_text) > 60 else "")
+        notify(APP_NAME, f"Done: \"{truncated}\"")
 
 
 # ============================================================
@@ -3102,13 +3439,8 @@ def handle_polite(text: str, full_text: str, cmd_config: dict) -> None:
     if result is None:
         if _llm_ready:
             TUI.status("\U0001f916", "Rewriting politely with LLM...", TUI.CYAN)
-            prompt = (
-                "Rewrite the following text to be polite and professional. "
-                "Keep the same meaning but make it appropriate for a workplace. "
-                "Return ONLY the rewritten text, nothing else:\n\n"
-                f"{text.strip()}"
-            )
-            result = _llm_call(prompt)
+            prompt, model = _llm_prompt_for("polite", cmd_config, text)
+            result = _llm_call(prompt, model=model)
         else:
             notify(APP_NAME, "LLM not configured — cannot rewrite. Use POL: with a provider.")
             TUI.warn("No phrase match and LLM unavailable — text unchanged")
@@ -3224,6 +3556,84 @@ def handle_test(text: str, full_text: str, cmd_config: dict) -> None:
     notify("Test", f"Pipeline OK: \"{content[:60]}\"")
 
 
+_CUSTOM_INSTRUCTION_PROMPT = (
+    "{instruction}\n\n"
+    "Apply the instruction above to the text below. Reply with ONLY the resulting "
+    "text — no preamble, no quotes, no explanations. Keep the original language "
+    "unless the instruction asks for another one.\n\nText:\n{text}"
+)
+
+
+def _prompt_context_vars(text: str) -> dict:
+    """Variables available to config.yaml prompt templates."""
+    fmt_vars = {"text": text.strip()}
+    ta = _current_text_analysis
+    if ta:
+        fmt_vars["code_language"] = ta.code_language or "unknown"
+        fmt_vars["looks_like"] = ta.looks_like
+        fmt_vars["language"] = ta.language
+        fmt_vars["is_code"] = str(ta.is_code)
+        ctx_parts = []
+        if ta.is_code:
+            ctx_parts.append(f"code ({ta.code_language or 'unknown language'})")
+        if not ta.is_formal:
+            ctx_parts.append("informal tone")
+        ctx_parts.append(f"looks like: {ta.looks_like}")
+        fmt_vars["context"] = ", ".join(ctx_parts)
+    else:
+        fmt_vars.update(context="general text", code_language="unknown",
+                        looks_like="prose", language="en", is_code="False")
+    fmt_vars["app_context"] = _current_app_context.context_type if _current_app_context else "unknown"
+    return fmt_vars
+
+
+def _llm_prompt_for(cmd_name: str, cmd_config: dict, text: str) -> tuple[str, str]:
+    """(prompt, model) for any LLM-backed command.
+
+    `text` is the command payload (for TONE "style: text", for TRANS
+    "LANG: text"). Raises ValueError with a user-facing message on bad input.
+    """
+    model = cmd_config.get("model", "")
+    body = text.strip()
+
+    if cmd_name == "custom":
+        instruction = (cmd_config.get("instruction") or "").strip()
+        if not instruction:
+            raise ValueError("Type an instruction first")
+        return (_CUSTOM_INSTRUCTION_PROMPT.replace("{instruction}", instruction)
+                .replace("{text}", body), model)
+
+    if cmd_config.get("_personal"):
+        parts = [f"Task: {cmd_config['description']}", ""] if cmd_config.get("description") else []
+        for ex in cmd_config.get("examples", []):
+            parts += [f"Input: {ex['input']}", f"Output: {ex['output']}", ""]
+        parts += [f"Input: {body}", "Output:"]
+        return "\n".join(parts), model
+
+    if cmd_name == "tone":
+        m = _TONE_STYLE_RE.match(text)
+        if not m or not text[m.end():].strip():
+            raise ValueError("TONE needs a style and text, e.g. TONE:casual: hello")
+        return (f"Rewrite the following text in a {m.group(1).lower()} tone. "
+                f"Return ONLY the rewritten text, nothing else:\n\n{text[m.end():].strip()}", model)
+
+    if cmd_name == "trans":
+        m = _TRANS_LANG_RE.match(text)
+        if not m or not text[m.end():].strip():
+            raise ValueError("TRANS needs a language and text, e.g. TRANS:JP: hello")
+        template = cmd_config.get("llm_prompt", "Translate to {lang}: {text}")
+        return _format_prompt(template, {"lang": m.group(1).upper(),
+                                         "text": text[m.end():].strip()}), model
+
+    if cmd_name == "polite":
+        return ("Rewrite the following text to be polite and professional. "
+                "Keep the same meaning but make it appropriate for a workplace. "
+                f"Return ONLY the rewritten text, nothing else:\n\n{body}", model)
+
+    template = cmd_config.get("llm_prompt", "Process this text: {text}")
+    return _format_prompt(template, _prompt_context_vars(text)), model
+
+
 class _KeepMissing(dict):
     """format_map helper: unknown {placeholders} are left as-is."""
     def __missing__(self, key: str) -> str:
@@ -3266,38 +3676,7 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict,
         notify(cmd_name, result)
         return
 
-    prompt_template = cmd_config.get("llm_prompt", "Process this text: {text}")
-
-    # Build context variables for smart prompt injection
-    fmt_vars = {"text": text.strip()}
-    if _current_text_analysis:
-        fmt_vars["code_language"] = _current_text_analysis.code_language or "unknown"
-        fmt_vars["looks_like"] = _current_text_analysis.looks_like
-        fmt_vars["language"] = _current_text_analysis.language
-        fmt_vars["is_code"] = str(_current_text_analysis.is_code)
-        # Build a context hint string
-        ctx_parts = []
-        if _current_text_analysis.is_code:
-            ctx_parts.append(f"code ({_current_text_analysis.code_language or 'unknown language'})")
-        if not _current_text_analysis.is_formal:
-            ctx_parts.append("informal tone")
-        ctx_parts.append(f"looks like: {_current_text_analysis.looks_like}")
-        fmt_vars["context"] = ", ".join(ctx_parts) if ctx_parts else "general text"
-    else:
-        fmt_vars["context"] = "general text"
-        fmt_vars["code_language"] = "unknown"
-        fmt_vars["looks_like"] = "prose"
-        fmt_vars["language"] = "en"
-        fmt_vars["is_code"] = "False"
-
-    if _current_app_context:
-        fmt_vars["app_context"] = _current_app_context.context_type
-    else:
-        fmt_vars["app_context"] = "unknown"
-
-    prompt = _format_prompt(prompt_template, fmt_vars)
-
-    cmd_model = cmd_config.get("model", "")
+    prompt, cmd_model = _llm_prompt_for(cmd_key, cmd_config, text)
 
     TUI.status("\U0001f916", f"Processing with LLM...", TUI.CYAN)
 
@@ -3872,11 +4251,7 @@ def handle_tone(text: str, full_text: str, cmd_config: dict) -> None:
         notify(f"Tone ({style})", result)
         return
 
-    prompt = (
-        f"Rewrite the following text in a {style} tone. "
-        f"Return ONLY the rewritten text, nothing else:\n\n{body}"
-    )
-    cmd_model = cmd_config.get("model", "")
+    prompt, cmd_model = _llm_prompt_for("tone", cmd_config, text)
 
     TUI.status("🎨", f"Rewriting in {style} tone...", TUI.CYAN)
     notify(APP_NAME, f"Rewriting in {style} tone...")
@@ -3918,9 +4293,7 @@ def handle_trans(text: str, full_text: str, cmd_config: dict) -> None:
         notify(f"Translated ({lang_code})", result)
         return
 
-    prompt_template = cmd_config.get("llm_prompt", "Translate to {lang}: {text}")
-    prompt = _format_prompt(prompt_template, {"lang": lang_code, "text": body})
-    cmd_model = cmd_config.get("model", "")
+    prompt, cmd_model = _llm_prompt_for("trans", cmd_config, text)
 
     TUI.status("🌐", f"Translating to {lang_code} with LLM...", TUI.CYAN)
     notify(APP_NAME, f"Translating to {lang_code}...")
@@ -4283,20 +4656,7 @@ def handle_personal_command(text: str, full_text: str, cmd_config: dict) -> None
         TUI.action("👤", "PERSONAL", f"[MOCK] {cmd_config.get('description', '')[:50]}")
         return
 
-    examples = cmd_config.get("examples", [])
-    prompt_parts = []
-    if cmd_config.get("description"):
-        prompt_parts.append(f"Task: {cmd_config['description']}")
-    prompt_parts.append("")
-    for ex in examples:
-        prompt_parts.append(f"Input: {ex['input']}")
-        prompt_parts.append(f"Output: {ex['output']}")
-        prompt_parts.append("")
-    prompt_parts.append(f"Input: {text.strip()}")
-    prompt_parts.append("Output:")
-
-    prompt = "\n".join(prompt_parts)
-    model = cmd_config.get("model", "")
+    prompt, model = _llm_prompt_for("personal", cmd_config, text)
     result = _llm_call(prompt, model=model)
 
     _push_undo(full_text, result)
@@ -4760,7 +5120,7 @@ def _do_intercept() -> None:
             return
 
         # No prefix: open command picker popup
-        if _TKINTER_AVAILABLE:
+        if _POPUP_AVAILABLE:
             if _dispatch_busy:
                 notify(APP_NAME, "⏳ Command still processing — please wait")
                 TUI.warn("Hotkey ignored — command still processing")
@@ -5259,7 +5619,9 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     # Start system tray icon. On macOS both pystray and Tk need the main
     # thread's run loop, so the tray is Linux-only for now.
     if _IS_MAC:
-        if _TKINTER_AVAILABLE:
+        if _NATIVE_UI:
+            mac_ui.init_app()  # NSApplication on the main thread (accessory: no Dock icon)
+        elif _TKINTER_AVAILABLE:
             _get_tk_root()  # create Tk (and its NSApplication) on the main thread
     elif not no_tray:
         threading.Thread(target=_start_tray, daemon=True).start()
@@ -5273,7 +5635,7 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     # Initialize silent mode from config
     _silent_mode = CONFIG.get("silent_mode", False)
 
-    if _IS_MAC and _TKINTER_AVAILABLE and not no_tray:
+    if _NATIVE_UI and not no_tray:
         _start_mac_menubar()
 
     # Register personal commands from config
@@ -5296,7 +5658,7 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
         (silent_hotkey, on_silent_triggered),
     ]
     if _IS_MAC:
-        if _TK_TOO_OLD:
+        if _TK_TOO_OLD and not _NATIVE_UI:
             TUI.box("Popup disabled", [
                 f"  {TUI.YELLOW}This Python uses Apple's Tk {tk.TkVersion}, which hangs on modern macOS.{TUI.RESET}",
                 f"  {TUI.DIM}Prefix commands still work: select \"SUM: text\" and press the hotkey.{TUI.RESET}",
@@ -5347,9 +5709,11 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
                     except Exception as exc:
                         TUI.warn(f"Main-thread task failed: {exc}")
 
-                # Keep Tk's event loop alive between popups (otherwise macOS
-                # marks the process as "not responding")
-                if _tk_root is not None:
+                # Keep the Cocoa / Tk event loop alive between popups (menu bar
+                # clicks; otherwise macOS marks the process as "not responding")
+                if _NATIVE_UI:
+                    mac_ui.pump(0)
+                elif _tk_root is not None:
                     try:
                         _tk_root.update()
                     except Exception:
@@ -5377,7 +5741,10 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
                     if interactive:
                         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                     try:
-                        if _TKINTER_AVAILABLE:
+                        if _NATIVE_UI:
+                            if mac_ui.show_result(result_title, result_text, _palette_status_line()):
+                                TUI.micro_log("Result copied to clipboard")
+                        elif _TKINTER_AVAILABLE:
                             result_popup = ResultPopup(result_title, result_text)
                             result_popup.run()
                     except Exception as exc:

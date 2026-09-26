@@ -13,6 +13,7 @@ watashigpt/
 ├── action-middleware/
 │   ├── main.py             # Application code (~5400 lines)
 │   ├── platform_mac.py     # macOS backend — all PyObjC/osascript code lives here
+│   ├── mac_ui.py           # macOS command palette (AppKit NSPanel) — UI only
 │   ├── paste_helper.py     # Linux/GNOME Wayland portal helper (runs as the real user)
 │   ├── config.yaml.example # Copied to config.yaml (gitignored) on first run
 │   ├── requirements.txt    # Platform markers: keyboard (Linux), pyobjc (macOS)
@@ -87,7 +88,8 @@ instead of touching the real clipboard. End-to-end check (manual):
 - **macOS menu bar**: `platform_mac.StatusBar` (NSStatusItem) replaces the pystray tray on macOS. Clicks arrive while Tk pumps events; anything touching AppKit/Tk from worker threads goes through `_run_on_main()`
 - **API keys**: `_resolve_api_key()` — env var → config.yaml → keyring (`ActionFlow` service, accounts `llm:<provider>` / `image:<provider>`). `--set-key` stores one
 - **Autostart**: macOS `--install` writes a LaunchAgent (`com.watashigpt.actionflow`), Linux `--install` a systemd unit. Without a TTY the TUI prints plain text; `_acquire_single_instance_lock()` prevents two instances
-- **macOS Tk**: Tk must stay on the main thread; the main loop calls `_tk_root.update()` every tick; `_present_popup()` activates our own process so the popup gets keyboard focus
+- **macOS palette**: `mac_ui.CommandPalette` is a non-activating NSPanel driven by `_PaletteController` (main.py), which supplies rows and decides per item: `run` (dispatch a built-in), `stream` (LLM preview via `_llm_stream`), `submenu` (tone/trans) or `message`. Accepted previews go through `_commit_generated()`. All LLM prompts come from `_llm_prompt_for()` — add new prompt logic there, not in handlers. Tk is not used on macOS when PyObjC is present (`_NATIVE_UI`)
+- **macOS Tk** (fallback only): Tk must stay on the main thread; the main loop calls `_tk_root.update()` every tick; `_present_popup()` activates our own process so the popup gets keyboard focus
 - **`_run_as_user()`**: runs subprocess commands as the real user when executing under `sudo` (Linux only; never run with sudo on macOS)
 - **Provider registry**: `_PROVIDER_BASE_URLS` and `_PROVIDER_DEFAULT_MODELS` dicts for clean multi-provider support
 - **Config loading**: `load_config()` deep-copies defaults; `hotkeys`/`llm`/`image_api` are merged key-by-key, every other top-level key is taken as-is. Falls back to `config.yaml.example` when `config.yaml` is missing
