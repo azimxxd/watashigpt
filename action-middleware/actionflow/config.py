@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 import yaml
+from actionflow.product import writing_commands
 
 APP_DIR = Path(__file__).resolve().parent.parent          # action-middleware/
 CONFIG_PATH = APP_DIR / "config.yaml"
@@ -55,6 +56,7 @@ def load_config(path: Path | None = None) -> dict:
     if not path.exists() and path == CONFIG_PATH and CONFIG_EXAMPLE_PATH.exists():
         path = CONFIG_EXAMPLE_PATH  # full command set until the user creates a config
     cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["commands"] = writing_commands(cfg["commands"])
     if not path.exists():
         return cfg
     try:
@@ -64,7 +66,7 @@ def load_config(path: Path | None = None) -> dict:
             raise ValueError("top level must be a mapping")
     except Exception as exc:
         print(f"  Warning: Failed to load config.yaml: {exc}")
-        print(f"  Falling back to defaults.")
+        print("  Falling back to defaults.")
         return cfg
 
     for key, value in user_cfg.items():
@@ -72,6 +74,7 @@ def load_config(path: Path | None = None) -> dict:
             cfg[key] = {**cfg.get(key, {}), **value}
         elif value is not None:
             cfg[key] = value
+    cfg["commands"] = writing_commands(cfg["commands"])
     return cfg
 
 
@@ -134,7 +137,15 @@ def save_nested(path: list[str], values: dict) -> None:
     edited: str | None = text
     for key, value in values.items():
         edited = _set_path(edited, path + [key], value) if edited is not None else None
-    if edited is None or yaml.safe_load(edited) is None and values:
+    try:
+        parsed = yaml.safe_load(edited) if edited is not None else None
+        node = parsed
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        valid = isinstance(node, dict) and all(node.get(k) == v for k, v in values.items())
+    except yaml.YAMLError:
+        valid = False
+    if not valid:
         data = (yaml.safe_load(text) or {}) if text else {}
         node = data
         for key in path:

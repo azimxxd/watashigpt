@@ -6,7 +6,8 @@ from __future__ import annotations
 import re
 from typing import Callable
 
-from actionflow import llm
+from actionflow import llm, preferences
+from actionflow.product import CORE_COMMANDS, TOOLS, DEVELOPER_TOOLS, writing_commands
 
 TONE_STYLES = ["casual", "formal", "friendly", "confident", "empathetic", "diplomatic",
                "concise", "academic", "professional email", "encouraging", "sarcastic", "gen-z"]
@@ -26,6 +27,9 @@ TRANS_LANGS = [
 
 # name → (title, SF Symbol, tint). Commands not listed get a generic look.
 COMMAND_META: dict[str, tuple[str, str, str]] = {
+    "proofread": ("Fix mistakes", "checkmark.circle", "blue"),
+    "clarify": ("Make clearer", "text.alignleft", "purple"),
+    "shorten": ("Shorten", "arrow.down.right.and.arrow.up.left", "orange"),
     "summarize": ("Summarize", "text.append", "purple"),
     "rewrite": ("Rewrite", "pencil.line", "purple"),
     "explain": ("Explain", "lightbulb", "yellow"),
@@ -102,116 +106,163 @@ def fuzzy_score(query: str, name: str, cmd: dict, title: str) -> float:
 
 
 class PaletteController:
-    """Supplies items and actions to mac_ui.CommandPalette."""
+    """Shared small writing palette for AppKit and Tk."""
 
-    def __init__(self, text: str, commands: dict, suggestions: list | None,
-                 prompt_for: Callable[[str, dict, str], tuple[str, str]]) -> None:
-        self.prompt_for = prompt_for  # (cmd_name, cmd_config, payload) → (prompt, model)
+    def __init__(self, text: str, commands: dict, suggestions=None,
+                 prompt_for: Callable | None = None) -> None:
         self.text = text
-        self.commands = commands
-        self.suggestions = suggestions or [(n, c, False) for n, c in sorted(commands.items())]
+        self.demo = False
+        self.commands = writing_commands(commands)
+        self.prompt_for = prompt_for
+        self.preferences = preferences.load()
 
-    # ── items ──
+    def refresh(self) -> None:
+        self.preferences = preferences.load()
+
     def _item(self, name: str, cmd: dict) -> dict:
-        title, icon, tint = COMMAND_META.get(name, (name.replace("_", " ").title(), "command", "gray"))
-        if cmd.get("_personal"):
-            title = name.replace("personal_", "").replace("_", " ").title()
-            icon, tint = "person.crop.circle", "pink"
-        item = {"id": name, "title": title, "icon": icon, "tint": tint,
-                "subtitle": command_subtitle(cmd)}
-        if cmd.get("llm_required") or name == "polite":
-            live = llm.MODE == "live"
-            item["tag"], item["tag_tint"] = ("AI", "purple") if live else ("No LLM", "gray")
-        return item
+        title, icon, tint = COMMAND_META.get(name, (name.replace('_', ' ').title(), 'command', 'gray'))
+        if cmd.get('_personal'):
+            title = name.replace('personal_', '').replace('_', ' ').title()
+        if name == 'trans':
+            title = 'Translate to ' + self.preferences['language']
+        return {'id':name, 'title':title, 'icon':icon, 'tint':tint,
+                'subtitle':command_subtitle(cmd),
+                'tag':'Last used' if self.preferences['last_action'] == name else ''}
+
+    @staticmethod
+    def _nav(name: str, title: str, subtitle: str = '', icon: str = 'gearshape') -> dict:
+        return {'id':name, 'title':title, 'subtitle':subtitle, 'icon':icon, 'tint':'gray'}
 
     def _custom_item(self, query: str) -> dict:
-        return {"id": "custom", "title": f"Ask AI: {query}", "icon": "sparkles", "tint": "purple",
-                "subtitle": "Run as a custom instruction", "tag": "AI" if llm.MODE == "live" else "No LLM",
-                "tag_tint": "purple" if llm.MODE == "live" else "gray", "instruction": query}
+        return {'id':'custom', 'title':query, 'instruction':query, 'icon':'sparkles',
+                'tint':'purple', 'subtitle':'Apply your instruction to the selected text'}
+
+    def _settings(self) -> list[dict]:
+        p = self.preferences
+        rows = [self._nav('languages', 'Translation language', p['language'], 'globe'),
+                self._nav('providers', 'Connect AI' if not llm.ready else 'Change AI provider',
+                          llm.provider if llm.ready else 'Bring your API key or use a local model', 'network'),
+                self._nav('toggle:show_tools', 'Additional tools', 'On' if p['show_tools'] else 'Off'),
+                self._nav('toggle:developer_tools', 'Developer tools', 'On' if p['developer_tools'] else 'Off'),
+                self._nav('saved', 'Manage saved actions', f"{len(p['saved_actions'])} saved", 'star'),
+                self._nav('toggle:metrics_enabled', 'Local usage counts', 'On · never sent anywhere' if p['metrics_enabled'] else 'Off · no text collected'),
+                self._nav('metrics', 'View local counts'),
+                self._nav('help', 'How to use ActionFlow', 'Shortcuts, privacy and safe undo', 'questionmark.circle')]
+        return rows
 
     def items(self, query: str, submenu: str | None) -> list[dict]:
         query = query.strip()
-        if submenu == "tone":
-            styles = [st for st in TONE_STYLES if query.lower() in st.lower()]
-            rows = [{"id": f"tone:{st}", "title": st.title(), "icon": "theatermasks", "tint": "pink",
-                     "subtitle": f"Rewrite in a {st} tone"} for st in styles]
-            if query and not any(st.lower() == query.lower() for st in styles):
-                rows.append({"id": f"tone:{query}", "title": query.title(), "icon": "plus",
-                             "tint": "pink", "subtitle": "Custom tone"})
-            return rows
-        if submenu == "trans":
+        if submenu == 'trans':
             langs = [l for l in TRANS_LANGS if query.lower() in l[0].lower() or query.lower() == l[1].lower()]
-            rows = [{"id": f"trans:{name}", "title": name, "icon": "globe", "tint": "teal",
-                     "subtitle": f"{flag}  {code}"} for name, code, flag in langs]
-            if query and not langs:
-                rows.append({"id": f"trans:{query}", "title": f"Translate to {query}", "icon": "globe",
-                             "tint": "teal", "subtitle": "Custom language"})
+            rows = [self._nav('language:' + name, name, flag + '  ' + code, 'globe') for name, code, flag in langs]
+            if query and not langs: rows.append(self._nav('language:' + query, query, 'Use this language', 'globe'))
             return rows
+        if submenu == 'tone':
+            return [self._nav('tone:' + st, st.title(), 'Rewrite in this tone', 'theatermasks')
+                    for st in TONE_STYLES if query.lower() in st.lower()]
+        if submenu == 'settings': rows = self._settings()
+        elif submenu == 'providers':
+            rows = [self._nav('provider:' + name, info.label.split(' —')[0],
+                             'Runs on your machine' if info.local else 'API key required', 'network')
+                    for name, info in llm.PROVIDERS.items()]
+        elif submenu == 'saved':
+            rows = [self._nav('delete:' + x['id'], x['name'], 'Remove saved action', 'trash')
+                    for x in self.preferences['saved_actions']]
+        elif submenu in ('tools','developer'):
+            names = TOOLS if submenu == 'tools' else DEVELOPER_TOOLS
+            rows = [self._item(n,self.commands[n]) for n in names if n in self.commands]
+        else:
+            rows = [self._item(n, self.commands[n]) for n in CORE_COMMANDS]
+            for x in self.preferences['saved_actions']:
+                rows.append({'id':'saved:' + x['id'], 'title':x['name'], 'subtitle':x['instruction'],
+                             'instruction':x['instruction'], 'icon':'star.fill', 'tint':'yellow'})
+            # Existing personal commands stay accessible as favorites.
+            rows += [self._item(n,c) for n,c in self.commands.items() if c.get('_personal')]
+            if not query:
+                if self.preferences['show_tools']: rows.append(self._nav('tools','Additional tools',icon='wrench'))
+                if self.preferences['developer_tools']: rows.append(self._nav('developer','Developer tools',icon='chevron.left.forwardslash.chevron.right'))
+                rows.append(self._nav('settings','Settings', 'Language, saved actions and AI connection'))
+                if not llm.ready:
+                    rows.insert(0,self._nav('providers','Connect AI to get started','Choose a provider or a local model','sparkles'))
+                return rows
+            scored = [(fuzzy_score(query, r['id'], {'description':r.get('subtitle','')}, r['title']), r) for r in rows]
+            matches = [r for score,r in sorted(scored,key=lambda x:-x[0]) if score]
+            custom = self._custom_item(query)
+            return ([custom] + matches) if ' ' in query or not matches else (matches + [custom])
+        return [r for r in rows if not query or query.lower() in (r['title'] + ' ' + r.get('subtitle','')).lower()]
 
-        if not query:
-            starred = [self._item(n, c) for n, c, star in self.suggestions if star]
-            rest = [self._item(n, c) for n, c, star in self.suggestions if not star]
-            if not starred:
-                return rest
-            return ([{"header": True, "title": "Suggested"}] + starred +
-                    [{"header": True, "title": "All Commands"}] + rest)
-
-        scored = []
-        for name, cmd in self.commands.items():
-            item = self._item(name, cmd)
-            score = fuzzy_score(query, name, cmd, item["title"])
-            if score:
-                scored.append((score, item["title"], item))
-        matches = [item for _s, _t, item in sorted(scored, key=lambda x: (-x[0], x[1]))]
-        custom = self._custom_item(query)
-        # A sentence is an instruction; a word is probably a search.
-        if " " in query or not matches:
-            return [custom] + matches
-        return matches + [custom]
-
-    # ── actions ──
-    def _stream_action(self, cmd_name: str, cmd_config: dict, payload: str, title: str,
-                       icon: str, tint: str) -> dict:
-        if llm.MODE != "live":
-            return {"kind": "message", "title": title,
-                    "text": "This command needs an LLM.\n\nSet llm.provider in config.yaml "
-                            "(or run setup on start) and save the API key with\n"
-                            "  python main.py --set-key <provider>"}
+    def _stream_action(self, cmd_name: str, cmd_config: dict, payload: str,
+                       title: str, icon: str = 'sparkles', tint: str = 'purple') -> dict:
+        if not llm.ready:
+            return {'kind':'submenu', 'id':'providers', 'title':'Connect AI to get started'}
         try:
             prompt, model = self.prompt_for(cmd_name, cmd_config, payload)
         except ValueError as exc:
-            return {"kind": "message", "title": title, "text": str(exc)}
-        return {"kind": "stream", "title": title, "icon": icon, "tint": tint,
-                "cmd_name": cmd_name, "cmd_config": cmd_config,
-                "factory": lambda: llm.stream(prompt, model)}
+            return {'kind':'message','title':title,'text':str(exc)}
+        return {'kind':'stream','title':title,'icon':icon,'tint':tint,'cmd_name':cmd_name,
+                'cmd_config':cmd_config, 'factory':lambda:llm.stream(prompt,model)}
 
     def activate(self, item: dict, query: str) -> dict:
-        item_id = item["id"]
-        if item_id == "custom":
-            return self._stream_action("custom", {"instruction": item["instruction"], "llm_required": True},
-                                       self.text, f"Ask AI · {item['instruction']}", "sparkles", "purple")
-        if item_id.startswith("tone:"):
-            return self._stream_action("tone", self.commands.get("tone", {}),
-                                       f"{item_id[5:]}: {self.text}", f"Tone · {item['title']}",
-                                       "theatermasks", "pink")
-        if item_id.startswith("trans:"):
-            code = item_id[6:]
-            return self._stream_action("trans", self.commands.get("trans", {}), f"{code}: {self.text}",
-                                       f"Translate · {item['title']}", "globe", "teal")
-        if item_id == "tone":
-            return {"kind": "submenu", "id": "tone", "title": "Choose a tone…"}
-        if item_id == "trans":
-            return {"kind": "submenu", "id": "trans", "title": "Translate to… (type any language)"}
-
-        cmd = self.commands.get(item_id, {})
-        if item_id == "polite" and self.text.strip().lower() in cmd.get("phrases", {}):
-            return {"kind": "run"}  # instant phrase lookup
-        if (cmd.get("llm_required") or item_id == "polite") and item_id not in PREVIEW_EXCLUDED:
-            return self._stream_action(item_id, cmd, self.text, item["title"], item["icon"], item["tint"])
-        return {"kind": "run"}
+        key = item['id']
+        menus = {'settings':'Settings', 'languages':'Choose a translation language',
+                 'providers':'Connect AI', 'saved':'Remove a saved action',
+                 'tools':'Additional tools', 'developer':'Developer tools', 'tone':'Choose a tone'}
+        if key in menus:
+            return {'kind':'submenu','id':'trans' if key == 'languages' else key,'title':menus[key]}
+        if key.startswith('toggle:'):
+            name = key.split(':',1)[1]
+            if name not in {'show_tools','developer_tools','metrics_enabled'}: raise ValueError('Unknown setting')
+            self.preferences = preferences.update(**{name:not self.preferences[name]})
+            return {'kind':'reload'}
+        if key.startswith('language:'):
+            language = key.split(':',1)[1]
+            from actionflow.prompts import TRANS_LANG_RE
+            if not TRANS_LANG_RE.fullmatch(language + ':'):
+                return {'kind':'message','title':'Language','text':'Enter a language name, for example Russian or Brazilian Portuguese.'}
+            self.preferences = preferences.update(language=language)
+            return {'kind':'home'}
+        if key.startswith('provider:'): return {'kind':'connect','provider':key.split(':',1)[1]}
+        if key.startswith('delete:'): return {'kind':'delete','id':key.split(':',1)[1],'title':item['title']}
+        if key == 'metrics':
+            counts = self.preferences['metrics']
+            return {'kind':'message','title':'Local usage counts',
+                    'text':'Only aggregate counters. No text or app names. Nothing is uploaded.\n\n' +
+                           ('\n'.join(f'{k}: {v}' for k,v in sorted(counts.items())) or 'No counts collected. Enable them in Settings if you want to evaluate your usage.')}
+        if key == 'help':
+            return {'kind':'message','title':'Write, select, improve',
+                    'text':'1. Select text in any app and press Ctrl+Alt+X.\n2. Choose an action or type your own instruction.\n3. Review the changes, then replace or copy.\n\nSave a custom instruction with Save action. It never stores the selected text.\n\nTo undo: select the exact inserted result in the source app, then press Ctrl+Alt+Z.\n\nSelected text is sent only when you run an AI action, to the provider you connect. Local models keep processing on your machine. Replacements use plain text; compare formatting before applying.'}
+        if key == 'custom' or key.startswith('saved:'):
+            return self._stream_action('custom', {'instruction':item['instruction'],'llm_required':True},self.text,item.get('title',item['instruction']))
+        if key == 'trans':
+            return self._stream_action('trans',self.commands['trans'],self.preferences['language'] + ': ' + self.text,item.get('title','Translate'),'globe','teal')
+        if key.startswith('tone:'):
+            return self._stream_action('tone',self.commands.get('tone',{}),key[5:] + ': ' + self.text,item.get('title',key))
+        cmd = self.commands.get(key,{})
+        if key == 'polite' and self.text.strip().lower() in cmd.get('phrases',{}):
+            return {'kind':'run'}
+        if cmd.get('llm_required') or cmd.get('_personal') or key == 'polite':
+            return self._stream_action(key,cmd,self.text,item.get('title',key),item.get('icon','sparkles'),item.get('tint','purple'))
+        return {'kind':'run'}
 
     def refine(self, result_text: str, instruction: str) -> dict:
-        cfg = {"instruction": instruction, "llm_required": True}
-        action = self._stream_action("custom", cfg, result_text, f"Refined · {instruction}",
-                                     "sparkles", "purple")
+        action = self._stream_action('custom',{'instruction':instruction,'llm_required':True},result_text,'Refine result')
+        # A refinement is contextual; do not save it as if it reproduced the original transform.
+        action['refinement'] = True
         return action
+
+    def record(self, event: str, action: str = '') -> None:
+        if not self.demo:
+            preferences.record(event,action)
+
+    def remember(self, spec: dict) -> None:
+        try:
+            self.preferences = preferences.update(last_action=spec.get('cmd_name',''))
+        except OSError:
+            pass  # Saving a preference must not prevent accepting text.
+
+    def save(self, spec: dict, name: str) -> dict:
+        if spec.get('refinement') or not spec.get('cmd_config',{}).get('instruction'):
+            raise ValueError('Only a standalone custom instruction can be saved')
+        result = preferences.save_action(name,spec['cmd_config']['instruction'])
+        self.refresh()
+        return result

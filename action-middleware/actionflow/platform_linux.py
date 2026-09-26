@@ -243,7 +243,7 @@ def add_hotkey(spec: str, callback) -> None:
     keyboard.add_hotkey(spec, callback)
 
 
-def send_paste(is_terminal: bool = False) -> None:
+def send_paste(is_terminal: bool = False) -> bool:
     """Paste into the focused window. Terminals use Ctrl+Shift+V.
 
     Order: portal helper (GNOME Wayland) → ydotool → wtype → uinput.
@@ -255,7 +255,7 @@ def send_paste(is_terminal: bool = False) -> None:
     if _helper_proc is not None:
         if _portal_send("PASTE_TERMINAL" if is_terminal else "PASTE"):
             time.sleep(0.08)
-            return
+            return True
         TUI.warn("Portal paste failed — trying next method")
 
     if HAS_YDOTOOL and not _ydotool_disabled:
@@ -267,7 +267,7 @@ def send_paste(is_terminal: bool = False) -> None:
             if result.returncode == 0:
                 time.sleep(0.05)
                 reset_keyboard()
-                return
+                return True
             TUI.warn(f"ydotool failed: {result.stderr.decode(errors='ignore').strip()}")
         except FileNotFoundError:
             _ydotool_disabled = True
@@ -281,7 +281,7 @@ def send_paste(is_terminal: bool = False) -> None:
                                  + (["-m", "shift"] if is_terminal else []),
                                  capture_output=True, timeout=0.6)
             if result.returncode == 0:
-                return
+                return True
             err = result.stderr.decode(errors="ignore").strip()
             if "virtual keyboard protocol" in err.lower():
                 _wtype_disabled = True
@@ -293,6 +293,7 @@ def send_paste(is_terminal: bool = False) -> None:
     keyboard.send("ctrl+shift+v" if is_terminal else "ctrl+v")
     time.sleep(0.1)
     reset_keyboard()
+    return True
 
 
 def focus_by_alt_tab() -> bool:
@@ -451,6 +452,6 @@ WantedBy=multi-user.target
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "enable", "--now", "actionflow"], check=True)
     print(f"{TUI.GREEN}✓{TUI.RESET} Installed and started {unit_path}")
-    print(f"  Put your key in /etc/actionflow.env:  ACTIONFLOW_API_KEY=...  (chmod 600)")
+    print("  Put your key in /etc/actionflow.env:  ACTIONFLOW_API_KEY=...  (chmod 600)")
     print(f"  Logs:  {TUI.CYAN}journalctl -u actionflow -f{TUI.RESET}")
 

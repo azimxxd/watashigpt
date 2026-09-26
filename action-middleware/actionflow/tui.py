@@ -12,6 +12,7 @@ import termios
 import threading
 import tty
 from datetime import datetime
+from actionflow.privacy import private_output, log_texts
 
 
 
@@ -134,7 +135,7 @@ class TUI:
                 sys.stdout.flush()
                 return current
             elif key in ('ctrl_c', 'escape'):
-                sys.stdout.write(f"\r\033[K\n")
+                sys.stdout.write("\r\033[K\n")
                 sys.stdout.flush()
                 return None
 
@@ -173,6 +174,8 @@ class TUI:
 
     @classmethod
     def _print(cls, *args, **kwargs) -> None:
+        if private_output.get():
+            return
         with cls._print_lock:
             print(*args, **kwargs)
             sys.stdout.flush()
@@ -260,6 +263,7 @@ class TUI:
         else:
             color = cls.CYAN
 
+        input_text, output_text = log_texts(cmd_name, input_text, output_text)
         max_len: int = max(20, (cls._width() - 50) // 2)
         inp = input_text[:max_len] + ("..." if len(input_text) > max_len else "")
         out = output_text[:max_len] + ("..." if len(output_text) > max_len else "")
@@ -273,7 +277,11 @@ class TUI:
             f"{cls.DIM}\"{inp}\" → \"{out}\"{cls.RESET}   "
             f"{check} {cls.DIM}{duration:.1f}s{cls.RESET}{trigger_tag}"
         )
-        cls._print(line)
+        token = private_output.set(False)
+        try:
+            cls._print(line)
+        finally:
+            private_output.reset(token)
 
     @classmethod
     def micro_log(cls, message: str) -> None:

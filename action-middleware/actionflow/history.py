@@ -11,13 +11,10 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from actionflow.config import CONFIG
+from actionflow.privacy import log_texts
 from actionflow.tui import TUI
 
 HISTORY_PATH = Path.home() / ".actionflow_history.jsonl"
-
-# Never stored in plaintext, whatever history.log_text says
-SENSITIVE_COMMANDS = frozenset({"password", "redact", "command"})
 
 _MAX_LINES, _KEEP_LINES = 5000, 3000
 
@@ -26,10 +23,7 @@ def log(command: str, input_text: str, output_text: str, duration_ms: int, *,
         provider: str = "builtin", app_context: str = "", text_length: int = 0,
         text_language: str = "", trigger: str = "") -> None:
     try:
-        if command in SENSITIVE_COMMANDS:
-            input_text, output_text = f"[{len(input_text)} chars]", "[REDACTED]"
-        elif not (CONFIG.get("history") or {}).get("log_text", False):
-            input_text, output_text = f"[{len(input_text)} chars]", f"[{len(output_text)} chars]"
+        input_text, output_text = log_texts(command, input_text, output_text)
         entry = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "command": command,

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
+from actionflow.product import PRESERVE_RULE
 
-TONE_STYLE_RE = re.compile(r"^([a-zA-Z]+):\s*")
+TONE_STYLE_RE = re.compile(r"^([\w -]{1,40}):\s*")
 # "JP: text", "Kazakh: text", "Brazilian Portuguese: text", "казахский: text"
 TRANS_LANG_RE = re.compile(r"^([^\W\d_](?:[^\W\d_]|[ -]){1,29}?):\s*")
 
@@ -51,6 +52,7 @@ def prompt_for(cmd_name: str, cmd_config: dict, text: str,
                variables: dict | None = None) -> tuple[str, str]:
     """(prompt, model) for any LLM-backed command, answering in the text's language."""
     prompt, model = _build(cmd_name, cmd_config, text, variables)
+    prompt = PRESERVE_RULE + "\n\n" + prompt
     if cmd_name not in _OWN_LANGUAGE:
         prompt = LANGUAGE_RULE + prompt
     return prompt, model

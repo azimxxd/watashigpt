@@ -3,13 +3,8 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING
 
 from actionflow import llm
-from actionflow.palette import TONE_STYLES as _TONE_STYLES, TRANS_LANGS as _TRANS_LANGS
-
-if TYPE_CHECKING:
-    from actionflow.analysis import AppContext, TextAnalysis
 
 try:
     import tkinter as tk
@@ -54,590 +49,6 @@ def _present_popup(win) -> None:
     win.deiconify()
     win.focus_force()
 
-
-
-class CommandPicker:
-    """Frameless tkinter popup for picking a command to apply to selected text."""
-
-    BG = "#1a0a2e"
-    BG_ROW = "#1a0a2e"
-    BG_HOVER = "#2a1a4e"
-    BG_SELECTED = "#3a2a6e"
-    FG = "#e0e0e0"
-    FG_DIM = "#888888"
-    BORDER_COLOR = "#00d4aa"
-    BADGE_FAST = "#00d4aa"
-    BADGE_LLM = "#d45cff"
-    BADGE_MOCK = "#d4aa00"
-    SEARCH_BG = "#0e0620"
-    PREVIEW_FG = "#777777"
-    MIN_WIDTH = 360
-    MAX_HEIGHT = 400
-    ROW_HEIGHT = 28
-
-    BADGE_STAR = "#ffd700"
-    BADGE_PERSONAL = "#ff8c00"
-
-    def __init__(self, selected_text: str, commands: dict,
-                 suggestions: list[tuple[str, dict, bool]] | None = None,
-                 text_analysis: "TextAnalysis | None" = None,
-                 app_context: "AppContext | None" = None):
-        self._text = selected_text
-        self._commands = commands
-        self._suggestions = suggestions
-        self._text_analysis = text_analysis
-        self._app_context = app_context
-        self._cmd_list: list[tuple[str, dict]] = list(commands.items())
-        self._filtered: list[tuple[str, dict]] = list(self._cmd_list)
-        self._selected_idx = 0
-        self._result: tuple | None = None  # (cmd_name, cmd_config) or None
-        self._submenu: str | None = None  # "tone" or "trans" or None
-        self._sub_items: list = []
-        self._sub_selected = 0
-        self._custom_entry = None
-        self._row_widgets: list = []
-        self._command_rows: dict[int, "tk.Frame"] = {}
-        self._is_searching = False
-
-        _get_tk_root()
-        self._root = tk.Toplevel()
-        self._root.withdraw()
-        self._root.overrideredirect(True)
-        self._root.attributes("-topmost", True)
-        self._root.configure(bg=self.BG, highlightbackground=self.BORDER_COLOR,
-                             highlightthickness=1)
-
-        self._font, self._font_bold, self._font_small = _popup_fonts()
-
-        self._build_ui()
-        self._position_window()
-        _present_popup(self._root)
-        self._search_var.set("")
-        self._search_entry.focus_set()
-
-    def _position_window(self) -> None:
-        """Position popup at mouse cursor, clamped to screen edges."""
-        self._root.update_idletasks()
-        mx = self._root.winfo_pointerx()
-        my = self._root.winfo_pointery()
-        w = max(self.MIN_WIDTH, self._root.winfo_reqwidth())
-        h = min(self.MAX_HEIGHT, self._root.winfo_reqheight())
-        sw = self._root.winfo_screenwidth()
-        sh = self._root.winfo_screenheight()
-
-        x = mx + 10
-        y = my + 10
-        if x + w > sw:
-            x = mx - w - 10
-        if y + h > sh:
-            y = my - h - 10
-        x = max(0, x)
-        y = max(0, y)
-        self._root.geometry(f"{w}x{h}+{x}+{y}")
-
-    def _build_ui(self) -> None:
-        """Build the main popup layout."""
-        # Header with close button
-        header_frame = tk.Frame(self._root, bg=self.BG)
-        header_frame.pack(fill="x")
-
-        # Preview
-        preview = self._text[:60] + ("..." if len(self._text) > 60 else "")
-        tk.Label(header_frame, text=f'"{preview}"', bg=self.BG, fg=self.PREVIEW_FG,
-                 font=self._font_small, anchor="w", padx=8, pady=4
-                 ).pack(side="left", fill="x", expand=True)
-
-        # Close button (✕)
-        close_btn = tk.Label(header_frame, text="✕", bg=self.BG, fg=self.FG_DIM,
-                            font=self._font_bold, cursor="hand2", padx=8, pady=4)
-        close_btn.pack(side="right")
-        close_btn.bind("<Button-1>", lambda e: self._on_escape())
-        close_btn.bind("<Enter>", lambda e: close_btn.configure(fg="#ff4444"))
-        close_btn.bind("<Leave>", lambda e: close_btn.configure(fg=self.FG_DIM))
-
-        # Analysis summary line
-        if self._text_analysis:
-            ta = self._text_analysis
-            parts = []
-            if self._app_context and self._app_context.context_type != "unknown":
-                parts.append(self._app_context.context_type)
-            parts.append(ta.language)
-            if ta.is_code:
-                parts.append(f"code" + (f"({ta.code_language})" if ta.code_language else ""))
-            elif not ta.is_formal:
-                parts.append("informal")
-            parts.append(f"{ta.length} chars")
-            analysis_line = " · ".join(parts)
-            tk.Label(self._root, text=analysis_line, bg=self.BG, fg="#555555",
-                     font=self._font_small, anchor="w", padx=8, pady=1
-                     ).pack(fill="x")
-
-        # Separator
-        tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
-
-        # Search
-        search_frame = tk.Frame(self._root, bg=self.SEARCH_BG)
-        search_frame.pack(fill="x")
-        tk.Label(search_frame, text="\U0001f50d", bg=self.SEARCH_BG, fg=self.FG_DIM,
-                 font=self._font_small).pack(side="left", padx=(8, 2))
-        self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", lambda *_: self._on_search())
-        self._search_entry = tk.Entry(
-            search_frame, textvariable=self._search_var,
-            bg=self.SEARCH_BG, fg=self.FG, insertbackground=self.FG,
-            font=self._font, relief="flat", bd=0,
-        )
-        self._search_entry.pack(fill="x", padx=(0, 8), pady=4, expand=True, side="left")
-
-        # Separator
-        tk.Frame(self._root, bg=self.BORDER_COLOR, height=1).pack(fill="x")
-
-        # Scrollable command list
-        self._canvas_frame = tk.Frame(self._root, bg=self.BG)
-        self._canvas_frame.pack(fill="both", expand=True)
-
-        self._canvas = tk.Canvas(self._canvas_frame, bg=self.BG, highlightthickness=0,
-                                 bd=0)
-        self._scrollbar = tk.Scrollbar(self._canvas_frame, orient="vertical",
-                                       command=self._canvas.yview)
-        self._inner_frame = tk.Frame(self._canvas, bg=self.BG)
-
-        self._inner_frame.bind("<Configure>",
-                               lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
-        self._canvas.create_window((0, 0), window=self._inner_frame, anchor="nw")
-        self._canvas.configure(yscrollcommand=self._scrollbar.set)
-
-        self._canvas.pack(side="left", fill="both", expand=True)
-        self._scrollbar.pack(side="right", fill="y")
-
-        self._populate_rows()
-
-        # Bindings
-        self._root.bind("<Escape>", self._on_escape)
-        self._root.bind("<Return>", self._on_enter)
-        self._root.bind("<Up>", self._on_up)
-        self._root.bind("<Down>", self._on_down)
-        self._root.bind("<FocusOut>", self._on_focus_out)
-        self._root.bind("<MouseWheel>", self._on_mousewheel)
-        self._root.bind("<Button-4>", lambda e: self._canvas.yview_scroll(-3, "units"))
-        self._root.bind("<Button-5>", lambda e: self._canvas.yview_scroll(3, "units"))
-        # Bound on the entry (runs before the Entry class binding inserts
-        # the character): digits pick a command only while the search is empty.
-        for i in range(1, 10):
-            self._search_entry.bind(f"<Key-{i}>", self._on_number_key)
-
-    def _populate_rows(self) -> None:
-        """Fill the command list rows."""
-        for w in self._row_widgets:
-            w.destroy()
-        self._row_widgets.clear()
-        self._command_rows = {}
-
-        if self._submenu == "tone":
-            self._populate_tone_submenu()
-            return
-        elif self._submenu == "trans":
-            self._populate_trans_submenu()
-            return
-
-        # Use smart suggestions if available and not actively searching
-        if self._suggestions and not self._is_searching:
-            starred = [(n, c) for n, c, s in self._suggestions if s]
-            rest = [(n, c) for n, c, s in self._suggestions if not s]
-
-            if starred:
-                # "For You" header
-                header = tk.Frame(self._inner_frame, bg=self.SEARCH_BG)
-                header.pack(fill="x", padx=2, pady=(2, 0))
-                self._row_widgets.append(header)
-                tk.Label(header, text="  \u2605 For You", bg=self.SEARCH_BG,
-                         fg=self.BADGE_STAR, font=self._font_bold, anchor="w",
-                         padx=6, pady=3).pack(fill="x")
-
-                for i, (name, cmd) in enumerate(starred):
-                    self._add_command_row(name, cmd, i, starred=True)
-
-                # "All Commands" header
-                header2 = tk.Frame(self._inner_frame, bg=self.SEARCH_BG)
-                header2.pack(fill="x", padx=2, pady=(4, 0))
-                self._row_widgets.append(header2)
-                tk.Label(header2, text="  All Commands", bg=self.SEARCH_BG,
-                         fg=self.FG_DIM, font=self._font_bold, anchor="w",
-                         padx=6, pady=3).pack(fill="x")
-
-                items = rest
-                offset = len(starred)
-            else:
-                items = starred + rest
-                offset = 0
-        else:
-            items = self._filtered
-            offset = 0
-
-        for i, (name, cmd) in enumerate(items):
-            self._add_command_row(name, cmd, i + offset)
-
-        self._update_scroll_height()
-
-    def _add_command_row(self, name: str, cmd: dict, idx: int,
-                         starred: bool = False) -> None:
-        """Add a single command row to the popup."""
-        row = tk.Frame(self._inner_frame, bg=self.BG_ROW, cursor="hand2")
-        row.pack(fill="x", padx=2, pady=1)
-        self._row_widgets.append(row)
-        self._command_rows[idx] = row
-
-        is_llm = cmd.get("llm_required", False)
-        is_mock_llm = is_llm and llm.MODE == "mock"
-        is_personal = cmd.get("_personal", False)
-
-        # Number
-        num_label = str(idx + 1) if idx < 9 else " "
-        fg_main = self.FG_DIM if is_mock_llm else self.FG
-        tk.Label(row, text=num_label, bg=self.BG_ROW, fg=self.FG_DIM,
-                 font=self._font_small, width=2).pack(side="left", padx=(6, 2))
-
-        # Star indicator
-        if starred:
-            tk.Label(row, text="\u2605", bg=self.BG_ROW, fg=self.BADGE_STAR,
-                     font=self._font_small).pack(side="left", padx=(0, 2))
-
-        # Name
-        display_name = name.replace("_", " ").title()
-        if is_personal:
-            display_name = name.replace("personal_", "").replace("_", " ").title()
-        tk.Label(row, text=display_name, bg=self.BG_ROW, fg=fg_main,
-                 font=self._font_bold, anchor="w", width=16).pack(side="left")
-
-        # Description
-        desc = cmd.get("description", "")[:30]
-        tk.Label(row, text=desc, bg=self.BG_ROW, fg=self.FG_DIM,
-                 font=self._font_small, anchor="w").pack(side="left", fill="x", expand=True)
-
-        # Badge
-        if is_personal:
-            badge_text, badge_fg = "[ME]", self.BADGE_PERSONAL
-        elif is_mock_llm:
-            badge_text, badge_fg = "[MOCK]", self.BADGE_MOCK
-        elif is_llm:
-            badge_text, badge_fg = "[LLM]", self.BADGE_LLM
-        else:
-            badge_text, badge_fg = "[FAST]", self.BADGE_FAST
-        tk.Label(row, text=badge_text, bg=self.BG_ROW, fg=badge_fg,
-                 font=self._font_small).pack(side="right", padx=(4, 8))
-
-        # Highlight
-        if idx == self._selected_idx:
-            self._set_row_bg(row, self.BG_SELECTED)
-
-        # Mouse bindings
-        row.bind("<Enter>", lambda e, r=row, j=idx: self._on_row_hover(r, j))
-        row.bind("<Leave>", lambda e, r=row, j=idx: self._on_row_leave(r, j))
-        row.bind("<Button-1>", lambda e, j=idx: self._on_row_click(j))
-        for child in row.winfo_children():
-            child.bind("<Enter>", lambda e, r=row, j=idx: self._on_row_hover(r, j))
-            child.bind("<Leave>", lambda e, r=row, j=idx: self._on_row_leave(r, j))
-            child.bind("<Button-1>", lambda e, j=idx: self._on_row_click(j))
-
-    def _populate_tone_submenu(self) -> None:
-        """Show the tone style picker."""
-        self._sub_items = _TONE_STYLES
-        self._sub_selected = 0
-
-        # Back header
-        back = tk.Frame(self._inner_frame, bg=self.SEARCH_BG, cursor="hand2")
-        back.pack(fill="x", padx=2, pady=1)
-        self._row_widgets.append(back)
-        tk.Label(back, text="\u2190 back   Choose tone style", bg=self.SEARCH_BG,
-                 fg=self.FG, font=self._font_bold, anchor="w", padx=8, pady=4
-                 ).pack(fill="x")
-        back.bind("<Button-1>", lambda e: self._back_to_main())
-        for child in back.winfo_children():
-            child.bind("<Button-1>", lambda e: self._back_to_main())
-
-        for i, style in enumerate(self._sub_items):
-            row = tk.Frame(self._inner_frame, bg=self.BG_ROW, cursor="hand2")
-            row.pack(fill="x", padx=2, pady=1)
-            self._row_widgets.append(row)
-
-            fg = self.FG
-            tk.Label(row, text=f"  {style.title()}", bg=self.BG_ROW, fg=fg,
-                     font=self._font, anchor="w", padx=8, pady=3).pack(fill="x")
-
-            if i == self._sub_selected:
-                self._set_row_bg(row, self.BG_SELECTED)
-
-            idx = i
-            row.bind("<Enter>", lambda e, r=row, j=idx: self._on_sub_hover(r, j))
-            row.bind("<Leave>", lambda e, r=row, j=idx: self._on_sub_leave(r, j))
-            row.bind("<Button-1>", lambda e, j=idx: self._on_sub_click(j))
-            for child in row.winfo_children():
-                child.bind("<Enter>", lambda e, r=row, j=idx: self._on_sub_hover(r, j))
-                child.bind("<Leave>", lambda e, r=row, j=idx: self._on_sub_leave(r, j))
-                child.bind("<Button-1>", lambda e, j=idx: self._on_sub_click(j))
-
-        self._update_scroll_height()
-
-    def _populate_trans_submenu(self) -> None:
-        """Show the language picker."""
-        self._sub_items = _TRANS_LANGS
-        self._sub_selected = 0
-
-        # Back header
-        back = tk.Frame(self._inner_frame, bg=self.SEARCH_BG, cursor="hand2")
-        back.pack(fill="x", padx=2, pady=1)
-        self._row_widgets.append(back)
-        tk.Label(back, text="\u2190 back   Translate to...", bg=self.SEARCH_BG,
-                 fg=self.FG, font=self._font_bold, anchor="w", padx=8, pady=4
-                 ).pack(fill="x")
-        back.bind("<Button-1>", lambda e: self._back_to_main())
-        for child in back.winfo_children():
-            child.bind("<Button-1>", lambda e: self._back_to_main())
-
-        for i, (lang_name, code, flag) in enumerate(self._sub_items):
-            row = tk.Frame(self._inner_frame, bg=self.BG_ROW, cursor="hand2")
-            row.pack(fill="x", padx=2, pady=1)
-            self._row_widgets.append(row)
-
-            tk.Label(row, text=f"  {lang_name}", bg=self.BG_ROW, fg=self.FG,
-                     font=self._font, anchor="w", padx=8, pady=3).pack(side="left", fill="x", expand=True)
-            tk.Label(row, text=flag, bg=self.BG_ROW, font=self._font,
-                     padx=8).pack(side="right")
-
-            if i == self._sub_selected:
-                self._set_row_bg(row, self.BG_SELECTED)
-
-            idx = i
-            row.bind("<Enter>", lambda e, r=row, j=idx: self._on_sub_hover(r, j))
-            row.bind("<Leave>", lambda e, r=row, j=idx: self._on_sub_leave(r, j))
-            row.bind("<Button-1>", lambda e, j=idx: self._on_sub_click(j))
-            for child in row.winfo_children():
-                child.bind("<Enter>", lambda e, r=row, j=idx: self._on_sub_hover(r, j))
-                child.bind("<Leave>", lambda e, r=row, j=idx: self._on_sub_leave(r, j))
-                child.bind("<Button-1>", lambda e, j=idx: self._on_sub_click(j))
-
-        # Custom entry row
-        custom_row = tk.Frame(self._inner_frame, bg=self.BG_ROW)
-        custom_row.pack(fill="x", padx=2, pady=1)
-        self._row_widgets.append(custom_row)
-        tk.Label(custom_row, text="  + custom:", bg=self.BG_ROW, fg=self.FG_DIM,
-                 font=self._font_small, padx=8).pack(side="left")
-        self._custom_entry = tk.Entry(custom_row, bg=self.SEARCH_BG, fg=self.FG,
-                                      insertbackground=self.FG, font=self._font_small,
-                                      relief="flat", width=10)
-        self._custom_entry.pack(side="left", padx=4, pady=2)
-        self._custom_entry.bind("<Return>", self._on_custom_lang)
-
-        self._update_scroll_height()
-
-    def _update_scroll_height(self) -> None:
-        """Update canvas scroll region and window height."""
-        self._root.update_idletasks()
-        content_h = self._inner_frame.winfo_reqheight()
-        canvas_h = min(content_h, self.MAX_HEIGHT - 80)  # Leave room for preview+search
-        self._canvas.configure(height=canvas_h)
-        self._root.update_idletasks()
-        # Reposition if needed
-        w = max(self.MIN_WIDTH, self._root.winfo_reqwidth())
-        h = min(self.MAX_HEIGHT, self._root.winfo_reqheight())
-        self._root.geometry(f"{w}x{h}")
-
-    def _set_row_bg(self, row: tk.Frame, bg: str) -> None:
-        """Set background for a row and all its children."""
-        row.configure(bg=bg)
-        for child in row.winfo_children():
-            try:
-                child.configure(bg=bg)
-            except tk.TclError:
-                pass
-
-    # ── Search ──
-    def _on_search(self) -> None:
-        q = self._search_var.get().lower()
-        self._is_searching = bool(q)
-        if not q:
-            self._filtered = list(self._cmd_list)
-        else:
-            self._filtered = [
-                (name, cmd) for name, cmd in self._cmd_list
-                if q in name.lower()
-                or q in cmd.get("description", "").lower()
-                or any(q in kw.lower() for kw in cmd.get("keywords", []))
-                or any(q in p.lower() for p in cmd.get("prefixes", []))
-            ]
-        self._selected_idx = 0
-        self._populate_rows()
-
-    # ── Keyboard ──
-    def _on_escape(self, event=None) -> None:
-        if self._submenu:
-            self._back_to_main()
-        else:
-            self._result = None
-            self._root.destroy()
-
-    def _on_enter(self, event=None) -> None:
-        if self._submenu:
-            self._on_sub_click(self._sub_selected)
-        elif self._filtered:
-            self._select_command(self._selected_idx)
-
-    def _on_up(self, event=None) -> None:
-        if self._submenu:
-            count = len(self._sub_items)
-            if count > 0:
-                self._sub_selected = (self._sub_selected - 1) % count
-                self._populate_rows()
-        else:
-            count = len(self._visible_items())
-            if count:
-                self._selected_idx = (self._selected_idx - 1) % count
-                self._populate_rows()
-                self._ensure_visible()
-
-    def _on_down(self, event=None) -> None:
-        if self._submenu:
-            count = len(self._sub_items)
-            if count > 0:
-                self._sub_selected = (self._sub_selected + 1) % count
-                self._populate_rows()
-        else:
-            count = len(self._visible_items())
-            if count:
-                self._selected_idx = (self._selected_idx + 1) % count
-                self._populate_rows()
-                self._ensure_visible()
-
-    def _on_number_key(self, event) -> None:
-        if self._submenu or self._search_var.get():
-            return
-        idx = int(event.char) - 1
-        if 0 <= idx < len(self._visible_items()):
-            self._select_command(idx)
-            return "break"  # don't also type the digit into the search box
-
-    def _on_mousewheel(self, event) -> None:
-        delta = event.delta if sys.platform == "darwin" else event.delta // 120
-        self._canvas.yview_scroll(-delta, "units")
-
-    def _on_focus_out(self, event) -> None:
-        # Only close if focus left the root entirely
-        try:
-            if not self._root.focus_get():
-                self._root.after(100, self._check_focus)
-        except Exception:
-            pass
-
-    def _check_focus(self) -> None:
-        try:
-            if not self._root.focus_get():
-                self._result = None
-                self._root.destroy()
-        except Exception:
-            pass
-
-    def _ensure_visible(self) -> None:
-        """Scroll to keep the selected row visible."""
-        widget = self._command_rows.get(self._selected_idx)
-        if widget is None:
-            return
-        self._canvas.update_idletasks()
-        y = widget.winfo_y()
-        h = widget.winfo_height()
-        canvas_h = self._canvas.winfo_height()
-        visible_top = self._canvas.canvasy(0)
-        visible_bot = visible_top + canvas_h
-        if y < visible_top:
-            self._canvas.yview_moveto(y / self._inner_frame.winfo_height())
-        elif y + h > visible_bot:
-            self._canvas.yview_moveto((y + h - canvas_h) / self._inner_frame.winfo_height())
-
-    # ── Mouse ──
-    def _on_row_hover(self, row, idx) -> None:
-        if idx != self._selected_idx:
-            self._set_row_bg(row, self.BG_HOVER)
-
-    def _on_row_leave(self, row, idx) -> None:
-        if idx != self._selected_idx:
-            self._set_row_bg(row, self.BG_ROW)
-
-    def _on_row_click(self, idx) -> None:
-        self._select_command(idx)
-
-    # ── Sub-menu mouse ──
-    def _on_sub_hover(self, row, idx) -> None:
-        if idx != self._sub_selected:
-            self._set_row_bg(row, self.BG_HOVER)
-
-    def _on_sub_leave(self, row, idx) -> None:
-        if idx != self._sub_selected:
-            self._set_row_bg(row, self.BG_ROW)
-
-    def _on_sub_click(self, idx) -> None:
-        if self._submenu == "tone":
-            style = self._sub_items[idx]
-            cmd_config = self._commands.get("tone", {})
-            # Store result with style prepended to payload
-            self._result = ("tone", cmd_config, f"{style}: {self._text}")
-            self._root.destroy()
-        elif self._submenu == "trans":
-            _, code, _ = self._sub_items[idx]
-            cmd_config = self._commands.get("trans", {})
-            self._result = ("trans", cmd_config, f"{code}: {self._text}")
-            self._root.destroy()
-
-    def _on_custom_lang(self, event=None) -> None:
-        lang = self._custom_entry.get().strip()
-        if lang:
-            cmd_config = self._commands.get("trans", {})
-            self._result = ("trans", cmd_config, f"{lang.upper()}: {self._text}")
-            self._root.destroy()
-
-    def _back_to_main(self) -> None:
-        self._submenu = None
-        self._sub_items = []
-        self._sub_selected = 0
-        self._custom_entry = None
-        self._populate_rows()
-        self._search_entry.focus_set()
-
-    # ── Selection ──
-    def _visible_items(self) -> list[tuple[str, dict]]:
-        """Commands in the order they are displayed (index == row number)."""
-        if self._suggestions and not self._is_searching:
-            starred = [(n, c) for n, c, s in self._suggestions if s]
-            rest = [(n, c) for n, c, s in self._suggestions if not s]
-            return starred + rest
-        return self._filtered
-
-    def _select_command(self, idx: int) -> None:
-        items = self._visible_items()
-        if idx >= len(items):
-            return
-        name, cmd = items[idx]
-
-        # Tone submenu
-        if name == "tone":
-            self._submenu = "tone"
-            self._populate_rows()
-            return
-
-        # Trans submenu
-        if name == "trans":
-            self._submenu = "trans"
-            self._populate_rows()
-            return
-
-        self._result = (name, cmd, self._text)
-        self._root.destroy()
-
-    def run(self) -> tuple | None:
-        """Show the popup and block until a choice is made. Returns (cmd_name, cmd_config, payload) or None."""
-        try:
-            self._root.wait_window(self._root)
-        except Exception:
-            return None
-        return self._result
 
 
 class ResultPopup:
@@ -766,3 +177,322 @@ class ResultPopup:
             self._root.wait_window(self._root)
         except Exception:
             pass
+
+
+class WritingPalette:
+    """Linux counterpart of the native writing palette, sharing its controller."""
+
+    def __init__(self, controller, context='', status='', copy_text=None):
+        import queue
+        self.controller = controller
+        self.copy_text = copy_text
+        self.outcome = None
+        self._stream_spec = None
+        self._stream_text = ''
+        self._stream_item = None
+        self._stream_started = 0
+        self._token = 0
+        self._queue = queue.Queue()
+        self._running = False
+        self._closed = False
+        self._submenu = None
+        self._state = 'list'
+        self._mode = 'result'
+        self.win = tk.Toplevel(get_root())
+        self.win.withdraw()
+        self.win.title('ActionFlow')
+        self.win.geometry('740x540')
+        self.win.minsize(650,440)
+        self.win.attributes('-topmost', True)
+        self.win.protocol('WM_DELETE_WINDOW', lambda:self.close(None))
+        header=tk.Frame(self.win)
+        header.pack(fill='x')
+        tk.Label(header,text=context,anchor='w',padx=16,pady=8).pack(side='left',fill='x',expand=True)
+        self.language_button=tk.Button(header,text='Language: ' + controller.preferences['language'],command=self.choose_language)
+        self.language_button.pack(side='right',padx=12)
+        self.query = tk.StringVar()
+        self.entry = tk.Entry(self.win,textvariable=self.query,font=('TkDefaultFont',15))
+        self.entry.pack(fill='x',padx=16,pady=8)
+        self.hint = tk.Label(self.win,text='Choose an action or type your own instruction',anchor='w')
+        self.hint.pack(fill='x',padx=16)
+        self.listbox = tk.Listbox(self.win,font=('TkDefaultFont',13),activestyle='dotbox',exportselection=False)
+        self.listbox.pack(fill='both',expand=True,padx=16,pady=8)
+        self.preview = tk.Text(self.win,wrap='word',font=('TkDefaultFont',12),padx=12,pady=12,state='disabled')
+        self.preview.tag_configure('delete',foreground='#b91c1c',overstrike=True)
+        self.preview.tag_configure('insert',background='#dcfce7',foreground='#14532d')
+        self.toolbar = tk.Frame(self.win)
+        self.toolbar.pack(fill='x',padx=12,pady=8)
+        self.buttons=[]
+        for title,fn in [('Result',lambda:self.render('result')),('Changes',lambda:self.render('changes')),
+                         ('Original',lambda:self.render('original')),('Save action',self.save),
+                         ('Copy',self.copy),('Replace',self.accept)]:
+            b=tk.Button(self.toolbar,text=title,command=fn,state='disabled')
+            b.pack(side='left',padx=3)
+            self.buttons.append(b)
+        self.status = tk.Label(self.win,text=status,anchor='w',padx=16,pady=8)
+        self.status.pack(fill='x')
+        self.query.trace_add('write',lambda *a:self.reload() if self._state == 'list' else None)
+        self.listbox.bind('<Double-Button-1>',lambda e:self.activate())
+        self.win.bind('<Return>',lambda e:self.enter())
+        self.win.bind('<Escape>',lambda e:self.back())
+        self.entry.bind('<Down>',lambda e:self.move(1))
+        self.entry.bind('<Up>',lambda e:self.move(-1))
+        self.win.bind('<Control-d>',lambda e:self.render('changes'))
+        self.win.bind('<Control-s>',lambda e:self.save())
+        self.win.bind('<Control-c>',lambda e:self.copy() if self._state == 'preview' and not self.query.get() else None)
+        self.win.bind('<Tab>',self.retry)
+        self.reload()
+
+    def choose_language(self):
+        if self._running: return
+        if self._state == 'preview': self.back()
+        self._submenu='trans'
+        self.query.set('')
+        self.hint.config(text='Choose a translation language')
+        self.reload()
+
+    def reload(self):
+        self.language_button.config(text='Language: ' + self.controller.preferences['language'])
+        self.rows = self.controller.items(self.query.get(),self._submenu)
+        self.listbox.delete(0,'end')
+        for row in self.rows:
+            self.listbox.insert('end',row['title'] + ('   ·   ' + row['subtitle'] if row.get('subtitle') else ''))
+        if self.rows: self.listbox.selection_set(0)
+
+    def move(self,delta):
+        if not self.rows: return 'break'
+        current = self.listbox.curselection()
+        i = ((current[0] if current else 0) + delta) % len(self.rows)
+        self.listbox.selection_clear(0,'end')
+        self.listbox.selection_set(i)
+        self.listbox.see(i)
+        return 'break'
+
+    def activate(self):
+        from tkinter import messagebox
+        from actionflow import preferences
+        selected = self.listbox.curselection()
+        if not selected: return
+        item = self.rows[selected[0]]
+        try: action = self.controller.activate(item,self.query.get())
+        except (OSError,ValueError):
+            messagebox.showerror('Could not save','Check access to your home folder.',parent=self.win)
+            return
+        kind = action['kind']
+        if kind == 'submenu':
+            self._submenu = action['id']
+            self.query.set('')
+            self.hint.config(text=action['title'] + ' · Esc to go back')
+            self.reload()
+        elif kind in ('reload','home'):
+            if kind == 'home': self._submenu = None
+            self.query.set('')
+            self.reload()
+        elif kind == 'stream':
+            self._stream_item = item
+            self.start(action)
+        elif kind == 'run': self.close({'kind':'run','item':item,'query':self.query.get()})
+        elif kind == 'message':
+            messagebox.showinfo(action['title'],action['text'],parent=self.win)
+        elif kind == 'connect': self.connect(action['provider'])
+        elif kind == 'delete':
+            if messagebox.askyesno('Remove action','Remove ' + action['title'] + '?',parent=self.win):
+                try:
+                    preferences.remove_action(action['id'])
+                    self.controller.refresh()
+                    self.reload()
+                except OSError: messagebox.showerror('Could not save','Check access to your home folder.',parent=self.win)
+
+    def enter(self):
+        if self._running: return 'break'
+        if self._state == 'list': self.activate()
+        elif self._stream_text and self.query.get().strip():
+            self.start(self.controller.refine(self._stream_text,self.query.get().strip()))
+        elif self._stream_text: self.accept()
+        return 'break'
+
+    def start(self,spec):
+        import time
+        import threading
+        self._stream_spec=spec
+        self._stream_started=time.time()
+        self._stream_text=''
+        self._state='preview'
+        self.query.set('')
+        self.listbox.pack_forget()
+        self.preview.pack(fill='both',expand=True,padx=16,pady=8,before=self.toolbar)
+        self._running=True
+        self._token += 1
+        token=self._token
+        for b in self.buttons: b.config(state='disabled')
+        self.hint.config(text='Generating… · Esc to cancel')
+        self.set_text('')
+        def worker():
+            try:
+                for chunk in spec['factory']():
+                    if token != self._token: return
+                    self._queue.put(('chunk',token,chunk))
+                self._queue.put(('done',token,None))
+            except Exception:
+                self._queue.put(('error',token,'Could not generate a result. Check your connection and retry with Tab.'))
+        threading.Thread(target=worker,daemon=True).start()
+
+    def set_text(self,text):
+        self.preview.config(state='normal')
+        self.preview.delete('1.0','end')
+        self.preview.insert('end',text)
+        self.preview.config(state='disabled')
+
+    def render(self,mode):
+        from actionflow import product
+        if self._running or not self._stream_text: return 'break'
+        self._mode=mode
+        if mode == 'original': self.set_text(self.controller.text)
+        elif mode == 'result': self.set_text(self._stream_text)
+        else:
+            self.preview.config(state='normal')
+            self.preview.delete('1.0','end')
+            for kind,text in product.diff_segments(self.controller.text,self._stream_text):
+                self.preview.insert('end',text,kind)
+            self.preview.config(state='disabled')
+        return 'break'
+
+    def drain(self):
+        import queue
+        from actionflow import product, connection
+        while True:
+            try: kind,token,data=self._queue.get_nowait()
+            except queue.Empty: break
+            if token != self._token: continue
+            if kind == 'chunk':
+                self._stream_text += data
+                self.set_text(self._stream_text)
+            elif kind == 'done':
+                self._running=False
+                self._stream_text=self._stream_text.strip()
+                if not self._stream_text:
+                    self.hint.config(text='Empty result · Tab to retry')
+                    continue
+                self.render('changes')
+                for b in self.buttons: b.config(state='normal')
+                spec=self._stream_spec or {}
+                if not spec.get('cmd_config',{}).get('instruction') or spec.get('refinement'):
+                    self.buttons[3].config(state='disabled')
+                self.hint.config(text=product.change_summary(self.controller.text,self._stream_text) + ' · Red: removed · Green: added')
+                self.status.config(text='Enter: replace · Type + Enter: refine · Tab: retry · Esc: back')
+                self.controller.record('generated',spec.get('cmd_name',''))
+            elif kind == 'connected':
+                self._running=False
+                try:
+                    connection.finish(data)
+                    self.controller.refresh()
+                    self.back()
+                    self._submenu=None
+                    self.reload()
+                    self.status.config(text='Connected · ' + llm.provider)
+                except Exception:
+                    self.set_text('Connection verified, but settings or key could not be saved. Check your system keyring.')
+            elif kind == 'error':
+                self._running=False
+                self._stream_text=''
+                self.set_text(data + '\n\nYour selected text has not changed.')
+                self.hint.config(text='Failed · Esc to go back')
+                self.controller.record('failed')
+        if not self._closed: self.win.after(30,self.drain)
+
+    def retry(self,event=None):
+        if self._state == 'preview' and not self._running and self._stream_spec:
+            self.start(self._stream_spec)
+            return 'break'
+
+    def accept(self):
+        import time
+        if self._running or not self._stream_text: return
+        self.close({'kind':'replace','item':self._stream_item,'text':self._stream_text,
+                    'seconds':time.time()-self._stream_started})
+
+    def copy(self):
+        if self._running or not self._stream_text: return
+        try: self.copy_text(self._stream_text)
+        except Exception:
+            self.status.config(text='Copy failed; your result is still here')
+            return
+        self.controller.remember(self._stream_spec or {})
+        self.controller.record('copied')
+        self.close({'kind':'copied'})
+        return 'break'
+
+    def save(self):
+        from tkinter import simpledialog, messagebox
+        spec=self._stream_spec or {}
+        instruction=spec.get('cmd_config',{}).get('instruction')
+        if self._running or not self._stream_text or not instruction or spec.get('refinement'): return
+        name=simpledialog.askstring('Save action','Name (only the instruction is saved, never your selected text):',
+                                    initialvalue=instruction[:60],parent=self.win)
+        if name is not None:
+            try:
+                self.controller.save(spec,name)
+                self.status.config(text='Action saved')
+            except (ValueError,OSError) as exc: messagebox.showerror('Could not save',str(exc),parent=self.win)
+        return 'break'
+
+    def connect(self,provider):
+        import threading
+        from tkinter import simpledialog
+        from actionflow import connection
+        info=llm.PROVIDERS[provider]
+        key=''
+        if not info.local:
+            key=simpledialog.askstring('Connect AI','API key from ' + info.key_url + '\nSaved in your system keyring.',show='*',parent=self.win)
+            if key is None: return
+        model=simpledialog.askstring('Choose model','Keep the default or enter a model available to you:',initialvalue=info.default_model,parent=self.win)
+        if model is None: return
+        self._stream_spec=None
+        self._stream_text=''
+        self._state='preview'
+        self.listbox.pack_forget()
+        self.preview.pack(fill='both',expand=True,padx=16,pady=8,before=self.toolbar)
+        self.set_text('Verifying connection… Esc to cancel.')
+        self._running=True
+        self._token += 1
+        token=self._token
+        def worker():
+            try: self._queue.put(('connected',token,connection.validate(provider,key,model)))
+            except Exception: self._queue.put(('error',token,'Could not connect. Check your key, model and network.'))
+        threading.Thread(target=worker,daemon=True).start()
+
+    def back(self):
+        if self._state == 'preview':
+            if self._stream_text: self.controller.record('discarded')
+            self._token += 1
+            self._running=False
+            self._stream_text=''
+            self._stream_spec=None
+            self._state='list'
+            self.preview.pack_forget()
+            self.listbox.pack(fill='both',expand=True,padx=16,pady=8,before=self.toolbar)
+            for b in self.buttons: b.config(state='disabled')
+            self.query.set('')
+            self.reload()
+        elif self._submenu:
+            self._submenu=None
+            self.query.set('')
+            self.reload()
+        else: self.close(None)
+        self.hint.config(text='Choose an action or type your own instruction') if not self._closed else None
+        return 'break'
+
+    def close(self,outcome):
+        if self._closed: return
+        if outcome is None and self._stream_text: self.controller.record('discarded')
+        self._closed=True
+        self._token += 1
+        self.outcome=outcome
+        self.win.destroy()
+
+    def run(self):
+        _present_popup(self.win)
+        self.entry.focus_set()
+        self.win.after(30,self.drain)
+        self.win.wait_window()
+        return self.outcome

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import main  # noqa: E402
 from actionflow import config as af_config  # noqa: E402
+from actionflow.analysis import get_smart_suggestions
 from actionflow import platform_mac  # noqa: E402
 
 
@@ -20,7 +21,7 @@ def pasted(monkeypatch):
     """Capture replacements instead of touching the real clipboard/keyboard."""
     out: list[str] = []
     monkeypatch.setattr(main, "_replace_selection",
-                        lambda text: out.append(text) if not main._chain_suppress_paste else None)
+                        lambda text, **kwargs: out.append(text) if not main._chain_suppress_paste else None)
     monkeypatch.setattr(main, "notify", lambda *a, **k: None)
     monkeypatch.setattr(main, "_log_history", lambda *a, **k: None)
     monkeypatch.setattr(main, "_undo_stack", [])
@@ -62,7 +63,7 @@ def test_load_config_never_mutates_defaults(tmp_path):
 def test_load_config_invalid_yaml_falls_back(tmp_path):
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("- just\n- a list\n")
-    assert main.load_config(cfg_file)["commands"].keys() == af_config.DEFAULT_CONFIG["commands"].keys()
+    assert main.load_config(cfg_file)["commands"].keys() == main.product.writing_commands(af_config.DEFAULT_CONFIG["commands"]).keys()
 
 
 def test_example_config_is_valid():
@@ -191,7 +192,7 @@ def test_redact_handler():
     out: list[str] = []
     main_redact = main.handle_redact
     orig = main._replace_selection
-    main._replace_selection = out.append
+    main._replace_selection = lambda text, **kwargs: out.append(text)
     try:
         main_redact("mail bob@example.com card 4111 1111 1111 1111", "", {})
     finally:
@@ -221,7 +222,7 @@ def test_smart_suggestions_rank_code_commands():
     cmds = {n: {} for n in ("docstring", "review", "explain", "summarize", "polite")}
     ctx = main.AppContext("ide", "code", "code")
     ta = main.analyze_text("def foo():\n    return 1\n")
-    ranked = [name for name, _cfg, _star in main.get_smart_suggestions(ctx, ta, cmds)]
+    ranked = [name for name, _cfg, _star in get_smart_suggestions(ctx, ta, cmds)]
     assert ranked[0] == "docstring"
     assert set(ranked) == set(cmds)
 
@@ -285,31 +286,34 @@ def test_launch_agent_plist():
 def _controller(text="some text here"):
     cmds = main.load_config(af_config.CONFIG_EXAMPLE_PATH)["commands"]
     ctx = main.AppContext("chat", "telegram", "telegram", "Telegram")
-    sugg = main.get_smart_suggestions(ctx, main.analyze_text(text), cmds)
+    sugg = get_smart_suggestions(ctx, main.analyze_text(text), cmds)
     return main.palette.PaletteController(text, cmds, sugg, prompt_for=main._llm_prompt_for), cmds
 
 
-def test_palette_items_sections_and_search():
+def test_palette_items_sections_and_search(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.preferences, 'PATH', tmp_path / 'preferences.json')
+    monkeypatch.setattr(main.llm, 'ready', True)
     ctl, cmds = _controller()
-    rows = ctl.items("", None)
-    assert rows[0] == {"header": True, "title": "Suggested"}
-    assert sum(1 for r in rows if not r.get("header")) == len(cmds)
-    assert ctl.items("summ", None)[0]["id"] == "summarize"
-    assert ctl.items("b64", None)[0]["id"] == "b64"          # by prefix
-    sentence = ctl.items("make it shorter", None)
-    assert sentence[0]["id"] == "custom" and sentence[0]["instruction"] == "make it shorter"
-    assert ctl.items("zzzz", None)[0]["id"] == "custom"
+    rows = ctl.items('', None)
+    assert [r['id'] for r in rows] == ['proofread','clarify','shorten','trans','settings']
+    assert ctl.items('fix', None)[0]['id'] == 'proofread'
+    assert all(r['id'] != 'b64' for r in ctl.items('b64',None))
+    sentence = ctl.items('make it shorter',None)
+    assert sentence[0]['id'] == 'custom' and sentence[0]['instruction'] == 'make it shorter'
+    assert ctl.items('zzzz',None)[0]['id'] == 'custom'
 
 
 def test_palette_actions(monkeypatch):
     ctl, _ = _controller("hello world")
     monkeypatch.setattr(main.llm, "MODE", "mock")
-    assert ctl.activate({"id": "summarize", "title": "Summarize", "icon": "x", "tint": "purple"}, "")["kind"] == "message"
+    monkeypatch.setattr(main.llm, "ready", False)
+    assert ctl.activate({"id": "summarize", "title": "Summarize", "icon": "x", "tint": "purple"}, "")["kind"] == "submenu"
     assert ctl.activate({"id": "b64"}, "")["kind"] == "run"
     assert ctl.activate({"id": "count"}, "")["kind"] == "run"
     assert ctl.activate({"id": "tone"}, "")["kind"] == "submenu"
 
     monkeypatch.setattr(main.llm, "MODE", "live")
+    monkeypatch.setattr(main.llm, "ready", True)
     seen = {}
     monkeypatch.setattr(main.llm, "stream", lambda prompt, model="": seen.setdefault("prompt", prompt) and iter(["ok"]))
     action = ctl.activate({"id": "tone:casual", "title": "Casual"}, "")
@@ -318,12 +322,12 @@ def test_palette_actions(monkeypatch):
     assert "casual tone" in seen["prompt"] and "hello world" in seen["prompt"]
     custom = ctl.activate({"id": "custom", "instruction": "in French"}, "in French")
     assert custom["kind"] == "stream"
-    assert ctl.items("", "trans")[0]["id"].startswith("trans:")
-    assert ctl.items("Kazakh", "trans")[0]["id"] == "trans:Kazakh"
-    assert ctl.items("Klingon", "trans")[-1]["id"] == "trans:Klingon"
+    assert ctl.items("", "trans")[0]["id"].startswith("language:")
+    assert ctl.items("Kazakh", "trans")[0]["id"] == "language:Kazakh"
+    assert ctl.items("Klingon", "trans")[-1]["id"] == "language:Klingon"
     prompt, _ = main.prompts.prompt_for("trans", {"llm_prompt": "Translate to {lang}: {text}"},
                                         "Brazilian Portuguese: bom dia")
-    assert prompt == "Translate to Brazilian Portuguese: bom dia"
+    assert prompt.endswith("Translate to Brazilian Portuguese: bom dia")
 
 
 def test_polite_phrase_runs_instantly():

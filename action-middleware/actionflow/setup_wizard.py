@@ -47,7 +47,7 @@ def _store_key(account: str, key: str, env_var: str) -> None:
     print(f"  {TUI.DIM}Tip: add  export {env_var}=<your key>  to your shell profile{TUI.RESET}")
 
 
-def _configure_provider(name: str, *, current_model: str = "") -> tuple[str, str] | None:
+def _configure_provider(name: str, *, current_model: str = "", settings: dict | None = None) -> tuple[str, str] | None:
     """Ask for key + model and verify them. Returns (key, model) or None."""
     info = llm.PROVIDERS[name]
     key = ""
@@ -67,7 +67,7 @@ def _configure_provider(name: str, *, current_model: str = "") -> tuple[str, str
 
     print(f"  {TUI.DIM}Checking connection…{TUI.RESET}", end="", flush=True)
     try:
-        client, model = llm.make_client(name, key, model)
+        client, model = llm.make_client(name, key, model, settings=settings)
         seconds = llm.ping(client, name, model)
         print(f"\r  {TUI.GREEN}✓ {info.label.split(' —')[0]} / {model} works ({seconds:.1f}s){TUI.RESET}   ")
     except Exception as exc:
@@ -136,7 +136,7 @@ def _offer_fallback(primary: str) -> None:
     if choice is None or choice >= len(others):
         return
     name = others[choice]
-    result = _configure_provider(name)
+    result = _configure_provider(name, settings=fb)
     if result is None:
         return
     key, model = result

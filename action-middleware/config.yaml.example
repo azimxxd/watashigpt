@@ -1,3 +1,6 @@
+# Everyday writing settings live in the app: language, saved actions and optional tools.
+# FIX:/CLEAR:/SHORT: are added automatically for existing configurations.
+# Legacy CMD/IMAGE/WIKI/DEFINE entries below are retired and cannot execute.
 confidence_threshold: 0.7
 interaction_mode: both
 # When the popup is unavailable, guess the command for un-prefixed text from
@@ -531,8 +534,8 @@ personal_commands: {}
   #         **Today:** Fixing bug #123
   #         **Blockers:** None
 command_security:
-  # CMD:/RUN: only runs these binaries (no shell). Avoid interpreters (python,
-  # node), env/printenv (they would leak API keys) and curl/find.
+  # CMD:/RUN: this list can narrow the built-in safe command/argument policy.
+  # Adding a name cannot bypass it. Git supports status/log only; no global flags.
   allowed_commands: [ls, cat, grep, git, echo, date, wc, head, tail, sort, uniq, diff, file, stat, whoami, hostname, uname, which, pwd, df, du, uptime, cal]
 image_api:
   provider: pollinations
@@ -560,3 +563,6 @@ llm:
     provider: ''
     model: ''
     api_key: ''
+    # base_url: https://backup.example/v1  # independent of primary base_url
+    # request_options: {}               # independent API options
+    # timeout: 60

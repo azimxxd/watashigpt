@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 from actionflow import __version__
+from actionflow import command_security, privacy, preferences, product
+from contextvars import ContextVar
 
 import argparse
 import json
@@ -62,7 +64,7 @@ _POPUP_AVAILABLE: bool = _NATIVE_UI or _TKINTER_AVAILABLE
 from actionflow.tui import TUI  # noqa: E402
 from actionflow import history, llm, palette, prompts, service, setup_wizard, textops  # noqa: E402
 from actionflow.analysis import (  # noqa: E402
-    AppContext, analyze_text, get_smart_suggestions, PatternLearner,
+    AppContext, analyze_text, PatternLearner,
 )
 from actionflow.config import (  # noqa: E402
     CONFIG, load_config, ensure_user_config, APP_DIR as _SCRIPT_DIR, CONFIG_PATH as _CONFIG_PATH,
@@ -305,7 +307,7 @@ def _tui_keybind_table() -> None:
     silent = CONFIG.get("hotkeys", {}).get("silent_toggle", "ctrl+alt+s")
     rows = [
         (_hotkey_label(HOTKEY), "Process selected text", TUI.CYAN, ""),
-        (_hotkey_label(UNDO_HOTKEY), "Undo last replacement", undo_color, undo_suffix),
+        (_hotkey_label(UNDO_HOTKEY), "Undo selected last result", undo_color, undo_suffix),
         (_hotkey_label(silent), "Toggle notifications", TUI.DIM, ""),
         ("CTRL+C", "Exit (in this terminal)", TUI.RED, ""),
     ]
@@ -316,39 +318,11 @@ def _tui_keybind_table() -> None:
 
 
 def _tui_commands_table() -> None:
-    commands = CONFIG.get("commands", {})
-    lines = []
-    for name, cmd in commands.items():
-        prefixes = ", ".join(cmd.get("prefixes", []))
-        keywords = ", ".join(cmd.get("keywords", [])[:3])
-        is_llm_cmd = cmd.get("llm_required", False)
-        dimmed = is_llm_cmd and llm.MODE == "mock"
-
-        if is_llm_cmd:
-            badge = f" {TUI.MAGENTA}{TUI.BOLD}[LLM]{TUI.RESET}"
-            if dimmed:
-                badge += f" {TUI.YELLOW}[MOCK]{TUI.RESET}"
-        else:
-            badge = f" {TUI.CYAN}{TUI.BOLD}[FAST]{TUI.RESET}"
-
-        count = _usage_counts.get(name, 0)
-        counter = f" {TUI.DIM}×{count}{TUI.RESET}"
-
-        if dimmed:
-            lines.append(
-                f"  {TUI.DIM}{name:<12} "
-                f"{prefixes:<20} "
-                f"{keywords}{TUI.RESET}"
-                f"{badge}{counter}"
-            )
-        else:
-            lines.append(
-                f"  {TUI.CYAN}{TUI.BOLD}{name:<12}{TUI.RESET} "
-                f"{TUI.DIM}{prefixes:<20}{TUI.RESET} "
-                f"{TUI.DIM}{keywords}{TUI.RESET}"
-                f"{badge}{counter}"
-            )
-    TUI.box("Commands", lines, TUI.CYAN)
+    TUI.box('Write anywhere', [
+        '  Fix mistakes · Make clearer · Shorten · Translate',
+        '  Select text, press the hotkey, then review before replacing.',
+        '  Type your own instruction; save it as an action for next time.',
+    ], TUI.CYAN)
 
 
 def _tui_llm_status_box() -> None:
@@ -394,7 +368,7 @@ def _palette_context_line(text: str) -> str:
 def _palette_status_line() -> str:
     if llm.MODE == "live":
         return f"{llm.provider} · {llm.model}"
-    return "Mock mode — no LLM configured"
+    return "Connect AI in Settings"
 
 
 def _commit_generated(cmd_name: str, cmd_config: dict, text: str, result: str,
@@ -405,8 +379,7 @@ def _commit_generated(cmd_name: str, cmd_config: dict, text: str, result: str,
         _usage_counts[cmd_name] = _usage_counts.get(cmd_name, 0) + 1
     _last_command = {"name": cmd_name, "config": cmd_config}
     result = llm.tidy(result)
-    _push_undo(text, result)
-    _replace_selection(result, announce=False)
+    _apply(text, result, announce=False)
     TUI.activity_entry(cmd_name, text, result, seconds, is_llm=True, trigger="popup")
     _log_history(cmd_name, text, result, int(seconds * 1000),
                  app_context=_current_app_context.context_type if _current_app_context else "",
@@ -415,123 +388,69 @@ def _commit_generated(cmd_name: str, cmd_config: dict, text: str, result: str,
                  trigger="popup", is_llm=True)
 
 
-def _handle_native_palette(text: str, source_window: str | None) -> None:
+def _writing_palette(text: str, source_window: str | None, *, demo=False, settings=False) -> None:
     global _popup_trigger, _current_source_window
-    commands = CONFIG.get("commands", {})
-    suggestions = None
-    if _current_app_context and _current_text_analysis:
-        pattern_scores = (_pattern_learner.get_scores(_current_app_context.context_type)
-                          if _pattern_learner else {})
-        suggestions = get_smart_suggestions(_current_app_context, _current_text_analysis,
-                                            commands, pattern_scores=pattern_scores)
-
-    controller = palette.PaletteController(text, commands, suggestions, prompt_for=_llm_prompt_for)
-    palette_ui = mac_ui.CommandPalette(controller, context=_palette_context_line(text),
-                                       status=_palette_status_line())
-    outcome = palette_ui.run()
-    if not outcome:
-        TUI.micro_log("Command palette closed")
+    controller = palette.PaletteController(text, CONFIG.get('commands',{}), prompt_for=_llm_prompt_for)
+    controller.demo = demo
+    context = ('Practice text · no other application will be changed' if demo else _palette_context_line(text))
+    if _NATIVE_UI:
+        ui = mac_ui.CommandPalette(controller, context=context, status=_palette_status_line())
+        if settings:
+            ui.submenu = {'id':'settings','title':'Settings'}
+            ui.reload()
+        if demo: ui.preview_buttons[5].setTitle_('Done')
+    else:
+        ui = tk_ui.WritingPalette(controller, context=context, status=_palette_status_line(), copy_text=clipboard_copy)
+        if settings:
+            ui._submenu = 'settings'
+            ui.reload()
+        if demo: ui.buttons[5].config(text='Done')
+    controller.record('opened')
+    outcome = ui.run()
+    if not outcome or outcome['kind'] == 'copied': return
+    if demo:
+        # The practice palette can preview/copy text but never inject keys into another app.
+        if outcome['kind'] == 'replace':
+            controller.remember(ui._stream_spec or {})
         return
-    if outcome["kind"] == "copied":
-        TUI.micro_log("Result copied to clipboard")
-        return
-
-    _popup_trigger = "popup"
+    _popup_trigger = 'popup'
     _current_source_window = source_window
     try:
-        if outcome["kind"] == "replace":
-            spec = palette_ui._stream_spec or {}
-            cmd_name = spec.get("cmd_name", outcome["item"]["id"])
-            TUI.status("🎯", f"Palette → {cmd_name}", TUI.GREEN)
-            _commit_generated(cmd_name, spec.get("cmd_config", {}), text,
-                              outcome["text"], outcome["seconds"])
-        else:  # "run": instant built-in command
-            name = outcome["item"]["id"]
-            TUI.status("🎯", f"Palette → {name}", TUI.GREEN)
-            dispatch(name, text, text, commands.get(name, {}))
-    except Exception as exc:
-        TUI.error(f"Palette action failed: {exc}")
-        notify(APP_NAME, f"Failed: {exc}", is_error=True)
+        if outcome['kind'] == 'replace':
+            spec = ui._stream_spec or {}
+            name = spec.get('cmd_name',outcome['item']['id'])
+            _commit_generated(name,spec.get('cmd_config',{}),text,outcome['text'],outcome['seconds'])
+            controller.remember(spec)
+            preferences.record('accepted')
+        else:
+            name = outcome['item']['id']
+            dispatch(name,text,text,controller.commands.get(name,{}))
+    except Exception:
+        preferences.record('failed')
+        # Keep the generated result available when focus/selection changed before the commit.
+        _result_queue.put(('Replacement cancelled — copy your result',outcome.get('text','') or
+                           'Your selection was not changed. Select the source text and try again.'))
+        notify(APP_NAME,'Could not replace safely. Your result is available to copy.',is_error=True)
     finally:
         _current_source_window = None
+
+
+def _show_welcome(settings=False) -> None:
+    if not _POPUP_AVAILABLE or not _job_lock.acquire(blocking=False): return
+    try:
+        _writing_palette('Hi Alex, I has checked the report. Can you sends the updated version by Friday?',
+                         None,demo=True,settings=settings)
+        try: preferences.update(onboarded=True)
+        except OSError: pass
+    finally:
+        _job_lock.release()
 
 
 def _handle_popup(text: str, source_window: str | None = None) -> None:
-    """Show the command picker popup and dispatch the chosen command."""
-    global _popup_trigger, _current_source_window
-
-    if _NATIVE_UI:
-        _handle_native_palette(text, source_window)
-        return
-
-    if not _TKINTER_AVAILABLE:
-        TUI.warn("tkinter not available — cannot show popup")
-        _popup_trigger = "prefix"
-        _current_source_window = source_window
-        try:
-            route(text)
-        finally:
-            _current_source_window = None
-        return
-
-    commands = CONFIG.get("commands", {})
-
-    # Compute smart suggestions
-    suggestions = None
-    if _current_app_context and _current_text_analysis:
-        pattern_scores = _pattern_learner.get_scores(
-            _current_app_context.context_type
-        ) if _pattern_learner else {}
-        suggestions = get_smart_suggestions(
-            _current_app_context, _current_text_analysis, commands,
-            pattern_scores=pattern_scores
-        )
-
-    picker = tk_ui.CommandPicker(text, commands, suggestions=suggestions,
-                           text_analysis=_current_text_analysis,
-                           app_context=_current_app_context)
-    result = picker.run()
-
-    if result is None:
-        TUI.micro_log(f"Command picker cancelled")
-        # Refocus original app even on cancel
-        if source_window:
-            _focus_window(source_window)
-        return
-
-    cmd_name, cmd_config, payload = result
-    is_llm = cmd_config.get("llm_required", False)
-
-    # Mock mode notification for LLM commands
-    if is_llm and llm.MODE == "mock":
-        notify(APP_NAME, f"'{cmd_name}' needs an LLM — set llm.provider in config.yaml and restart")
-        TUI.warn("LLM not configured — command not applied")
-        if source_window:
-            _focus_window(source_window)
-        return
-
-    _popup_trigger = "popup"
-    TUI.status("\U0001f3af", f"Popup \u2192 {cmd_name}", TUI.GREEN)
-
-    # Refocus the original app before processing
-    if source_window:
-        if _focus_window(source_window):
-            TUI.micro_log("Refocused source window")
-        else:
-            TUI.warn("Direct source-window focus failed — will retry before paste")
-    time.sleep(0.3)
-
-    _current_source_window = source_window
-    TUI.micro_log(f"Processing {cmd_name}...")
-    try:
-        dispatch(cmd_name, payload, text, cmd_config)
-    except Exception as exc:
-        TUI.error(f"Popup dispatch error: {exc}")
-    finally:
-        _current_source_window = None
-        # Reset keyboard state after dispatch to ensure hotkeys keep working.
-        time.sleep(0.05)
-        _reset_keyboard_state()
+    if _POPUP_AVAILABLE:
+        _writing_palette(text,source_window)
+    else:
+        notify(APP_NAME,'Install the desktop UI to preview edits before applying them.',is_error=True)
 
 
 # ============================================================
@@ -541,7 +460,7 @@ def _handle_popup(text: str, source_window: str | None = None) -> None:
 def clipboard_copy(text: str) -> None:
     ok = mac.clipboard_set(text) if _IS_MAC else linux.clipboard_set(text)
     if not ok:
-        TUI.error("Clipboard copy failed")
+        raise RuntimeError("Clipboard copy failed")
 
 
 def clipboard_paste(timeout: float = 1.0) -> str:
@@ -557,16 +476,16 @@ def _reset_keyboard_state() -> None:
 
 
 def _send_paste_keys() -> None:
-    """Paste the clipboard into the focused window (⌘V / Ctrl+V)."""
+    """Raise if the platform could not send the paste shortcut."""
     if _IS_MAC:
-        mac.wait_for_modifiers_released()
-        if not mac.send_paste():
-            TUI.warn("Cmd+V failed — grant Accessibility to your terminal app")
+        if not mac.wait_for_modifiers_released() or not mac.send_paste():
+            raise RuntimeError("Paste failed — check Accessibility permissions")
         time.sleep(0.08)
-        return
-    is_terminal = (_current_app_context is not None
-                   and _current_app_context.context_type == AppContext.TERMINAL)
-    linux.send_paste(is_terminal=is_terminal)
+    else:
+        is_terminal = (_current_app_context is not None
+                       and _current_app_context.context_type == AppContext.TERMINAL)
+        if not linux.send_paste(is_terminal=is_terminal):
+            raise RuntimeError("Paste failed")
 
 
 def _focus_by_alt_tab() -> bool:
@@ -602,11 +521,11 @@ _clipboard_restore_lock = threading.Lock()
 def _wait_for_clipboard_sync(expected_text: str,
                              timeout: float = _CLIPBOARD_SYNC_TIMEOUT) -> bool:
     """Wait briefly until clipboard content matches expected text."""
-    expected = expected_text.rstrip("\n")
+    expected = expected_text
     deadline = time.time() + timeout
 
     while time.time() < deadline:
-        current = clipboard_paste(timeout=0.08).rstrip("\n")
+        current = clipboard_paste(timeout=0.08)
         if current == expected:
             return True
         time.sleep(_CLIPBOARD_SYNC_POLL)
@@ -620,78 +539,72 @@ def _cancel_pending_clipboard_restore() -> None:
         _clipboard_restore_token += 1
 
 
-def _schedule_clipboard_restore(previous_clipboard: str) -> None:
-    """Restore clipboard asynchronously so dispatch can finish immediately."""
+def _schedule_clipboard_restore(snapshot, expected_text: str,
+                                change_count: int = -1) -> None:
+    """Restore only if this operation still owns the clipboard."""
     global _clipboard_restore_token
     with _clipboard_restore_lock:
         _clipboard_restore_token += 1
         token = _clipboard_restore_token
 
-    def _worker() -> None:
+    def worker() -> None:
         try:
             time.sleep(_CLIPBOARD_RESTORE_DELAY)
             with _clipboard_restore_lock:
                 if token != _clipboard_restore_token:
                     return
-            clipboard_copy(previous_clipboard)
-            TUI.micro_log("Clipboard restored")
-        except Exception as exc:
-            TUI.warn(f"Clipboard restore failed: {exc}")
+                if _IS_MAC and change_count >= 0:
+                    if mac.clipboard_change_count() != change_count:
+                        return
+                elif clipboard_paste(timeout=0.2) != expected_text:
+                    return
+                if _IS_MAC:
+                    mac.clipboard_restore(snapshot)
+                else:
+                    clipboard_copy(snapshot)
+        except Exception:
+            TUI.warn("Clipboard restore failed")
 
-    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _refocus_source_window_for_paste() -> None:
-    """Best-effort refocus of the original app before sending Ctrl+V."""
+    """Fail closed if the original target cannot be confirmed."""
     if not _current_source_window:
-        if _popup_trigger == "popup":
-            _focus_by_alt_tab()
-        return
-
-    for attempt in range(_FOCUS_RETRY_COUNT):
+        raise RuntimeError("Cannot identify the source window; replacement cancelled")
+    for _ in range(_FOCUS_RETRY_COUNT):
         if _focus_window(_current_source_window):
-            if attempt > 0:
-                TUI.micro_log("Refocused source window for paste")
-            time.sleep(0.06)
-            return
+            time.sleep(_FOCUS_RETRY_DELAY)
+            if _get_active_window_id() == _current_source_window:
+                return
         time.sleep(_FOCUS_RETRY_DELAY)
-
-    TUI.warn("Could not refocus source window before paste")
-    if _popup_trigger == "popup":
-        _focus_by_alt_tab()
+    raise RuntimeError("Cannot focus the source window; replacement cancelled")
 
 
-def _replace_selection(new_text: str, announce: bool = True) -> None:
+def _replace_selection(new_text: str, announce: bool = True,
+                       expected_text: str | None = None) -> None:
     if _chain_suppress_paste:
-        # Intermediate chain step — store result but don't paste
-        TUI.success("Chain step complete (output passed to next step)")
         return
-
-    previous_clipboard = clipboard_paste(timeout=0.2)
-
-    # 1. Copy result to clipboard
-    TUI.micro_log("Copying result to clipboard...")
-    clipboard_copy(new_text)
-    # Give clipboard time to register
-    time.sleep(0.15)
-    TUI.micro_log("Clipboard set")
-
-    # 2. Refocus the source window before pasting
-    TUI.micro_log(f"Source window: {_current_source_window or 'none (staying in current)'}")
+    _cancel_pending_clipboard_restore()
     _refocus_source_window_for_paste()
-    time.sleep(0.08)
-
-    # 3. Paste into focused window
-    TUI.micro_log("Sending paste keys...")
-    _send_paste_keys()
-    # Delay clipboard restore to ensure paste completes first
-    _schedule_clipboard_restore(previous_clipboard)
-
-    TUI.success("Text replaced in-place")
-    TUI.micro_log("Paste sequence complete")
+    if expected_text is not None:
+        selected = mac.capture_selection() if _IS_MAC else linux.capture_selection()
+        if selected != expected_text or _get_active_window_id() != _current_source_window:
+            raise RuntimeError("Selection changed; replacement cancelled")
+    snapshot = mac.clipboard_snapshot() if _IS_MAC else clipboard_paste(timeout=0.2)
+    clipboard_copy(new_text)
+    count = mac.clipboard_change_count() if _IS_MAC else -1
+    try:
+        if not _wait_for_clipboard_sync(new_text):
+            raise RuntimeError("Clipboard did not receive the result; replacement cancelled")
+        if _get_active_window_id() != _current_source_window:
+            raise RuntimeError("Focus changed; replacement cancelled")
+        _send_paste_keys()
+    finally:
+        _schedule_clipboard_restore(snapshot, new_text, count)
+    TUI.success("Paste sent to the source application")
     if announce:
-        truncated = new_text[:60] + ("..." if len(new_text) > 60 else "")
-        notify(APP_NAME, f"Done: \"{truncated}\"")
+        notify(APP_NAME, "Text replacement sent")
 
 
 # ============================================================
@@ -729,7 +642,10 @@ def notify(title: str, message: str, is_error: bool = False) -> None:
 
 def _push_undo(original: str, replacement: str) -> None:
     with _undo_lock:
-        _undo_stack.append({"original": original, "replacement": replacement})
+        entry = {"original": original, "replacement": replacement}
+        if _current_source_window:
+            entry["source_window"] = _current_source_window
+        _undo_stack.append(entry)
         if len(_undo_stack) > 20:
             _undo_stack.pop(0)
         count = len(_undo_stack)
@@ -737,41 +653,38 @@ def _push_undo(original: str, replacement: str) -> None:
 
 
 def _do_undo() -> None:
+    """Restore an explicitly selected result, never paste at an unchecked caret."""
+    global _current_source_window
+    if not _job_lock.acquire(blocking=False):
+        notify("Undo", "Wait for the current operation to finish", is_error=True)
+        return
+    previous_source = _current_source_window
     try:
-        time.sleep(0.2)
-        # Release modifier keys from the undo hotkey combo
+        _cancel_pending_clipboard_restore()
         _reset_keyboard_state()
-
         with _undo_lock:
-            if not _undo_stack:
-                TUI.warn("Nothing to undo")
-                notify(APP_NAME, "Nothing to undo.")
-                return
-            entry = _undo_stack.pop()
-
-        TUI.separator()
-        TUI.action("↩", "UNDO", "Restoring previous text")
-        previous_clipboard = clipboard_paste(timeout=0.2)
-        clipboard_copy(entry["original"])
-        time.sleep(0.4)
-        _refocus_source_window_for_paste()
-        _send_paste_keys()
-        _schedule_clipboard_restore(previous_clipboard)
-        time.sleep(0.15)
-
-        truncated = entry["original"][:50] + ("..." if len(entry["original"]) > 50 else "")
-        TUI.success(f"Undone — restored: \"{truncated}\"")
+            entry = _undo_stack[-1] if _undo_stack else None
+        if entry is None:
+            notify("Undo", "Nothing to undo")
+            return
+        source = _get_active_window_id()
+        if not source or source != entry.get("source_window"):
+            notify("Undo", "Select the last result in its source application first", is_error=True)
+            return
+        selected = mac.capture_selection() if _IS_MAC else linux.capture_selection()
+        if not selected or selected != entry["replacement"]:
+            notify("Undo", "Select the exact last result before undoing", is_error=True)
+            return
+        _current_source_window = source
+        _replace_selection(entry["original"], announce=False, expected_text=entry["replacement"])
         with _undo_lock:
-            remaining = len(_undo_stack)
-        if remaining == 0:
-            TUI.micro_log(f"Undo applied — stack {TUI.DIM}empty{TUI.RESET}")
-        else:
-            TUI.micro_log(f"Undo applied — stack {TUI.YELLOW}×{remaining}{TUI.RESET} remaining")
-        notify("Undo", "Undone · restored previous text")
-
-    except Exception as exc:
-        TUI.error(f"Undo error: {exc}")
-        TUI.micro_log(f"{TUI.RED}Undo error: {exc}{TUI.RESET}")
+            _undo_stack.pop()
+        notify("Undo", "Original text restored")
+    except Exception:
+        notify("Undo", "Could not restore text; undo entry retained", is_error=True)
+    finally:
+        _current_source_window = previous_source
+        _job_lock.release()
 
 
 def on_undo_triggered() -> None:
@@ -822,27 +735,11 @@ def handle_polite(text: str, full_text: str, cmd_config: dict) -> None:
             TUI.warn("No phrase match and LLM unavailable — text unchanged")
             return
 
-    _push_undo(full_text, result)
-    _replace_selection(result)
+    _apply(full_text, result)
     TUI.action("📝", "POLITE", f"\"{normalised}\" → \"{result[:60]}\"")
 
 
-# Read-only tools only. Interpreters (python, node), env/printenv (leak API
-# keys into notifications), curl and find (-exec/-delete) are deliberately
-# absent; add them in config.yaml → command_security.allowed_commands at your
-# own risk.
-_CMD_DEFAULT_ALLOWED = [
-    "ls", "cat", "grep", "git", "echo", "date", "wc", "head", "tail", "sort",
-    "uniq", "diff", "file", "stat", "whoami", "hostname", "uname", "which",
-    "pwd", "df", "du", "uptime", "cal",
-]
-
-# Arguments that turn an otherwise harmless binary into arbitrary execution
-_CMD_BLOCKED_ARGS: dict[str, tuple[str, ...]] = {
-    "git": ("-c", "--config-env", "--exec-path", "-C", "--upload-pack",
-            "--receive-pack", "--ext-cmd"),
-    "find": ("-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fls"),
-}
+_CMD_DEFAULT_ALLOWED = command_security.DEFAULT_ALLOWED
 
 _CMD_ALLOWED_COMMANDS: list[str] = list(_CMD_DEFAULT_ALLOWED)
 
@@ -857,10 +754,10 @@ _refresh_command_security()
 
 
 def handle_command(text: str, full_text: str, cmd_config: dict) -> None:
-    """Terminal Magic — execute a shell command silently.
+    """Run a command permitted by the built-in argument policy.
 
-    Security: uses shlex.split (no shell=True), allowlist for binary names,
-    and runs as $SUDO_USER (not root) via _run_as_user().
+    Resolve a trusted system binary without a shell, and run as the real
+    user (not root) via _run_as_user().
     """
     command = text.strip()
 
@@ -876,25 +773,16 @@ def handle_command(text: str, full_text: str, cmd_config: dict) -> None:
         TUI.error("CMD: empty command")
         return
 
-    # Allowlist check: only the binary name (basename), not full paths
-    binary = os.path.basename(parts[0])
-    if "/" in parts[0] or binary not in _CMD_ALLOWED_COMMANDS:
-        TUI.error(f"BLOCKED — '{parts[0]}' not in allowed commands list")
-        notify("Security Block",
-               f"'{parts[0]}' is not allowed. Allowed: {', '.join(_CMD_ALLOWED_COMMANDS[:10])}...")
-        return
-    blocked = _CMD_BLOCKED_ARGS.get(binary, ())
-    bad = next((a for a in parts[1:] if a in blocked or
-                any(a.startswith(b + "=") for b in blocked if b.startswith("--"))), None)
-    if bad:
-        TUI.error(f"BLOCKED — '{binary} {bad}' can execute arbitrary code")
-        notify("Security Block", f"'{bad}' is not allowed with {binary}")
+    try:
+        parts = command_security.validated_argv(parts, _CMD_ALLOWED_COMMANDS)
+    except ValueError as exc:
+        notify("Security Block", str(exc), is_error=True)
         return
 
     try:
         # Execute as the real user, NOT root — shell=False by default
         result = _run_as_user(parts, capture_output=True, text=True, timeout=30,
-                              cwd=str(Path.home()), stdin=subprocess.DEVNULL)
+                              cwd=str(linux.effective_home() if linux else Path.home()), stdin=subprocess.DEVNULL)
 
         TUI.action("⚡", "COMMAND", f"`{command}`")
 
@@ -925,8 +813,7 @@ def handle_test(text: str, full_text: str, cmd_config: dict) -> None:
     content = text.strip()
     result = f"[TEST OK] \"{content}\" | session={_SESSION_TYPE} | wayland={_IS_WAYLAND} | llm={llm.MODE}"
 
-    _push_undo(full_text, result)
-    _replace_selection(result)
+    _apply(full_text, result)
 
     TUI.action("🧪", "TEST", f"Input: \"{content}\"")
     TUI.success(f"Output: \"{result}\"")
@@ -963,7 +850,7 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict,
 
     prompt, cmd_model = _llm_prompt_for(cmd_key, cmd_config, text)
 
-    TUI.status("\U0001f916", f"Processing with LLM...", TUI.CYAN)
+    TUI.status("\U0001f916", "Processing with LLM...", TUI.CYAN)
 
     result = llm.call(prompt, model_override=cmd_model)
 
@@ -971,18 +858,27 @@ def handle_llm_command(text: str, full_text: str, cmd_config: dict,
         # Display-only: show in a popup, don't replace text
         _result_queue.put((cmd_name, result))
     else:
-        _push_undo(full_text, result)
-        _replace_selection(result)
+        _apply(full_text, result)
 
     truncated = result[:80] + ("..." if len(result) > 80 else "")
     provider_tag = f" [{llm.last_provider_used}]" if llm.last_provider_used else ""
     TUI.action("\U0001f916", cmd_name.upper(), f"\"{truncated}\"{provider_tag}")
 
 
-def _apply(full_text: str, result: str) -> None:
-    """Record an undo point and paste `result` over the selection."""
-    _push_undo(full_text, result)
-    _replace_selection(result)
+_dispatch_result = ContextVar("dispatch_result", default=None)
+
+
+def _apply(full_text: str, result: str, announce: bool = True) -> None:
+    """Commit once, then record undo and an explicit dispatch result."""
+    if not _chain_suppress_paste:
+        if announce:
+            _replace_selection(result, expected_text=full_text)
+        else:
+            _replace_selection(result, announce=False, expected_text=full_text)
+        _push_undo(full_text, result)
+    frame = _dispatch_result.get()
+    if frame is not None:
+        frame["text"] = result
 
 
 def handle_fmt(text: str, full_text: str, cmd_config: dict) -> None:
@@ -1065,8 +961,7 @@ def handle_date(text: str, full_text: str, cmd_config: dict) -> None:
             return
 
         result = parsed.strftime("%Y-%m-%d")
-        _push_undo(full_text, result)
-        _replace_selection(result)
+        _apply(full_text, result)
 
         TUI.action("📅", "DATE", f"\"{content}\" → {result}")
         notify("Date", f"{content} → {result}")
@@ -1092,9 +987,8 @@ def handle_sanitize(text: str, full_text: str, cmd_config: dict) -> None:
 def handle_password(text: str, full_text: str, cmd_config: dict) -> None:
     length = (cmd_config.get("password_config") or {}).get("length", 20)
     password = textops.generate_password(length)
-    _push_undo(full_text, password)
-    _replace_selection(password, announce=False)  # never show it in Notification Center
-    TUI.action("🔑", "PASSWORD", f"Generated {len(password)}-char password ({password[:4]}...)")
+    _apply(full_text, password, announce=False)  # never show it in Notification Center
+    TUI.action("🔑", "PASSWORD", f"Generated {len(password)}-char password")
 
 
 def handle_repeat(text: str, full_text: str, cmd_config: dict) -> None:
@@ -1107,7 +1001,12 @@ def handle_repeat(text: str, full_text: str, cmd_config: dict) -> None:
     cmd_name = _last_command["name"]
     last_config = _last_command["config"]
     TUI.status("🔁", f"Repeating: {cmd_name}", TUI.CYAN)
-    dispatch(cmd_name, text.strip(), full_text, last_config)
+    result = dispatch(cmd_name, text.strip(), full_text, last_config)
+    if result is None:
+        raise RuntimeError("Repeated command failed")
+    frame = _dispatch_result.get()
+    if frame is not None:
+        frame["text"] = result
 
 
 _CLIP_NAME_RE = _re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
@@ -1230,8 +1129,7 @@ def handle_tone(text: str, full_text: str, cmd_config: dict) -> None:
 
     result = llm.call(prompt, model_override=cmd_model)
 
-    _push_undo(full_text, result)
-    _replace_selection(result)
+    _apply(full_text, result)
 
     truncated = result[:80] + ("..." if len(result) > 80 else "")
     provider_tag = f" [{llm.last_provider_used}]" if llm.last_provider_used else ""
@@ -1264,8 +1162,7 @@ def handle_trans(text: str, full_text: str, cmd_config: dict) -> None:
 
     result = llm.call(prompt, model_override=cmd_model)
 
-    _push_undo(full_text, result)
-    _replace_selection(result)
+    _apply(full_text, result)
 
     truncated = result[:80] + ("..." if len(result) > 80 else "")
     provider_tag = f" [{llm.last_provider_used}]" if llm.last_provider_used else ""
@@ -1409,16 +1306,17 @@ def handle_image(text: str, full_text: str, cmd_config: dict) -> None:
         TUI.success(f"Image saved: {image_path}")
 
         # Copy image to clipboard and paste
+        _refocus_source_window_for_paste()
         if _clipboard_copy_image(str(image_path)):
             time.sleep(0.15)
+            if _get_active_window_id() != _current_source_window:
+                raise RuntimeError("Focus changed; image paste cancelled")
             _send_paste_keys()
             TUI.success("Image pasted into application")
             paste_msg = "Pasted into app"
         else:
             # Fallback: insert the file path as text
-            clipboard_copy(str(image_path))
-            time.sleep(0.4)
-            _send_paste_keys()
+            _apply(full_text, str(image_path))
             TUI.warn("Could not paste image — inserted file path instead")
             paste_msg = "Path inserted (image paste unavailable)"
 
@@ -1568,8 +1466,7 @@ def handle_personal_command(text: str, full_text: str, cmd_config: dict) -> None
     prompt, model = _llm_prompt_for("personal", cmd_config, text)
     result = llm.call(prompt, model_override=model)
 
-    _push_undo(full_text, result)
-    _replace_selection(result)
+    _apply(full_text, result)
     TUI.action("👤", "PERSONAL", f"{cmd_config.get('description', '')[:30]}: {result[:40]}")
     notify("Personal Command", f"{result[:80]}")
 
@@ -1648,6 +1545,10 @@ def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> s
     """
     global _last_command, _current_notify_level
 
+    if cmd_name in product.DISABLED_COMMANDS:
+        notify(APP_NAME,'This command has been retired. ActionFlow now focuses on writing.',is_error=True)
+        return None
+
     # Set per-command notification level (always | errors_only | never)
     _current_notify_level = cmd_config.get("notify", "always")
 
@@ -1660,16 +1561,17 @@ def dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict) -> s
 
     is_llm = cmd_config.get("llm_required", False) or cmd_name not in _BUILTIN_HANDLERS
     start_time = time.time()
+    token = _dispatch_result.set({"text": ""})
     try:
-        return _dispatch(cmd_name, payload, full_text, cmd_config, is_llm, start_time)
+        with privacy.command_scope(cmd_name):
+            return _dispatch(cmd_name, payload, full_text, cmd_config, is_llm, start_time)
     finally:
+        _dispatch_result.reset(token)
         _current_notify_level = "always"  # per-command setting must not leak
 
 
 def _dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict,
               is_llm: bool, start_time: float) -> str | None:
-    with _undo_lock:
-        undo_depth = len(_undo_stack)
     history_ctx = dict(
         app_context=_current_app_context.context_type if _current_app_context else "",
         text_length=len(payload),
@@ -1695,9 +1597,7 @@ def _dispatch(cmd_name: str, payload: str, full_text: str, cmd_config: dict,
         return None
 
     duration = time.time() - start_time
-    with _undo_lock:
-        pushed = len(_undo_stack) > undo_depth
-        output = _undo_stack[-1]["replacement"] if pushed else ""
+    output = _dispatch_result.get()["text"]
     TUI.activity_entry(cmd_name, payload, output or "(no text change)", duration,
                        is_llm=is_llm, trigger=_popup_trigger)
     _log_history(cmd_name, payload, output or "(no text change)", int(duration * 1000),
@@ -1824,11 +1724,6 @@ def route(text: str) -> None:
                 notify(APP_NAME, f"Chain stopped at step {step_label} — text left unchanged",
                        is_error=True)
                 return
-            # Intermediate results are not undo points: undo must restore the
-            # originally selected text, not a half-processed one.
-            with _undo_lock:
-                if _undo_stack and _undo_stack[-1]["replacement"] == output:
-                    _undo_stack.pop()
             current_input = output
 
         return
@@ -1886,8 +1781,7 @@ def route(text: str) -> None:
             return
 
     # Tier 4: Fallback
-    truncated = text[:40] + ("..." if len(text) > 40 else "")
-    TUI.warn(f"Unknown command: \"{truncated}\"")
+    TUI.warn("Unknown command")
 
     available = ", ".join(
         p for cmd in commands.values() for p in cmd.get("prefixes", [])
@@ -1922,8 +1816,9 @@ def _do_intercept() -> None:
 
         TUI.separator()
         TUI.status("⌨", "Hotkey triggered — reading selection...", TUI.CYAN)
-        TUI.micro_log(f"Hotkey triggered — reading selection...")
+        TUI.micro_log("Hotkey triggered — reading selection...")
 
+        captured_source = _get_active_window_id()
         if _IS_MAC:
             text: str = mac.capture_selection()
             if not text:
@@ -1942,8 +1837,10 @@ def _do_intercept() -> None:
             notify(APP_NAME, "No text selected.")
             return
 
-        truncated = text[:60] + ("..." if len(text) > 60 else "")
-        TUI.action("📋", "CAPTURED", f"\"{truncated}\"")
+        if captured_source and _get_active_window_id() != captured_source:
+            notify(APP_NAME, "Source window changed; try again", is_error=True)
+            return
+        TUI.action("📋", "CAPTURED", f"{len(text)} characters")
 
         # Phase 8: detect app context and analyze text
         global _current_app_context, _current_text_analysis
@@ -1964,15 +1861,15 @@ def _do_intercept() -> None:
         # If user explicitly typed a prefix/chain, run immediately without popup.
         if has_prefix or has_chain:
             _popup_trigger = "prefix"
-            _current_source_window = _get_active_window_id()
+            _current_source_window = captured_source
             if _current_source_window:
                 TUI.micro_log(f"Captured source window: {_current_source_window}")
             else:
-                TUI.micro_log("Captured source window: unavailable (will use Alt+Tab fallback)")
+                TUI.micro_log("Source window unavailable; automatic replacement is disabled")
 
             TUI.micro_log("Prefix detected — executing without popup")
             try:
-                route(routed_text)
+                route(text)
             finally:
                 _current_source_window = None
                 # Reset keyboard state after dispatch to ensure hotkeys keep working.
@@ -1983,11 +1880,11 @@ def _do_intercept() -> None:
         # No prefix: open command picker popup
         if _POPUP_AVAILABLE:
             # Save which window is focused so we can refocus it after the popup
-            source_window = _get_active_window_id()
+            source_window = captured_source
             if source_window:
                 TUI.micro_log(f"Captured source window: {source_window}")
             else:
-                TUI.micro_log("Captured source window: unavailable (will use Alt+Tab fallback)")
+                TUI.micro_log("Source window unavailable; automatic replacement is disabled")
             _popup_queue.put((text, source_window))
             handed_to_palette = True
             TUI.micro_log("Opening command picker...")
@@ -2001,7 +1898,7 @@ def _do_intercept() -> None:
             return
         TUI.warn("tkinter unavailable — using keyword/LLM routing (smart_routing: true)")
         _popup_trigger = "prefix"
-        _current_source_window = _get_active_window_id()
+        _current_source_window = captured_source
         try:
             route(text)
         finally:
@@ -2048,15 +1945,15 @@ def _command_search() -> None:
         if select.select([sys.stdin], [], [], 0.1)[0]:
             ch = sys.stdin.read(1)
             if ch == '\x1b':  # Escape
-                sys.stdout.write(f"\r\033[K")
+                sys.stdout.write("\r\033[K")
                 sys.stdout.flush()
                 return
             elif ch == '\x03':  # Ctrl+C
-                sys.stdout.write(f"\r\033[K")
+                sys.stdout.write("\r\033[K")
                 sys.stdout.flush()
                 return
             elif ch in ('\r', '\n'):  # Enter — show results
-                sys.stdout.write(f"\r\033[K\n")
+                sys.stdout.write("\r\033[K\n")
                 sys.stdout.flush()
                 if matches:
                     lines = []
@@ -2131,8 +2028,7 @@ def _start_mac_menubar() -> None:
         TUI.warn(f"Menu bar icon unavailable: {exc}")
         return
 
-    mode = f"live · {llm.provider}/{llm.model}" if llm.MODE == "live" else "mock mode (no LLM)"
-    bar.add_item(f"ActionFlow — {mode}")
+    bar.add_item("ActionFlow — writing assistant")
     bar.add_item(f"{mac.format_hotkey(HOTKEY)}  process selection   "
                  f"{mac.format_hotkey(UNDO_HOTKEY)}  undo")
     bar.add_separator()
@@ -2146,10 +2042,9 @@ def _start_mac_menubar() -> None:
     bar.add_item("Recent history…", lambda: _result_queue.put(("History (last 20)",
                                                                 history.recent_text())))
     bar.add_separator()
-    bar.add_item("Open config.yaml", lambda: mac.open_path(str(_CONFIG_PATH)))
+    bar.add_item("Settings & practice…", lambda: _run_on_main(lambda: _show_welcome(settings=True)))
+    bar.add_item("Advanced configuration…", lambda: mac.open_path(str(_CONFIG_PATH)))
     bar.add_item("Reload config", _reload_config)
-    bar.add_item("Open images folder", lambda: mac.open_path(str(_IMAGE_DIR))
-                 if _IMAGE_DIR.exists() else notify(APP_NAME, "No generated images yet"))
     bar.add_separator()
     bar.add_item("Quit ActionFlow", _exit_event.set, key="q")
     _mac_menubar = bar
@@ -2179,10 +2074,7 @@ def _start_tray() -> None:
         _result_queue.put(("History (last 20)", history.recent_text()))
 
     def on_settings(icon, item):
-        try:
-            _run_as_user(["xdg-open", str(_CONFIG_PATH)], capture_output=True, timeout=5)
-        except Exception:
-            pass
+        _run_on_main(lambda: _show_welcome(settings=True))
 
     def on_reload(icon, item):
         _reload_config()
@@ -2317,8 +2209,8 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
         _usage_counts[cmd_name] = 0
 
     # Interactive LLM setup (only if not already configured)
-    setup_wizard.run_llm_setup()
-    _init_image_api()
+    if not _POPUP_AVAILABLE:
+        setup_wizard.run_llm_setup()
 
     # Init LLM
     llm.on_warning = TUI.warn
@@ -2434,6 +2326,9 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
     TUI.micro_log(f"{cmd_count} commands loaded | {llm_label} | {HOTKEY.upper()} to intercept")
     TUI.micro_log(f"{TUI.DIM}/ = search  S = export session  Ctrl+C = exit{TUI.RESET}")
     print()
+
+    if _POPUP_AVAILABLE and not preferences.load()["onboarded"]:
+        _show_welcome()
 
     interactive = sys.stdin.isatty()
     try:

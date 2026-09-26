@@ -113,14 +113,15 @@ def resolve_api_key(kind: str, provider_name: str, config_value: str = "") -> st
 # Clients
 # ============================================================
 
-def make_client(provider_name: str, api_key: str, model_name: str = ""):
+def make_client(provider_name: str, api_key: str, model_name: str = "", *,
+                settings: dict | None = None):
     """(client, resolved_model). Raises ValueError for unknown providers."""
     from openai import OpenAI
 
     if provider_name in RETIRED_PROVIDERS:
         raise ValueError(f"{RETIRED_PROVIDERS[provider_name]} — choose another provider")
     info = PROVIDERS.get(provider_name)
-    llm_cfg = CONFIG.get("llm", {})
+    llm_cfg = settings if settings is not None else CONFIG.get("llm", {})
     base_url = (llm_cfg.get("base_url") or "").strip() or (info.base_url if info else None)
     if info is None and not base_url:
         raise ValueError(f"Unknown LLM provider '{provider_name}' (set llm.base_url for custom endpoints)")
@@ -134,15 +135,17 @@ def make_client(provider_name: str, api_key: str, model_name: str = ""):
     return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=1), resolved
 
 
-def init() -> None:
+def init(primary_key: str | None = None) -> None:
     """Initialise primary + fallback clients from CONFIG. Sets MODE='live' on success."""
     global client, ready, provider, model, MODE
     global fallback_client, fallback_ready, fallback_provider, fallback_model
 
+    client, ready, provider, model, MODE = None, False, "", "", "mock"
+    fallback_client, fallback_ready, fallback_provider, fallback_model = None, False, "", ""
     llm_cfg = CONFIG.get("llm", {})
     name = (llm_cfg.get("provider") or "").strip().lower()
     info = PROVIDERS.get(name)
-    key = resolve_api_key("llm", name, llm_cfg.get("api_key", ""))
+    key = primary_key if primary_key is not None else resolve_api_key("llm", name, llm_cfg.get("api_key", ""))
     if not name or (not key and not (info and info.local)):
         return
     try:
@@ -163,7 +166,8 @@ def init() -> None:
             on_warning(f"Fallback provider {fb_name} has no API key — run: main.py --set-key {fb_name}")
             return
         try:
-            fallback_client, fallback_model = make_client(fb_name, fb_key, (fb_cfg.get("model") or "").strip())
+            fallback_client, fallback_model = make_client(
+                fb_name, fb_key, (fb_cfg.get("model") or "").strip(), settings=fb_cfg)
             fallback_provider, fallback_ready = fb_name, True
         except Exception as exc:
             on_warning(f"Fallback LLM setup failed for {fb_name}: {exc}")
@@ -189,7 +193,12 @@ def request_options(provider_name: str, model_name: str) -> dict:
         extra = {"reasoning_effort": "none" if "2.5-flash" in m else "low"}
     elif provider_name == "openrouter":
         extra = {"reasoning": {"effort": "low", "exclude": True}}
-    user_extra = CONFIG.get("llm", {}).get("request_options")
+    settings = CONFIG.get("llm", {})
+    fb = settings.get("fallback")
+    fb = fb if isinstance(fb, dict) else {}
+    if provider_name == fb.get("provider") and provider_name != settings.get("provider"):
+        settings = fb
+    user_extra = settings.get("request_options")
     if isinstance(user_extra, dict):
         extra.update(user_extra)
     return extra
@@ -219,10 +228,10 @@ def _create(client_obj, provider_name: str, model_name: str, prompt: str,
     extra = request_options(provider_name, model_name)
     try:
         return client_obj.chat.completions.create(**kwargs, extra_body=extra or None)
-    except BadRequestError as exc:
+    except BadRequestError:
         if not extra:
             raise
-        on_warning(f"{provider_name} rejected extra options ({exc.message[:80]}) — retrying without")
+        on_warning(f"{provider_name} rejected extra options — retrying without")
         return client_obj.chat.completions.create(**kwargs)
 
 
@@ -235,7 +244,7 @@ def _settings(max_tokens: int | None, temperature: float | None) -> tuple[int, f
 def _candidates(model_override: str) -> list[tuple]:
     out = [(client, provider, model_override or model)]
     if fallback_ready and fallback_client:
-        out.append((fallback_client, fallback_provider, model_override or fallback_model))
+        out.append((fallback_client, fallback_provider, fallback_model))
     return out
 
 
@@ -267,7 +276,7 @@ def call(prompt: str, model_override: str = "", *, max_tokens: int | None = None
             last_provider_used = prov if not i else f"{prov} (fallback)"
             return text
         except Exception as exc:
-            on_warning(f"LLM ({prov}) failed: {exc}")
+            on_warning(f"LLM ({prov}) failed: {type(exc).__name__}")
             last_exc = exc
     last_provider_used = ""
     raise LLMError(str(last_exc)[:200]) from last_exc
@@ -297,7 +306,7 @@ def stream(prompt: str, model_override: str = "") -> Iterator[str]:
         except Exception as exc:
             if produced:
                 raise LLMError(f"connection lost mid-response: {exc}"[:200]) from exc
-            on_warning(f"LLM ({prov}) failed: {exc}")
+            on_warning(f"LLM ({prov}) failed: {type(exc).__name__}")
             last_exc = exc
     raise LLMError(str(last_exc)[:200]) from last_exc
 

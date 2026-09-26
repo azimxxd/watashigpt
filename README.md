@@ -1,197 +1,205 @@
+<div align="center">
+
 # ActionFlow
 
-Select text anywhere, press a hotkey, and rewrite / translate / summarize / format it in place —
-with a free LLM or 20+ built-in tools. A Spotlight-style command palette on macOS, a Tk picker on Linux.
+### Better writing, right where you work.
 
-**by WatashiGPT**
+Select text. Choose an action. Review the changes. Put it back.
 
-![Python](https://img.shields.io/badge/Python-3.9+-blue)
-![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-green)
+**A small desktop writing assistant by WatashiGPT.**
+
+![macOS](https://img.shields.io/badge/macOS-native_AppKit-222222?style=flat-square&logo=apple)
+![Linux](https://img.shields.io/badge/Linux-Tk_interface-222222?style=flat-square&logo=linux)
+![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Privacy](#privacy) · [Advanced setup](docs/advanced.md)
+
+</div>
+
+<br>
+
+<p align="center">
+  <img src="docs/images/writing-palette.png" alt="ActionFlow macOS palette showing Fix mistakes, Make clearer, Shorten and Translate" width="820">
+</p>
+
+<p align="center"><sub>The macOS interface with example text. Linux follows the same workflow in a Tk window.</sub></p>
+
+## Four actions. Your own instructions.
+
+ActionFlow helps with the writing you already do: messages, emails and everyday notes.
+Use it from the app you are working in, without moving your text into a separate chat.
+
+| Action | When to use it |
+| :--- | :--- |
+| **Fix mistakes** | Correct spelling, grammar and punctuation while keeping your voice. |
+| **Make clearer** | Make a sentence easier to understand, without making it more formal. |
+| **Shorten** | Remove unnecessary words and keep the essential information. |
+| **Translate** | Translate directly into your last chosen language. |
+
+Need something different? Type an instruction:
+
+> Make this friendlier, but keep it short.
+>
+> Turn these notes into an email.
+>
+> Translate into English using simple, natural wording.
+
+After a successful custom instruction, choose **Save action** to use it again on different text.
+Only the instruction and its name are saved. You can remove saved actions in Settings.
 
 ## How it works
 
-1. Select text in any app
-2. Press `⌃⌥X` (macOS) / `Ctrl+Alt+X` (Linux) — the command palette opens
-3. Pick a command, or just **type an instruction** (“make it shorter, in English”) and press `↵`
-4. AI results stream into a preview — `↵` replaces your selection, `⇥` regenerates,
-   typing refines it, `⌘C` copies instead
-5. `⌃⌥Z` undoes the last replacement
+1. **Select** text in your editor, browser, mail app or messenger.
+2. **Open** ActionFlow with **⌃⌥X** on macOS or **Ctrl+Alt+X** on Linux.
+3. **Choose** one of the four actions, or write your own instruction.
+4. **Review** the streamed result. Compare **Original**, **Changes** and **Result**.
+5. **Replace** the selection, **Copy** the result, or type a refinement and try again.
 
-Prefer the keyboard? Start the selection with a prefix (`SUM: long text`, `TRANS:EN: привет`)
-and the hotkey runs it immediately. Chain with `|`: `POL:|SUM: text`.
+<p align="center">
+  <img src="docs/images/change-preview.png" alt="ActionFlow change preview: removed words are red and struck through, added words have a green background" width="820">
+</p>
+
+<p align="center"><sub>Review exactly what changed. Copy and Replace always use the clean result, even when Original or Changes is selected.</sub></p>
+
+The language selector remembers your translation language. The last accepted or copied action
+is remembered too. There is no YAML to edit for ordinary use.
 
 ## Quick start
 
 ### macOS
 
-```bash
+```sh
+git clone https://github.com/azimxxd/watashigpt.git
+cd watashigpt
+# This writing-focused version is currently on the macos-support branch.
+git switch macos-support
 cd action-middleware
-./run.sh            # creates .venv on first run (uses uv if installed), then starts
+./run.sh
 ```
 
-No suitable Python? `curl -LsSf https://astral.sh/uv/install.sh | sh` — `run.sh` then
-creates a Python 3.12 venv automatically.
+The launcher creates a virtual environment and installs dependencies on the first run.
+Use Python **3.9+**, or an installed `uv` to let the launcher provision Python 3.12.
 
-On first launch:
-1. Pick an LLM provider (free ones need no card) and paste the key — it's verified and saved to the Keychain.
-2. Grant your terminal app **Accessibility** and **Input Monitoring**
-   (System Settings → Privacy & Security), then restart the terminal.
+- Grant your terminal **Accessibility** and **Input Monitoring** in
+  **System Settings → Privacy & Security**. Restart the terminal if prompted.
+- Connect an AI provider in the first-run practice window. Enter an API key and choose a model
+  available to your account, or connect a local model.
+- Try the sample sentence. The practice window never replaces text in another app.
 
-| Permission | Why |
-|------------|-----|
-| Accessibility | Send ⌘C / ⌘V to the focused app, swallow the hotkey |
-| Input Monitoring | Listen for the global hotkey |
+Return to setup through **Settings & practice…** in the menu bar. Existing provider configuration
+is retained. Start-at-login instructions are in [advanced setup](docs/advanced.md#start-at-login).
 
-Start at login (menu bar icon, no terminal window): `python main.py --install`
-(logs: `~/Library/Logs/ActionFlow.log`, remove with `--uninstall`). The login agent runs Python
-directly, so grant the two permissions to the Python path `--install` prints.
+<details>
+<summary><strong>Linux setup</strong></summary>
 
-### Linux (X11 / Wayland)
+Install the tools for your desktop session:
 
-```bash
-sudo apt-get install wl-clipboard libnotify-bin python3-gi gir1.2-atspi-2.0   # Wayland
-sudo apt-get install xclip xdotool libnotify-bin                              # X11
-cd action-middleware && ./run.sh      # runs with sudo -E (the keyboard library reads /dev/input)
+```sh
+# Wayland
+sudo apt-get install python3-tk wl-clipboard libnotify-bin python3-gi gir1.2-atspi-2.0
+
+# X11
+sudo apt-get install python3-tk xclip xdotool libnotify-bin
 ```
 
-Service: `sudo -E python main.py --install` (API key goes in `/etc/actionflow.env`).
-On GNOME Wayland a helper process uses the xdg-desktop-portal to paste.
+Then clone the repository, select `macos-support`, and run `action-middleware/run.sh` as above.
+The Tk window provides the same four actions, custom instructions, streaming preview and saved actions.
 
-Windows is not supported.
+Global hotkeys currently require root, so the launcher uses `sudo -E`.
+A working desktop keyring is needed to save API keys through the UI. For sessions without one,
+use the environment-based configuration described in [advanced setup](docs/advanced.md#providers).
 
-## LLM providers
+Automatic replacement requires a verifiable source window. On unsupported desktop/compositor
+combinations, use **Copy** and paste the result yourself.
 
-All OpenAI-compatible; defaults checked September 2026. Reasoning/“thinking” is turned off or
-down automatically — text edits need speed.
+</details>
 
-| Provider | Free | Default model | Key |
-|----------|------|---------------|-----|
-| **Groq** | ✓ | `openai/gpt-oss-120b` | [console.groq.com/keys](https://console.groq.com/keys) |
-| **Google Gemini** | ✓ | `gemini-3.5-flash-lite` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| **Cerebras** | ✓ | `gpt-oss-120b` | [cloud.cerebras.ai](https://cloud.cerebras.ai) |
-| **OpenRouter** | ✓ (`:free` models) | `qwen/qwen3.8-27b:free` | [openrouter.ai/keys](https://openrouter.ai/keys) |
-| OpenAI | paid | `gpt-6-luna` | [platform.openai.com](https://platform.openai.com/api-keys) |
-| Ollama / LM Studio | local | `qwen3.5:9b` / loaded model | — |
+## Review stays in your hands
 
-- **Backup provider** — setup offers a second free provider; it takes over when the first fails or hits a rate limit.
-- **Keys** — env var (`ACTIONFLOW_API_KEY`) → `config.yaml` → system keychain. Save one: `python main.py --set-key groq`.
-- **Check** — `python main.py --check` pings the configured providers and lists the models your key can use.
-- **Any endpoint** — set `llm.base_url`; extra API params via `llm.request_options`.
-- **Failures never touch your text** — you get an error and the selection stays as it was.
-- Retired upstream: GitHub Models (July 2026), `gemini-2.0-flash` (auto-replaced).
+| Control | Action |
+| :--- | :--- |
+| **Enter** | Replace the selection, or apply a typed refinement. |
+| **Tab** | Regenerate after the request finishes. |
+| **Escape** | Cancel generation or go back. |
+| **Original / Changes / Result** | Switch the preview without changing the output. |
+| **Save action** | Save a standalone custom instruction for reuse. |
+| **Language** | Change the default translation language. |
 
-## Commands
+Before replacing, ActionFlow checks the source app/window, selected text and clipboard. If the
+selection changes, the generated result stays available in a copyable popup. The delayed clipboard
+restore skips newer copies; on macOS it also preserves the previous clipboard's rich formats.
 
-### Built-in (no LLM required)
+**To undo:** select the exact last inserted result in its source app, then press **⌃⌥Z** or
+**Ctrl+Alt+Z**. Undo does not paste the original text at an unchecked cursor position.
 
-| Prefix | Action | Notes |
-|--------|--------|-------|
-| `POL:` / `POLITE:` | Rewrite rude/blunt text politely | Phrase lookup, LLM fallback |
-| `CMD:` / `RUN:` | Execute a command (no shell) | Binary allowlist + blocked exec flags |
-| `TEST:` / `PING:` | Pipeline verification | |
-| `FMT:` / `FORMAT:` | Pretty-print JSON / YAML / XML | `min:` / `sort:` modes |
-| `COUNT:` / `STATS:` | Word/char/line stats + reading time | Shown in a popup, text unchanged |
-| `MOCK:` / `SPONGE:` | Spongebob alternating caps | |
-| `B64:` / `BASE64:` | Base64 encode | |
-| `DECODE:` / `DB64:` | Base64 decode | Error notification on invalid |
-| `HASH:` / `SHA:` | SHA256 hex digest | |
-| `REDACT:` / `PII:` | Mask emails, phones, cards, IBANs, IPs, API keys | Regex-based |
-| `CALC:` / `MATH:` | Safe math evaluator | Handles `15% of 340`, `sqrt(144)`, arithmetic |
-| `DATE:` | Natural language date → ISO format | Uses `dateparser` |
-| `ESCAPE:` / `ESC:` | Escape special characters | Auto-detects HTML/SQL/regex |
-| `SANITIZE:` / `STRIP:` | Strip HTML/markdown/ANSI formatting | Auto-detects format type |
-| `PASSWORD:` / `PW:` | Generate strong random password | |
-| `REPEAT:` / `AGAIN:` | Re-run last command on current selection | |
-| `CLIP:` | Named clipboard slots | `CLIP:save name` / `CLIP:load name` / `CLIP:list` |
-| `STACK:` / `PUSH:` | Push clipboard onto stack | |
-| `POP:` | Pop top item from clipboard stack | |
-| `WIKI:` | Wikipedia article summary | Shown in a popup |
-| `DEFINE:` | Dictionary word definition | Shown in a popup |
-| `IMG:` / `IMAGE:` | Generate an image and paste it | Pollinations.ai — free without a key |
+**Current limitation:** generated edits are plain text. Prompts request that paragraph/list structure,
+facts, names, numbers and links be preserved, but the model can still make mistakes. Review the result;
+fonts, colours and other rich-text styles are not retained.
 
-### LLM Commands (require a configured provider)
+## A small interface, with room to grow
 
-| Prefix | Action |
-|--------|--------|
-| `SUM:` / `TLDR:` | Summarize text |
-| `RW:` / `REWRITE:` | Rewrite professionally |
-| `EXP:` / `EXPLAIN:` | Explain in simple terms |
-| `TONE:style:` | Dynamic tone rewriting (`TONE:casual:`, `TONE:formal:`, etc.) |
-| `BULLETS:` / `LIST:` | Convert to bullet list |
-| `TITLE:` / `HEADLINE:` | Generate short headline |
-| `TWEET:` | Shorten to 280 chars |
-| `EMAIL:` | Generate email from rough notes |
-| `REGEX:` | Generate regex from description |
-| `DOCSTRING:` / `DOC:` | Generate code docstring |
-| `REVIEW:` / `CR:` | Quick code review |
-| `GITCOMMIT:` / `COMMIT:` | Generate conventional commit message |
-| `MEETING:` / `NOTES:` | Structure meeting notes |
-| `TODO:` / `ACTIONS:` | Extract action items as checklist |
-| `ELI5:` | Explain like I'm 5 |
-| `HAIKU:` | Rewrite as haiku |
-| `ROAST:` | Light roast of selected text |
-| `FILL:` | Fill `{{placeholder}}` markers from context |
-| `TRANS:lang:` | Translate (`TRANS:EN:`, `TRANS:Kazakh:`, `TRANS:Brazilian Portuguese:`) |
+The main palette stays focused. Enable either optional group in **Settings** if you need it:
 
-### Pipe Chains
+- **Additional tools:** summarize, change tone, count words, format structured text, redact data
+  and other text utilities.
+- **Developer tools:** code review, docstrings, regular expressions and commit messages.
 
-Chain multiple commands by separating with `|`:
+Both groups are off by default. Saved instructions are the simplest way to add your own recurring tasks.
+Contextual refinements cannot be saved as standalone actions, because they depend on an earlier result.
 
-```
-POL:|SUM: rude long text   →  rewrites politely, then summarizes
-```
+<details>
+<summary><strong>Upgrading from the command-heavy version?</strong></summary>
 
-### Personal Commands
+Shell execution, image generation, Wikipedia and dictionary commands are retired, including their old
+prefixes. Novelty commands no longer appear in the palette.
 
-Define your own commands in `config.yaml` under `personal_commands:` with few-shot examples. They appear with a `[ME]` badge in the popup.
+Existing non-retired prefixes, chains and personal commands remain available. Prefix commands run
+immediately rather than opening a preview. See [legacy commands](docs/advanced.md#legacy-commands)
+for compatibility details.
 
-## Keys
-
-| Key | Action |
-|-----|--------|
-| `⌃⌥X` / `Ctrl+Alt+X` | Process selection (palette or prefix command) |
-| `⌃⌥Z` / `Ctrl+Alt+Z` | Undo last replacement |
-| `⌃⌥S` / `Ctrl+Alt+S` | Toggle notifications |
-
-In the palette: type to search or write an instruction · `↑↓` / `⌘1–9` pick · `↵` run ·
-`esc` back/close. In the preview: `↵` replace (or apply the refinement you typed) · `⇥` retry ·
-`⌘C` copy. In the terminal: `/` search commands · `S` export session to Markdown.
+</details>
 
 ## Privacy
 
-- Built-in commands never leave your machine; AI commands send the selection to *your* chosen provider.
-- History (`~/.actionflow_history.jsonl`, mode 600, auto-trimmed) stores only text lengths unless `history.log_text: true`.
-- API keys live in env vars or the keychain — never written to `config.yaml`.
-- `CMD:` runs only allow-listed read-only binaries, without a shell.
+- **Your provider:** AI actions send selected text to the configured provider, and to a configured
+  backup if needed. With local-only providers, generation stays on your machine.
+- **Your keys:** GUI setup verifies the connection before saving the key in the system keyring.
+  Existing environment/config key overrides still work.
+- **Your text:** history and diagnostic logs hide text by default. Sensitive command output remains
+  masked even when text logging is enabled.
+- **Your preferences:** language and saved instructions live in `~/.actionflow_preferences.json`,
+  written atomically with mode `600`. Saving an action does not save the selected text or its result.
+- **Optional local counts:** disabled by default. If enabled, they store fixed aggregate counters for
+  generation, acceptance, copying, discarding and failures. No text, instructions, app names or timestamps
+  are included in the counters. They are never uploaded, and practice sessions are excluded.
 
 ## Development
 
-```bash
+```sh
 cd action-middleware
-pip install -r requirements-dev.txt
-python -m pytest tests
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests
+.venv/bin/python -m pyflakes main.py actionflow/*.py tests/*.py
 ```
 
-```
-action-middleware/
-├── main.py                 # app: hotkeys → capture → dispatch → handlers → paste, main loop
-├── actionflow/
-│   ├── config.py           # defaults, config.yaml loading, comment-preserving saves
-│   ├── llm.py              # providers, calls, streaming, fallback, API keys
-│   ├── prompts.py          # every LLM prompt is built here
-│   ├── setup_wizard.py     # first-run setup, --set-key, --check
-│   ├── textops.py          # pure built-in transforms (calc, redact, format, …)
-│   ├── analysis.py         # app context, text analysis, suggestions, PatternLearner
-│   ├── palette.py          # command metadata + palette controller
-│   ├── mac_ui.py           # macOS command palette (AppKit)
-│   ├── platform_mac.py     # macOS hotkeys, clipboard, focus, notifications, menu bar
-│   ├── platform_linux.py   # Linux X11/Wayland equivalents + systemd service
-│   ├── paste_helper.py     # GNOME Wayland portal helper (runs as the user)
-│   ├── tk_ui.py            # Linux Tk picker
-│   ├── tui.py              # terminal output
-│   ├── history.py          # history log, export, --history
-│   └── service.py          # macOS LaunchAgent
-├── config.yaml.example     # copied to config.yaml on first run
-├── run.sh                  # launcher
-└── tests/test_core.py
-```
+If your virtual environment was created with `uv` and has no pip, install development dependencies with
+`uv pip install --python .venv/bin/python -r requirements-dev.txt`.
+
+| Module | Responsibility |
+| :--- | :--- |
+| `product.py` | Four writing actions, optional groups and word-level diffs. |
+| `palette.py` | Shared product logic for the macOS and Linux interfaces. |
+| `mac_ui.py` / `tk_ui.py` | Native AppKit and Tk windows. |
+| `preferences.py` | Local settings, saved instructions and opt-in counters. |
+| `connection.py` / `llm.py` | Connection setup, provider requests, streaming and fallback. |
+| `main.py` | Selection capture, dispatch, safe replacement and undo. |
+
+Tests cover routing, privacy, command restrictions, preferences, provider setup and preview safety.
+Native AppKit checks run when available. For desktop integration, use the
+[manual smoke checklist](docs/advanced.md#manual-smoke-checks).
+
+---
+
+Want to check whether this actually helps people write? Start with the
+[one-week pilot guide](docs/pilot.md) for 5–10 participants. It focuses on repeat use and friction,
+without collecting their private writing.

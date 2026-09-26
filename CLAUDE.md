@@ -47,8 +47,7 @@ macOS needs Accessibility + Input Monitoring for the terminal app. Manual E2E: s
   prefix? `route()` → `dispatch()` : queue palette for the main thread → `_handle_popup()` →
   releases `_job_lock`.
 - **dispatch() contract**: returns replacement text, `""` if nothing replaced, `None` on failure
-  (errors notified, never re-raised). Chains use the return value and pop intermediate undo
-  entries. Per-command `notify:` level is reset after each dispatch.
+  (errors notified, never re-raised). Chains use explicit dispatch results; intermediate steps never create undo entries. Per-command `notify:` level is reset after each dispatch.
 - **Handlers**: `_BUILTIN_HANDLERS` maps names → `handle_<name>(text, full_text, cmd_config)`;
   other commands go to `handle_llm_command()` using `llm_prompt` from config.
 - **LLM**: `llm.call()` / `llm.stream()` try primary then fallback, raise `LLMError` — never paste
@@ -64,7 +63,7 @@ macOS needs Accessibility + Input Monitoring for the terminal app. Manual E2E: s
   `image:<provider>`); never written to config.yaml.
 - **Privacy**: history stores lengths only unless `history.log_text`; `SENSITIVE_COMMANDS` never
   stored; passwords are not shown in notifications.
-- **Security**: `CMD:` = allowlist (`command_security.allowed_commands`) + `_CMD_BLOCKED_ARGS`,
+- **Security**: `CMD:` = allowlist (`command_security.allowed_commands`) narrowed by `command_security.validated_argv`,
   no shell, cwd=$HOME. Without a popup, keyword/LLM routing is opt-in (`smart_routing`).
 
 ## Code style
@@ -98,7 +97,7 @@ Type hints on signatures, docstrings on non-obvious functions, section banners i
 | `DATE:` | Natural language date → ISO format | Uses `dateparser` library |
 | `ESCAPE:` / `ESC:` | Escape special characters | Auto-detects HTML/SQL/regex, or use `ESCAPE:html:` prefix |
 | `SANITIZE:` / `STRIP:` | Strip HTML/markdown/ANSI formatting | Auto-detects format type |
-| `PASSWORD:` / `PW:` | Generate strong random password | Length configurable in config, shows first 4 chars |
+| `PASSWORD:` / `PW:` | Generate strong random password | Length configurable in config; never logged |
 | `REPEAT:` / `AGAIN:` | Re-run last command on current selection | |
 | `CLIP:` | Named clipboard slots | `CLIP:save name` / `CLIP:load name` / `CLIP:list` |
 | `STACK:` / `PUSH:` | Push clipboard onto stack | Shows stack depth |
@@ -129,3 +128,23 @@ Type hints on signatures, docstrings on non-obvious functions, section banners i
 | `ROAST:` | Light roast of selected text |
 | `FILL:` | Fill `{{placeholder}}` markers from context |
 | `TRANS:` | Translate to target language (`TRANS:JP:`, `TRANS:ES:`, etc.) |
+
+## Replacement safety
+
+- `_apply()` records undo only after successful paste and reports output independently of the bounded undo stack.
+- Undo requires the exact replacement to be selected in the source app; it shares `_job_lock`.
+- `privacy.command_scope()` suppresses detailed diagnostic output by default; activity/history use shared redaction.
+- Fallback client settings are separate from the primary endpoint, request options and model overrides.
+
+## Writing-focused product
+
+- Main palette: proofread, clarify, shorten, trans; free-form instructions and saved actions.
+- `product.py` owns CORE_COMMANDS, optional packs, retired commands and word-level diffs.
+- `preferences.py` writes atomic mode-600 local preferences; saved actions contain instructions only.
+- Both AppKit and Tk use PaletteController. Preview modes never change the clean text copied/pasted.
+- `connection.validate()` performs network validation in a worker. Only a live UI token may call
+  `connection.finish()` to save a verified key to keyring and provider settings to config.
+- First-run practice and Settings use a demo palette: never paste into another application.
+- Local aggregate metrics are opt-in, contain no text/timestamps/app names and exclude practice.
+- CMD/image/wiki/define are retired in dispatch even when an old config still defines them.
+- Optional text/developer tools default off; non-retired legacy prefixes/chains remain for power users.

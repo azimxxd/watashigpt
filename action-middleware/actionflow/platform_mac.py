@@ -83,8 +83,9 @@ def format_hotkey(spec: str) -> str:
 
 def has_pyobjc() -> bool:
     try:
-        import Quartz  # noqa: F401
-        import AppKit  # noqa: F401
+        from importlib import import_module
+        import_module("Quartz")
+        import_module("AppKit")
         return True
     except ImportError:
         return False
@@ -467,7 +468,8 @@ class HotkeyListener:
     def start(self) -> bool:
         """Start listening. Returns False (and sets .error) on failure."""
         try:
-            import Quartz  # noqa: F401
+            from importlib import import_module
+            import_module("Quartz")
         except ImportError:
             self.error = "PyObjC not installed — run: pip install -r requirements.txt"
             return False

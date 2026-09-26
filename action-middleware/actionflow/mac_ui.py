@@ -2,8 +2,8 @@
 #
 # A Spotlight/Raycast-style command palette built with AppKit (PyObjC):
 #   - non-activating floating panel: the app you were typing in stays active,
-#     so the result is pasted straight back without refocusing anything
-#   - vibrancy, rounded corners, SF Symbols, follows light/dark mode
+#     replacement is verified separately by main.py before any paste
+#   - high-contrast dark surface, rounded corners and SF Symbols
 #   - search field doubles as a free-form instruction ("make it shorter")
 #   - streaming preview for LLM results: ↵ replace, ⇥ retry, type to refine
 #
@@ -27,18 +27,22 @@ import queue
 import threading
 import time
 
+from actionflow import product, preferences, connection, llm
+
 import objc
-import Quartz  # noqa: F401 — registers CGColorRef so NSColor.CGColor() bridges cleanly
+from importlib import import_module
+import_module("Quartz")  # Register CGColorRef for NSColor.CGColor() bridging.
 from AppKit import (
     NSApplication, NSApplicationActivationPolicyAccessory, NSBezierPath,
     NSColor, NSDate, NSDefaultRunLoopMode, NSEvent, NSFont, NSFontWeightMedium,
     NSFontWeightRegular, NSFontWeightSemibold, NSImage, NSImageSymbolConfiguration,
     NSImageView, NSMakeRect, NSPanel, NSProgressIndicator, NSScreen, NSScrollView,
     NSTableColumn, NSTableRowView, NSTableView, NSTextField, NSTextView, NSView,
-    NSVisualEffectView, NSAnimationContext, NSPasteboard, NSPasteboardTypeString,
+    NSAnimationContext, NSPasteboard, NSPasteboardTypeString,
     NSAttributedString, NSForegroundColorAttributeName, NSFontAttributeName,
     NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSMouseInRect,
-    NSLineBreakByTruncatingTail,
+    NSLineBreakByTruncatingTail, NSButton, NSAlert, NSSecureTextField, NSAppearance, NSAppearanceNameDarkAqua,
+    NSMutableAttributedString, NSBackgroundColorAttributeName, NSStrikethroughStyleAttributeName,
 )
 from Foundation import NSObject
 
@@ -92,7 +96,7 @@ def _label(text: str, size: float = 13, weight=NSFontWeightRegular, color=None,
            frame=None) -> NSTextField:
     field = NSTextField.labelWithString_(text)
     field.setFont_(NSFont.systemFontOfSize_weight_(size, weight))
-    field.setTextColor_(color or NSColor.labelColor())
+    field.setTextColor_(color or NSColor.colorWithCalibratedWhite_alpha_(0.95, 1))
     field.setLineBreakMode_(NSLineBreakByTruncatingTail)
     field.cell().setTruncatesLastVisibleLine_(True)
     if frame is not None:
@@ -162,7 +166,7 @@ class AFRowView(NSTableRowView):
 
     def drawSelectionInRect_(self, rect):
         bounds = NSMakeRect(6, 1, self.bounds().size.width - 12, self.bounds().size.height - 2)
-        NSColor.labelColor().colorWithAlphaComponent_(0.10).setFill()
+        NSColor.colorWithCalibratedWhite_alpha_(0.95, 1).colorWithAlphaComponent_(0.10).setFill()
         NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, 8, 8).fill()
 
     def isEmphasized(self):
@@ -200,6 +204,12 @@ class AFPaletteDelegate(NSObject):
         if 0 <= row < len(self.palette.rows) and not self.palette.rows[row].get("header"):
             self.palette.select_row(row)
             self.palette.activate_selected()
+
+    def languageClicked_(self, sender):
+        self.palette.choose_language()
+
+    def previewAction_(self, sender):
+        self.palette.preview_action(sender.tag())
 
     # search field
     def controlTextDidChange_(self, notification):
@@ -240,6 +250,9 @@ class CommandPalette:
         self._stream_text = ""
         self._stream_started = 0.0
         self._streaming = False
+        self._modal = False
+        self._connecting = False
+        self._preview_mode = "result"
         self._result_mode = result is not None
         self._opened_at = time.time()
 
@@ -260,6 +273,7 @@ class CommandPalette:
             NSMakeRect(0, 0, W, H),
             _STYLE_BORDERLESS | _STYLE_NONACTIVATING | _STYLE_FULLSIZE,
             _BACKING_BUFFERED, False)
+        panel.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameDarkAqua))
         panel.setLevel_(_LEVEL_POPUP)
         panel.setCollectionBehavior_(_COLLECTION)
         panel.setFloatingPanel_(True)
@@ -273,11 +287,9 @@ class CommandPalette:
         panel.setDelegate_(self.delegate)
         self.panel = panel
 
-        root = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
-        root.setMaterial_(_MATERIAL_POPOVER)
-        root.setBlendingMode_(_BLENDING_BEHIND)
-        root.setState_(_STATE_ACTIVE)
+        root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
         root.setWantsLayer_(True)
+        root.layer().setBackgroundColor_(NSColor.colorWithCalibratedWhite_alpha_(0.10, 1).CGColor())
         root.layer().setCornerRadius_(16)
         root.layer().setMasksToBounds_(True)
         root.layer().setBorderWidth_(0.5)
@@ -289,7 +301,7 @@ class CommandPalette:
         top = H - _SEARCH_H
         self.search_icon = NSImageView.alloc().initWithFrame_(NSMakeRect(20, top + 18, 22, 22))
         self.search_icon.setImage_(_symbol("magnifyingglass", 17))
-        self.search_icon.setContentTintColor_(NSColor.secondaryLabelColor())
+        self.search_icon.setContentTintColor_(NSColor.colorWithCalibratedWhite_alpha_(0.70, 1))
         root.addSubview_(self.search_icon)
 
         field = NSTextField.alloc().initWithFrame_(NSMakeRect(52, top + 15, W - 110, 28))
@@ -298,13 +310,13 @@ class CommandPalette:
         field.setDrawsBackground_(False)
         field.setFocusRingType_(1)  # none
         field.setFont_(NSFont.systemFontOfSize_weight_(20, NSFontWeightRegular))
-        field.setTextColor_(NSColor.labelColor())
+        field.setTextColor_(NSColor.colorWithCalibratedWhite_alpha_(0.95, 1))
         field.cell().setUsesSingleLineMode_(True)
         field.cell().setScrollable_(True)
         field.setDelegate_(self.delegate)
         root.addSubview_(field)
         self.field = field
-        self._set_placeholder("Search commands or type an instruction…")
+        self._set_placeholder("What would you like to do with this text?")
 
         self.spinner = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(W - 44, top + 20, 18, 18))
         self.spinner.setStyle_(1)        # spinning
@@ -314,9 +326,16 @@ class CommandPalette:
 
         # Context line (what was selected, where)
         ctx_y = top - _CONTEXT_H
-        self.context_label = _label(self.context_text, 12, color=NSColor.secondaryLabelColor(),
-                                    frame=NSMakeRect(22, ctx_y + 4, W - 44, 16))
+        self.context_label = _label(self.context_text, 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.70, 1),
+                                    frame=NSMakeRect(22, ctx_y + 4, W - 260, 16))
         root.addSubview_(self.context_label)
+        self.language_button = NSButton.alloc().initWithFrame_(NSMakeRect(W-235,ctx_y,215,24))
+        self.language_button.setTitle_('Language: ' + (getattr(self.controller,'preferences',{}).get('language','English')) + ' ▾')
+        self.language_button.setBezelStyle_(1)
+        self.language_button.setTarget_(self.delegate)
+        self.language_button.setAction_('languageClicked:')
+        self.language_button.setHidden_(self._result_mode)
+        root.addSubview_(self.language_button)
         root.addSubview_(_layer_view(NSMakeRect(0, ctx_y - 1, W, 1),
                                      NSColor.separatorColor().colorWithAlphaComponent_(0.6)))
 
@@ -367,18 +386,18 @@ class CommandPalette:
         self.preview_title = _label("", 14, NSFontWeightSemibold,
                                     frame=NSMakeRect(56, ph - 36, W - 200, 20))
         preview.addSubview_(self.preview_title)
-        self.preview_meta = _label("", 12, color=NSColor.tertiaryLabelColor(),
+        self.preview_meta = _label("", 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.58, 1),
                                    frame=NSMakeRect(W - 220, ph - 35, 200, 18))
         self.preview_meta.setAlignment_(2)  # right
         preview.addSubview_(self.preview_meta)
 
-        text_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(8, 4, W - 16, ph - 52))
+        text_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(8, 42, W - 16, ph - 90))
         text_scroll.setDrawsBackground_(False)
         text_scroll.setHasVerticalScroller_(True)
         text_scroll.setAutohidesScrollers_(True)
         text_scroll.setScrollerStyle_(1)
         text_scroll.setBorderType_(0)
-        text_view = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 32, ph - 52))
+        text_view = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 32, ph - 90))
         text_view.setEditable_(False)
         text_view.setSelectable_(True)
         text_view.setDrawsBackground_(False)
@@ -390,6 +409,19 @@ class CommandPalette:
         preview.addSubview_(text_scroll)
         self.text_view = text_view
         self.text_scroll = text_scroll
+        self.preview_buttons = []
+        x = 16
+        for i, (title, width) in enumerate([('Result',80), ('Changes',90), ('Original',85),
+                                           ('Save action',115), ('Copy',80), ('Replace',100)]):
+            button = NSButton.alloc().initWithFrame_(NSMakeRect(x, 6, width, 28))
+            button.setTitle_(title)
+            button.setBezelStyle_(1)
+            button.setTarget_(self.delegate)
+            button.setAction_('previewAction:')
+            button.setTag_(i)
+            preview.addSubview_(button)
+            self.preview_buttons.append(button)
+            x += width + 4
         root.addSubview_(preview)
         self.preview = preview
 
@@ -397,13 +429,13 @@ class CommandPalette:
         root.addSubview_(_layer_view(NSMakeRect(0, _FOOTER_H, W, 1),
                                      NSColor.separatorColor().colorWithAlphaComponent_(0.6)))
         footer_bg = _layer_view(NSMakeRect(0, 0, W, _FOOTER_H),
-                                NSColor.labelColor().colorWithAlphaComponent_(0.03))
+                                NSColor.colorWithCalibratedWhite_alpha_(0.95, 1).colorWithAlphaComponent_(0.03))
         root.addSubview_(footer_bg)
         logo = NSImageView.alloc().initWithFrame_(NSMakeRect(18, 11, 16, 16))
         logo.setImage_(_symbol("wand.and.stars", 12, NSFontWeightSemibold))
         logo.setContentTintColor_(NSColor.systemPurpleColor())
         root.addSubview_(logo)
-        self.status_label = _label(self.status_text, 12, color=NSColor.secondaryLabelColor(),
+        self.status_label = _label(self.status_text, 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.70, 1),
                                    frame=NSMakeRect(40, 11, 280, 16))
         root.addSubview_(self.status_label)
         self.hints_view = NSView.alloc().initWithFrame_(NSMakeRect(W / 2 - 20, 0, W / 2 + 10, _FOOTER_H))
@@ -411,7 +443,7 @@ class CommandPalette:
 
     def _set_placeholder(self, text: str) -> None:
         attrs = {
-            NSForegroundColorAttributeName: NSColor.placeholderTextColor(),
+            NSForegroundColorAttributeName: NSColor.colorWithCalibratedWhite_alpha_(0.62, 1),
             NSFontAttributeName: NSFont.systemFontOfSize_weight_(20, NSFontWeightRegular),
         }
         self.field.setPlaceholderAttributedString_(
@@ -423,17 +455,17 @@ class CommandPalette:
             sub.removeFromSuperview()
         x = self.hints_view.frame().size.width - 16
         for label, key in reversed(hints):
-            key_label = _label(key, 11, NSFontWeightMedium, NSColor.secondaryLabelColor())
+            key_label = _label(key, 11, NSFontWeightMedium, NSColor.colorWithCalibratedWhite_alpha_(0.70, 1))
             key_label.sizeToFit()
             key_w = max(22, key_label.frame().size.width + 12)
             x -= key_w
             cap = _layer_view(NSMakeRect(x, 9, key_w, 20),
-                              NSColor.labelColor().colorWithAlphaComponent_(0.08), radius=5)
+                              NSColor.colorWithCalibratedWhite_alpha_(0.95, 1).colorWithAlphaComponent_(0.08), radius=5)
             key_label.setFrame_(NSMakeRect(0, 2, key_w, 15))
             key_label.setAlignment_(1)  # center
             cap.addSubview_(key_label)
             self.hints_view.addSubview_(cap)
-            text = _label(label, 12, color=NSColor.secondaryLabelColor())
+            text = _label(label, 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.70, 1))
             text.sizeToFit()
             text_w = text.frame().size.width
             x -= text_w + 6
@@ -448,7 +480,7 @@ class CommandPalette:
         if item.get("header"):
             view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, _HEADER_H))
             view.addSubview_(_label(item["title"].upper(), 11, NSFontWeightSemibold,
-                                    NSColor.tertiaryLabelColor(),
+                                    NSColor.colorWithCalibratedWhite_alpha_(0.58, 1),
                                     frame=NSMakeRect(22, 5, W - 44, 14)))
             return view
 
@@ -477,7 +509,7 @@ class CommandPalette:
         right = W - 30 - 62
         shortcut = item.get("shortcut")
         if shortcut:
-            hint = _label(shortcut, 12, color=NSColor.tertiaryLabelColor(),
+            hint = _label(shortcut, 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.58, 1),
                           frame=NSMakeRect(right - 34, 12, 34, 16))
             hint.setAlignment_(2)
             view.addSubview_(hint)
@@ -491,11 +523,20 @@ class CommandPalette:
         subtitle = item.get("subtitle", "")
         if subtitle:
             sub_x = 56 + title_w + 10
-            view.addSubview_(_label(subtitle, 12.5, color=NSColor.secondaryLabelColor(),
+            view.addSubview_(_label(subtitle, 12.5, color=NSColor.colorWithCalibratedWhite_alpha_(0.70, 1),
                                     frame=NSMakeRect(sub_x, 12.5, max(0, right - sub_x - 8), 17)))
         return view
 
+    def choose_language(self) -> None:
+        if self._result_mode or self._streaming: return
+        if self.state == 'preview': self._back_to_list()
+        self.submenu = {'id':'trans','title':'Choose a translation language'}
+        self.field.setStringValue_('')
+        self._set_placeholder(self.submenu['title'])
+        self.reload()
+
     def reload(self) -> None:
+        self.language_button.setTitle_('Language: ' + self.controller.preferences['language'] + ' ▾')
         query = str(self.field.stringValue() or "")
         self.rows = self.controller.items(query, self.submenu["id"] if self.submenu else None)
         # ⌘1…⌘9 hints on the first selectable rows
@@ -545,8 +586,26 @@ class CommandPalette:
         if item.get("header"):
             return
         query = str(self.field.stringValue() or "")
-        action = self.controller.activate(item, query)
+        try:
+            action = self.controller.activate(item, query)
+        except (OSError, ValueError):
+            self._dialog('Could not save this setting', 'Check access to your home folder and try again.')
+            return
         kind = action.get("kind")
+        if kind in ('reload','home'):
+            if kind == 'home': self.submenu = None
+            self.field.setStringValue_('')
+            self.reload()
+            return
+        if kind == 'connect':
+            self._connect(action['provider'])
+            return
+        if kind == 'delete':
+            if self._dialog('Remove ' + action['title'] + '?', 'The selected text is never stored with this action.', confirm='Remove') is not None:
+                preferences.remove_action(action['id'])
+                self.controller.refresh()
+                self.reload()
+            return
         if kind == "run":
             self._close({"kind": "run", "item": item, "query": query})
         elif kind == "submenu":
@@ -566,6 +625,8 @@ class CommandPalette:
 
     def _enter_preview(self, spec: dict) -> None:
         self.state = "preview"
+        for button in self.preview_buttons:
+            button.setEnabled_(False)
         self.list_scroll.setHidden_(True)
         self.preview.setHidden_(False)
         tint = _tint(spec.get("tint", "purple"))
@@ -583,7 +644,7 @@ class CommandPalette:
         style.setLineSpacing_(3)
         attrs = {
             NSFontAttributeName: NSFont.systemFontOfSize_(14),
-            NSForegroundColorAttributeName: NSColor.labelColor(),
+            NSForegroundColorAttributeName: NSColor.colorWithCalibratedWhite_alpha_(0.95, 1),
             NSParagraphStyleAttributeName: style,
         }
         self.text_view.textStorage().setAttributedString_(
@@ -591,7 +652,9 @@ class CommandPalette:
         self.text_view.scrollToEndOfDocument_(None)
 
     def _start_stream(self, spec: dict) -> None:
+        self._connecting = False
         self._stream_spec = spec
+        self._preview_mode = "result"
         self._enter_preview(spec)
         self._stream_text = ""
         self._set_preview_text("")
@@ -621,11 +684,18 @@ class CommandPalette:
         if notice:
             self._set_hints([("Back", "esc")])
         elif static:
+            self.preview_buttons[4].setEnabled_(True)
             self._set_hints([("Copy", "⌘C"), ("Close", "esc")])
         else:
-            seconds = time.time() - self._stream_started
-            words = len(self._stream_text.split())
-            self.preview_meta.setStringValue_(f"{words} words · {seconds:.1f}s")
+            self.preview_meta.setStringValue_(product.change_summary(self.controller.text, self._stream_text))
+            self._preview_mode = "changes"
+            self._render_preview()
+            self.status_label.setStringValue_("Red: removed · Green: added")
+            for button in self.preview_buttons:
+                button.setEnabled_(True)
+            can_save = bool((self._stream_spec or {}).get("cmd_config",{}).get("instruction")) and not (self._stream_spec or {}).get("refinement")
+            self.preview_buttons[3].setEnabled_(can_save)
+            self.controller.record("generated", (self._stream_spec or {}).get("cmd_name", ""))
             self._set_hints([("Replace", "↵"), ("Copy", "⌘C"), ("Retry", "⇥"), ("Back", "esc")])
 
     def _drain_ui_queue(self) -> None:
@@ -637,6 +707,21 @@ class CommandPalette:
                 break
             if token != self._stream_token:
                 continue
+            if kind == 'connected':
+                dirty = False
+                self._connecting = False
+                self._streaming = False
+                self.spinner.stopAnimation_(None)
+                try:
+                    connection.finish(payload)
+                    self.controller.refresh()
+                    self.status_label.setStringValue_('Connected · ' + llm.provider)
+                    self.submenu = None
+                    self._back_to_list()
+                except Exception:
+                    self._set_preview_text('Connection verified, but the key or settings could not be saved. Check access to your system keyring and try again.')
+                    self._finish_stream(static=True, notice=True)
+                continue
             if kind == "chunk":
                 self._stream_text += payload
                 dirty = True
@@ -644,14 +729,21 @@ class CommandPalette:
                 self._stream_text = self._stream_text.strip()
                 self._set_preview_text(self._stream_text)
                 dirty = False
-                self._finish_stream()
+                if self._stream_text:
+                    self._finish_stream()
+                else:
+                    self._finish_stream(static=True, notice=True)
+                    self._set_preview_text('No result was returned. Press Tab to retry, or Esc to go back.')
             elif kind == "error":
+                dirty = False
+                self.controller.record("failed")
+                self._connecting = False
                 self._streaming = False
                 self.spinner.stopAnimation_(None)
                 self.preview_meta.setStringValue_("Failed")
-                self._set_preview_text(f"⚠︎  {payload}\n\nYour text was not changed.")
+                self._set_preview_text("Could not complete the request. Check your AI connection and retry.\n\nYour text was not changed.")
                 self._stream_text = ""
-                self._set_hints([("Retry", "⇥"), ("Back", "esc")])
+                self._set_hints(([ ("Retry", "⇥") ] if self._stream_spec else []) + [("Back", "esc")])
         if dirty:
             self._set_preview_text(self._stream_text)
 
@@ -659,10 +751,21 @@ class CommandPalette:
         text = self._stream_text or str(self.text_view.string() or "")
         pb = NSPasteboard.generalPasteboard()
         pb.clearContents()
-        pb.setString_forType_(text, NSPasteboardTypeString)
+        if not pb.setString_forType_(text, NSPasteboardTypeString):
+            self.preview_meta.setStringValue_("Copy failed; try again")
+            return
+        if not self._result_mode:
+            self.controller.remember(self._stream_spec or {})
+            self.controller.record("copied")
         self._close({"kind": "copied"})
 
     def _back_to_list(self) -> None:
+        self.status_label.setStringValue_("Connected · " + llm.provider if llm.ready else "Connect AI in Settings")
+        if self._stream_text:
+            self.controller.record("discarded")
+        self._stream_text = ""
+        self._stream_spec = None
+        self._connecting = False
         self._stream_token += 1  # abandon a running stream
         self._streaming = False
         self.spinner.stopAnimation_(None)
@@ -671,8 +774,106 @@ class CommandPalette:
         self.list_scroll.setHidden_(False)
         self.field.setStringValue_("")
         self.search_icon.setImage_(_symbol("magnifyingglass", 17))
-        self._set_placeholder("Search commands or type an instruction…")
+        self._set_placeholder("What would you like to do with this text?")
         self.reload()
+
+    def _render_preview(self) -> None:
+        if self._preview_mode == 'original':
+            self._set_preview_text(self.controller.text)
+        elif self._preview_mode == 'result':
+            self._set_preview_text(self._stream_text)
+        else:
+            value = NSMutableAttributedString.alloc().initWithString_('')
+            for kind, text in product.diff_segments(self.controller.text, self._stream_text):
+                attrs = {NSFontAttributeName:NSFont.systemFontOfSize_(14),
+                         NSForegroundColorAttributeName:NSColor.colorWithCalibratedWhite_alpha_(0.95, 1)}
+                if kind == 'delete':
+                    attrs[NSForegroundColorAttributeName] = NSColor.systemRedColor()
+                    attrs[NSStrikethroughStyleAttributeName] = 1
+                elif kind == 'insert':
+                    attrs[NSBackgroundColorAttributeName] = NSColor.systemGreenColor().colorWithAlphaComponent_(0.18)
+                value.appendAttributedString_(NSAttributedString.alloc().initWithString_attributes_(text,attrs))
+            self.text_view.textStorage().setAttributedString_(value)
+        self.text_view.scrollRangeToVisible_((0,0))
+
+    def preview_action(self, tag: int) -> None:
+        if self._streaming: return
+        if self._result_mode and tag == 4:
+            self._copy_result()
+            return
+        if not self._stream_text: return
+        if tag < 3:
+            self._preview_mode = ('result','changes','original')[tag]
+            self._render_preview()
+        elif tag == 3:
+            spec = self._stream_spec or {}
+            instruction = spec.get('cmd_config',{}).get('instruction')
+            if not instruction or spec.get('refinement'): return
+            name = self._dialog('Save action', 'Only this instruction is saved. Selected text and results are never included.',
+                                default=instruction[:60], confirm='Save')
+            if name is not None:
+                try:
+                    self.controller.save(spec,name)
+                    self.preview_meta.setStringValue_('Action saved')
+                except (ValueError,OSError) as exc:
+                    self._dialog('Could not save action',str(exc))
+        elif tag == 4:
+            self._copy_result()
+        elif tag == 5:
+            self._close({'kind':'replace','item':self._stream_item,'text':self._stream_text,
+                         'seconds':time.time()-self._stream_started})
+
+    def _dialog(self, title: str, message: str, default=None, secure=False, confirm='OK'):
+        self._modal = True
+        self.panel.setLevel_(3)
+        try:
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_(title)
+            alert.setInformativeText_(message)
+            alert.addButtonWithTitle_(confirm)
+            alert.addButtonWithTitle_('Cancel')
+            field = None
+            if default is not None:
+                cls = NSSecureTextField if secure else NSTextField
+                field = cls.alloc().initWithFrame_(NSMakeRect(0,0,420,28))
+                field.setStringValue_(default)
+                alert.setAccessoryView_(field)
+                alert.window().setInitialFirstResponder_(field)
+            if alert.runModal() != 1000: return None
+            return str(field.stringValue()) if field is not None else ''
+        finally:
+            self.panel.setLevel_(_LEVEL_POPUP)
+            self._modal = False
+            self._opened_at = time.time()
+            self.panel.makeKeyAndOrderFront_(None)
+            self.panel.makeFirstResponder_(self.field)
+
+    def _connect(self, provider: str) -> None:
+        info = llm.PROVIDERS[provider]
+        key = ''
+        if not info.local:
+            key = self._dialog('Connect ' + info.label.split(' —')[0],
+                               'Paste your API key from ' + info.key_url + '\nIt is saved in your system keyring.',
+                               default='',secure=True,confirm='Next')
+            if key is None: return
+        model = self._dialog('Choose model', 'Keep the default or enter a model available to your account.',
+                             default=info.default_model,confirm='Connect')
+        if model is None: return
+        self._stream_spec = None
+        self._stream_text = ''
+        self._enter_preview({'title':'Connecting…','icon':'network'})
+        self._set_preview_text('Verifying your connection. You can cancel with Esc; your selection will stay unchanged.')
+        self._streaming = self._connecting = True
+        self.spinner.startAnimation_(None)
+        self._stream_token += 1
+        token = self._stream_token
+        def worker():
+            try:
+                result = connection.validate(provider,key,model)
+                self._ui_queue.put(('connected',token,result))
+            except Exception:
+                self._ui_queue.put(('error',token,'Could not connect. Check your API key, model and network, then choose the provider again.'))
+        threading.Thread(target=worker,daemon=True,name='connect-ai').start()
 
     # ── Keyboard ─────────────────────────────────────────────
 
@@ -691,7 +892,7 @@ class CommandPalette:
             elif self.submenu:
                 self.submenu = None
                 self.search_icon.setImage_(_symbol("magnifyingglass", 17))
-                self._set_placeholder("Search commands or type an instruction…")
+                self._set_placeholder("What would you like to do with this text?")
                 self.field.setStringValue_("")
                 self.reload()
             else:
@@ -724,6 +925,12 @@ class CommandPalette:
             return event
         if self._streaming:
             return event if code not in (_KEY_RETURN, _KEY_ENTER, _KEY_TAB) else None
+        if cmd and code == 1 and self._stream_text:  # Cmd+S
+            self.preview_action(3)
+            return None
+        if cmd and code == 2 and self._stream_text:  # Cmd+D
+            self.preview_action(1 if self._preview_mode != 'changes' else 0)
+            return None
         if code == _KEY_TAB and self._stream_spec is not None:
             self._start_stream(self._stream_spec)
             return None
@@ -744,7 +951,7 @@ class CommandPalette:
     def lost_focus(self) -> None:
         # Clicked elsewhere — behave like Spotlight and go away (ignore the
         # first moments: showing the panel can briefly shuffle key status).
-        if not self.done and time.time() - self._opened_at > 0.3:
+        if not self._modal and not self.done and time.time() - self._opened_at > 0.3:
             self._close(None)
 
     # ── Lifecycle ────────────────────────────────────────────
@@ -761,6 +968,8 @@ class CommandPalette:
     def _close(self, outcome) -> None:
         if self.done:
             return
+        if outcome is None and self._stream_text:
+            self.controller.record("discarded")
         self.done = True
         self.outcome = outcome
         self._stream_token += 1
