@@ -38,8 +38,26 @@ def context_vars(text: str, ta=None, app_ctx=None) -> dict:
     return fmt_vars
 
 
+# Prompts are English, and models answer in the prompt's language unless told
+# otherwise — so a Russian selection came back summarized in English.
+LANGUAGE_RULE = ("Write your answer in the same language as the text you are given "
+                 "(Russian text → Russian answer, Kazakh → Kazakh, English → English).\n\n")
+
+# Commands whose output language is decided by the command itself
+_OWN_LANGUAGE = frozenset({"trans", "custom", "gitcommit"})
+
+
 def prompt_for(cmd_name: str, cmd_config: dict, text: str,
                variables: dict | None = None) -> tuple[str, str]:
+    """(prompt, model) for any LLM-backed command, answering in the text's language."""
+    prompt, model = _build(cmd_name, cmd_config, text, variables)
+    if cmd_name not in _OWN_LANGUAGE:
+        prompt = LANGUAGE_RULE + prompt
+    return prompt, model
+
+
+def _build(cmd_name: str, cmd_config: dict, text: str,
+           variables: dict | None = None) -> tuple[str, str]:
     """(prompt, model) for any LLM-backed command.
 
     `text` is the command payload (for TONE "style: text", for TRANS

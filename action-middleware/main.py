@@ -404,6 +404,7 @@ def _commit_generated(cmd_name: str, cmd_config: dict, text: str, result: str,
     with _usage_lock:
         _usage_counts[cmd_name] = _usage_counts.get(cmd_name, 0) + 1
     _last_command = {"name": cmd_name, "config": cmd_config}
+    result = llm.tidy(result)
     _push_undo(text, result)
     _replace_selection(result, announce=False)
     TUI.activity_entry(cmd_name, text, result, seconds, is_llm=True, trigger="popup")

@@ -454,3 +454,12 @@ def test_config_save_keeps_comments(tmp_path, monkeypatch):
     data = __import__("yaml").safe_load(text)
     assert data["llm"]["provider"] == "groq" and data["llm"]["model"] == "openai/gpt-oss-120b"
     assert data["llm"]["fallback"] == {"provider": "gemini", "model": "gemini-3.5-flash-lite"}
+
+
+def test_prompts_keep_the_text_language():
+    cmds = main.load_config(af_config.CONFIG_EXAMPLE_PATH)["commands"]
+    summarize, _ = main.prompts.prompt_for("summarize", cmds["summarize"], "Привет")
+    assert summarize.startswith(main.prompts.LANGUAGE_RULE)
+    trans, _ = main.prompts.prompt_for("trans", cmds["trans"], "EN: Привет")
+    assert main.prompts.LANGUAGE_RULE not in trans
+    assert main.llm.tidy("- a  \n- b  ") == "- a\n- b"

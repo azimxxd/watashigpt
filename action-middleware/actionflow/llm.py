@@ -200,7 +200,12 @@ _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 def strip_thinking(text: str) -> str:
     """Remove <think>…</think> blocks some open models put in the answer."""
-    return _THINK_RE.sub("", text).strip()
+    return tidy(_THINK_RE.sub("", text))
+
+
+def tidy(text: str) -> str:
+    """Final cleanup of an answer: no trailing spaces (Markdown line breaks)."""
+    return "\n".join(line.rstrip() for line in text.strip().splitlines())
 
 
 def _create(client_obj, provider_name: str, model_name: str, prompt: str,
