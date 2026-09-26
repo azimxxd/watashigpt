@@ -19,10 +19,13 @@ Select text. Choose an action. Review the changes. Put it back.
 <br>
 
 <p align="center">
-  <img src="docs/images/writing-palette.png" alt="ActionFlow macOS palette showing Fix mistakes, Make clearer, Shorten and Translate" width="820">
+  <a href="docs/media/actionflow-demo.mp4">
+    <img src="docs/media/actionflow-demo.webp" alt="ActionFlow demo: a message with typos is selected, ⌃⌥X opens the palette, Fix mistakes shows a red/green diff, the fix replaces the text in the chat, then a custom instruction translates it to Kazakh" width="820">
+  </a>
 </p>
 
-<p align="center"><sub>The macOS interface with example text. Linux follows the same workflow in a Tk window.</sub></p>
+<p align="center"><sub>20-second demo — real ActionFlow UI and real AI answers. <a href="docs/media/actionflow-demo.mp4">▶ Watch with sound (MP4)</a><br>
+Linux follows the same workflow in a Tk window.</sub></p>
 
 ## Four actions. Your own instructions.
 
