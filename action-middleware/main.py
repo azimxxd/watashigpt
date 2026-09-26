@@ -1526,6 +1526,9 @@ class TUI:
     def selector(cls, options: list[str]) -> int | None:
         """Arrow-key horizontal selector. Returns index or None if cancelled."""
         current = 0
+        # The hint goes on its own line: if the option row wrapped, "\r" could
+        # only redraw its last line and the row would be duplicated.
+        sys.stdout.write(f"  {cls.DIM}← → to move, enter to select{cls.RESET}\n")
 
         while True:
             parts = []
@@ -1534,9 +1537,8 @@ class TUI:
                     parts.append(f"{cls.BG_CYAN}{cls.BLACK}{cls.BOLD} {opt} {cls.RESET}")
                 else:
                     parts.append(f"{cls.DIM} {opt} {cls.RESET}")
-            line = "  ".join(parts)
-            hint = f"{cls.DIM}(← → to move, enter to select){cls.RESET}"
-            sys.stdout.write(f"\r  {line}   {hint}\033[K")
+            line = " ".join(parts)
+            sys.stdout.write(f"\r  {line}\033[K")
             sys.stdout.flush()
 
             key = cls._read_key()
