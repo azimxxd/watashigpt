@@ -535,21 +535,28 @@ command_security:
   # node), env/printenv (they would leak API keys) and curl/find.
   allowed_commands: [ls, cat, grep, git, echo, date, wc, head, tail, sort, uniq, diff, file, stat, whoami, hostname, uname, which, pwd, df, du, uptime, cal]
 image_api:
-  api_key: ''  # Use env var ACTIONFLOW_IMAGE_API_KEY instead
-  model: seedream
   provider: pollinations
+  # No key: free anonymous endpoint. With a key (python main.py --set-key image:pollinations)
+  # requests go to gen.pollinations.ai; pick any model from https://gen.pollinations.ai/image/models
+  model: tongyi-mai/z-image-turbo
+  api_key: ''  # Use env var ACTIONFLOW_IMAGE_API_KEY or the keychain instead
 llm:
-  # groq | openai | gemini | openrouter | github | ollama | lmstudio
-  # (ollama / lmstudio run locally and need no API key).
+  # Free tiers (no card):  groq · gemini · cerebras · openrouter
+  # Paid: openai     Local: ollama · lmstudio
   # Leave empty to pick interactively on first launch.
   provider: ''
+  # Empty = the provider's default: groq → openai/gpt-oss-120b,
+  # gemini → gemini-3.5-flash-lite, cerebras → gpt-oss-120b,
+  # openrouter → qwen/qwen3.8-27b:free, openai → gpt-6-luna.
+  # List what your key can use:  python main.py --check
   model: ''
-  api_key: ''  # Use env var ACTIONFLOW_API_KEY instead
+  api_key: ''  # Use env var ACTIONFLOW_API_KEY or the keychain instead
   # base_url: http://localhost:11434/v1   # optional: any OpenAI-compatible endpoint
   max_tokens: 2048   # upper bound on response length
   temperature: 0.7
   timeout: 60        # seconds per request
-  fallback:
-    api_key: ''
-    model: ''
+  # request_options: {reasoning_effort: low}   # extra API params (advanced)
+  fallback:          # used when the primary provider fails or is rate-limited
     provider: ''
+    model: ''
+    api_key: ''

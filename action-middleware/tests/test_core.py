@@ -11,7 +11,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import main  # noqa: E402
-import platform_mac  # noqa: E402
+from actionflow import config as af_config  # noqa: E402
+from actionflow import platform_mac  # noqa: E402
 
 
 @pytest.fixture
@@ -54,18 +55,18 @@ def test_load_config_never_mutates_defaults(tmp_path):
     cfg = main.load_config(tmp_path / "missing.yaml")
     cfg["llm"]["api_key"] = "secret"
     cfg["commands"]["polite"]["prefixes"].append("X:")
-    assert main._DEFAULT_CONFIG["llm"]["api_key"] == ""
-    assert "X:" not in main._DEFAULT_CONFIG["commands"]["polite"]["prefixes"]
+    assert af_config.DEFAULT_CONFIG["llm"]["api_key"] == ""
+    assert "X:" not in af_config.DEFAULT_CONFIG["commands"]["polite"]["prefixes"]
 
 
 def test_load_config_invalid_yaml_falls_back(tmp_path):
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("- just\n- a list\n")
-    assert main.load_config(cfg_file)["commands"].keys() == main._DEFAULT_CONFIG["commands"].keys()
+    assert main.load_config(cfg_file)["commands"].keys() == af_config.DEFAULT_CONFIG["commands"].keys()
 
 
 def test_example_config_is_valid():
-    cfg = main.load_config(main._CONFIG_EXAMPLE_PATH)
+    cfg = main.load_config(af_config.CONFIG_EXAMPLE_PATH)
     assert len(cfg["commands"]) > 30
     for name, cmd in cfg["commands"].items():
         assert cmd.get("prefixes"), name
@@ -138,10 +139,10 @@ class _FailingClient:
 
 
 def test_llm_failure_never_replaces_text(pasted, monkeypatch):
-    monkeypatch.setattr(main, "LLM_MODE", "live")
-    monkeypatch.setattr(main, "_llm_ready", True)
-    monkeypatch.setattr(main, "_llm_client", _FailingClient)
-    monkeypatch.setattr(main, "_llm_fallback_ready", False)
+    monkeypatch.setattr(main.llm, "MODE", "live")
+    monkeypatch.setattr(main.llm, "ready", True)
+    monkeypatch.setattr(main.llm, "client", _FailingClient)
+    monkeypatch.setattr(main.llm, "fallback_ready", False)
     cmd = {"llm_required": True, "llm_prompt": "Summarize: {text}", "prefixes": ["SUM:"]}
     assert main.dispatch("summarize", "some text", "SUM: some text", cmd) is None
     assert pasted == []
@@ -149,21 +150,21 @@ def test_llm_failure_never_replaces_text(pasted, monkeypatch):
 
 
 def test_llm_call_raises_after_fallback_fails(monkeypatch):
-    monkeypatch.setattr(main, "_llm_ready", True)
-    monkeypatch.setattr(main, "_llm_client", _FailingClient)
-    monkeypatch.setattr(main, "_llm_fallback_ready", True)
-    monkeypatch.setattr(main, "_llm_fallback_client", _FailingClient)
-    with pytest.raises(main.LLMError):
-        main._llm_call("hi")
+    monkeypatch.setattr(main.llm, "ready", True)
+    monkeypatch.setattr(main.llm, "client", _FailingClient)
+    monkeypatch.setattr(main.llm, "fallback_ready", True)
+    monkeypatch.setattr(main.llm, "fallback_client", _FailingClient)
+    with pytest.raises(main.llm.LLMError):
+        main.llm.call("hi")
 
 
 def test_format_prompt():
     vars_ = {"text": "hello", "lang": "JP"}
-    assert main._format_prompt("To {lang}: {text}", vars_) == "To JP: hello"
-    assert main._format_prompt("Fill {{placeholder}}: {text}", vars_) == "Fill {placeholder}: hello"
-    assert main._format_prompt("{unknown} {text}", vars_) == "{unknown} hello"
-    assert main._format_prompt("stray { brace {text}", vars_) == "stray { brace hello"
-    assert main._format_prompt("{0} {text}", vars_) == "{0} hello"
+    assert main.prompts.format_prompt("To {lang}: {text}", vars_) == "To JP: hello"
+    assert main.prompts.format_prompt("Fill {{placeholder}}: {text}", vars_) == "Fill {placeholder}: hello"
+    assert main.prompts.format_prompt("{unknown} {text}", vars_) == "{unknown} hello"
+    assert main.prompts.format_prompt("stray { brace {text}", vars_) == "stray { brace hello"
+    assert main.prompts.format_prompt("{0} {text}", vars_) == "{0} hello"
 
 
 # ── Built-in handlers ──────────────────────────────────────
@@ -183,10 +184,10 @@ def test_format_prompt():
     ("2**1000", None),
 ])
 def test_safe_eval_math(expr, expected):
-    assert main._safe_eval_math(expr) == expected
+    assert main.textops.calc(expr) == expected
 
 
-def test_redact():
+def test_redact_handler():
     out: list[str] = []
     main_redact = main.handle_redact
     orig = main._replace_selection
@@ -247,22 +248,22 @@ def test_format_hotkey():
 
 def test_resolve_api_key_order(monkeypatch):
     store = {"llm:groq": "from-keychain"}
-    monkeypatch.setattr(main, "_secret_get", lambda account: store.get(account, ""))
+    monkeypatch.setattr(main.llm, "secret_get", lambda account: store.get(account, ""))
     monkeypatch.delenv("ACTIONFLOW_API_KEY", raising=False)
-    assert main._resolve_api_key("llm", "groq") == "from-keychain"
-    assert main._resolve_api_key("llm", "Groq ", "from-config") == "from-config"
+    assert main.llm.resolve_api_key("llm", "groq") == "from-keychain"
+    assert main.llm.resolve_api_key("llm", "Groq ", "from-config") == "from-config"
     monkeypatch.setenv("ACTIONFLOW_API_KEY", "from-env")
-    assert main._resolve_api_key("llm", "groq", "from-config") == "from-env"
+    assert main.llm.resolve_api_key("llm", "groq", "from-config") == "from-env"
     monkeypatch.delenv("ACTIONFLOW_API_KEY")
-    assert main._resolve_api_key("llm", "openai") == ""
+    assert main.llm.resolve_api_key("llm", "openai") == ""
 
 
 def test_history_hides_text_by_default(tmp_path, monkeypatch):
     path = tmp_path / "history.jsonl"
-    monkeypatch.setattr(main, "_HISTORY_PATH", path)
-    monkeypatch.setattr(main, "CONFIG", {**main.CONFIG, "history": {}})
+    monkeypatch.setattr(main.history, "HISTORY_PATH", path)
+    monkeypatch.setitem(main.CONFIG, "history", {})
     main._log_history("summarize", "my secret text", "short", 5)
-    monkeypatch.setattr(main, "CONFIG", {**main.CONFIG, "history": {"log_text": True}})
+    monkeypatch.setitem(main.CONFIG, "history", {"log_text": True})
     main._log_history("summarize", "visible", "out", 5)
     main._log_history("password", "x", "hunter2", 5)
     lines = [__import__("json").loads(l) for l in path.read_text().splitlines()]
@@ -273,7 +274,7 @@ def test_history_hides_text_by_default(tmp_path, monkeypatch):
 
 def test_launch_agent_plist():
     import plistlib
-    data = plistlib.loads(plistlib.dumps(main._launch_agent_plist()))
+    data = plistlib.loads(plistlib.dumps(main.service.launch_agent_plist(Path(main.__file__))))
     assert data["Label"] == "com.watashigpt.actionflow"
     assert data["ProgramArguments"][1].endswith("main.py")
     assert data["KeepAlive"] == {"SuccessfulExit": False}
@@ -282,10 +283,10 @@ def test_launch_agent_plist():
 # ── Command palette controller (macOS UI logic, no AppKit needed) ──
 
 def _controller(text="some text here"):
-    cmds = main.load_config(main._CONFIG_EXAMPLE_PATH)["commands"]
+    cmds = main.load_config(af_config.CONFIG_EXAMPLE_PATH)["commands"]
     ctx = main.AppContext("chat", "telegram", "telegram", "Telegram")
     sugg = main.get_smart_suggestions(ctx, main.analyze_text(text), cmds)
-    return main._PaletteController(text, cmds, sugg), cmds
+    return main.palette.PaletteController(text, cmds, sugg, prompt_for=main._llm_prompt_for), cmds
 
 
 def test_palette_items_sections_and_search():
@@ -302,15 +303,15 @@ def test_palette_items_sections_and_search():
 
 def test_palette_actions(monkeypatch):
     ctl, _ = _controller("hello world")
-    monkeypatch.setattr(main, "LLM_MODE", "mock")
+    monkeypatch.setattr(main.llm, "MODE", "mock")
     assert ctl.activate({"id": "summarize", "title": "Summarize", "icon": "x", "tint": "purple"}, "")["kind"] == "message"
     assert ctl.activate({"id": "b64"}, "")["kind"] == "run"
     assert ctl.activate({"id": "count"}, "")["kind"] == "run"
     assert ctl.activate({"id": "tone"}, "")["kind"] == "submenu"
 
-    monkeypatch.setattr(main, "LLM_MODE", "live")
+    monkeypatch.setattr(main.llm, "MODE", "live")
     seen = {}
-    monkeypatch.setattr(main, "_llm_stream", lambda prompt, model="": seen.setdefault("prompt", prompt) and iter(["ok"]))
+    monkeypatch.setattr(main.llm, "stream", lambda prompt, model="": seen.setdefault("prompt", prompt) and iter(["ok"]))
     action = ctl.activate({"id": "tone:casual", "title": "Casual"}, "")
     assert action["kind"] == "stream" and action["cmd_name"] == "tone"
     list(action["factory"]())
@@ -318,7 +319,11 @@ def test_palette_actions(monkeypatch):
     custom = ctl.activate({"id": "custom", "instruction": "in French"}, "in French")
     assert custom["kind"] == "stream"
     assert ctl.items("", "trans")[0]["id"].startswith("trans:")
-    assert ctl.items("Kazakh", "trans")[-1]["id"] == "trans:Kazakh"
+    assert ctl.items("Kazakh", "trans")[0]["id"] == "trans:Kazakh"
+    assert ctl.items("Klingon", "trans")[-1]["id"] == "trans:Klingon"
+    prompt, _ = main.prompts.prompt_for("trans", {"llm_prompt": "Translate to {lang}: {text}"},
+                                        "Brazilian Portuguese: bom dia")
+    assert prompt == "Translate to Brazilian Portuguese: bom dia"
 
 
 def test_polite_phrase_runs_instantly():
@@ -338,8 +343,114 @@ def test_llm_stream_falls_back_before_first_token(monkeypatch):
                 def create(**kw):
                     return iter([Chunk("Hel"), Chunk("lo")])
 
-    monkeypatch.setattr(main, "_llm_ready", True)
-    monkeypatch.setattr(main, "_llm_client", _FailingClient)
-    monkeypatch.setattr(main, "_llm_fallback_ready", True)
-    monkeypatch.setattr(main, "_llm_fallback_client", Good)
-    assert "".join(main._llm_stream("hi")) == "Hello"
+    monkeypatch.setattr(main.llm, "ready", True)
+    monkeypatch.setattr(main.llm, "client", _FailingClient)
+    monkeypatch.setattr(main.llm, "fallback_ready", True)
+    monkeypatch.setattr(main.llm, "fallback_client", Good)
+    assert "".join(main.llm.stream("hi")) == "Hello"
+
+
+# ── textops ────────────────────────────────────────────────
+
+from actionflow import textops  # noqa: E402
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("mail bob@example.com card 4111 1111 1111 1111", "mail [EMAIL] card [CARD]"),
+    ("call +7 701 123 4567 now", "call [PHONE] now"),
+    ("order 12345678 shipped", "order 12345678 shipped"),          # not a phone
+    ("server 192.168.1.10", "server [IP]"),
+    ("key sk-proj-abcdefghijklmnopqrstuv", "key [API_KEY]"),
+])
+def test_redact(text, expected):
+    assert textops.redact(text)[0] == expected
+
+
+def test_escape_and_sanitize():
+    assert textops.escape("sql: it's; fine") == ("sql", "it''s; fine")
+    assert textops.escape("<b>") == ("html", "&lt;b&gt;")
+    assert textops.sanitize("# Title\nUse C# and **bold** #tag") == "Title\nUse C# and bold #tag"
+    assert textops.sanitize("\x1b[31mred\x1b[0m") == "red"
+
+
+def test_b64_roundtrip_and_strict_decode():
+    assert textops.b64_decode(textops.b64_encode("Привет")) == "Привет"
+    with pytest.raises(ValueError):
+        textops.b64_decode("this is not base64!!")
+
+
+def test_format_structured():
+    assert textops.format_structured('{"b":1,"a":[1,2]}')[1] == '{\n  "b": 1,\n  "a": [\n    1,\n    2\n  ]\n}'
+    assert textops.format_structured('min: {"a": 1}') == ("Minified JSON", '{"a":1}')
+    assert textops.format_structured("<a><b>x</b></a>")[1] == "<a>\n  <b>x</b>\n</a>"
+    with pytest.raises(ValueError):
+        textops.format_structured("just words")
+
+
+def test_password_and_mocking_case():
+    pw = textops.generate_password(16)
+    assert len(pw) == 16 and any(c.isdigit() for c in pw) and any(c.isupper() for c in pw)
+    assert textops.mocking_case("hello world") == "HeLlO wOrLd"
+
+
+def test_history_rotation_and_export(tmp_path, monkeypatch):
+    path = tmp_path / "h.jsonl"
+    monkeypatch.setattr(main.history, "HISTORY_PATH", path)
+    monkeypatch.setattr(main.history, "_MAX_LINES", 10)
+    monkeypatch.setattr(main.history, "_KEEP_LINES", 4)
+    monkeypatch.setitem(main.CONFIG, "history", {"log_text": True})
+    for i in range(12):
+        main.history.log("cmd", f"in|{i}\nx", "out", 1)
+    main.history.rotate()
+    assert len(path.read_text().splitlines()) == 4
+    monkeypatch.setattr(main.history.Path, "home", lambda: tmp_path)
+    md = main.history.export_session(__import__("datetime").datetime(2000, 1, 1), "mock").read_text()
+    assert "in\\|11 x" in md and md.count("\n| ") == 5  # header + 4 rows, pipes escaped
+
+
+# ── Providers / config saving ──────────────────────────────
+
+def test_provider_defaults_are_current():
+    p = main.llm.PROVIDERS
+    assert "github" not in p and "github" in main.llm.RETIRED_PROVIDERS
+    assert all(p[n].free for n in ("groq", "gemini", "cerebras", "openrouter"))
+    assert p["gemini"].default_model != "gemini-2.0-flash"
+    with pytest.raises(ValueError, match="retired"):
+        main.llm.make_client("github", "key")
+
+
+def test_retired_model_is_replaced():
+    _client, model = main.llm.make_client("gemini", "dummy-key", "gemini-2.0-flash")
+    assert model == main.llm.RETIRED_MODELS["gemini-2.0-flash"]
+
+
+def test_request_options_turn_reasoning_down(monkeypatch):
+    opts = main.llm.request_options
+    assert opts("groq", "openai/gpt-oss-120b")["include_reasoning"] is False
+    assert opts("groq", "qwen/qwen3.8-27b")["reasoning_effort"] == "none"
+    assert opts("gemini", "gemini-2.5-flash")["reasoning_effort"] == "none"
+    assert opts("openrouter", "x:free")["reasoning"]["exclude"] is True
+    assert opts("openai", "gpt-6-luna") == {}
+    monkeypatch.setitem(main.CONFIG["llm"], "request_options", {"top_p": 0.9})
+    assert opts("openai", "gpt-6-luna") == {"top_p": 0.9}
+
+
+def test_strip_thinking_stream():
+    f = lambda parts: "".join(main.llm._without_thinking(iter(parts)))
+    assert f(["<thi", "nk>plan", "</think>", "Hello"]) == "Hello"
+    assert f(["Hel", "lo"]) == "Hello"
+    assert main.llm.strip_thinking("<think>x</think>\nDone") == "Done"
+
+
+def test_config_save_keeps_comments(tmp_path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text("# top comment\nllm:\n  provider: ''  # pick one\n  model: ''\n"
+                    "  fallback:\n    provider: ''\ncommands: {}\n")
+    monkeypatch.setattr(af_config, "CONFIG_PATH", path)
+    af_config.save_values("llm", {"provider": "groq", "model": "openai/gpt-oss-120b"})
+    af_config.save_nested(["llm", "fallback"], {"provider": "gemini", "model": "gemini-3.5-flash-lite"})
+    text = path.read_text()
+    assert "# top comment" in text and "# pick one" in text
+    data = __import__("yaml").safe_load(text)
+    assert data["llm"]["provider"] == "groq" and data["llm"]["model"] == "openai/gpt-oss-120b"
+    assert data["llm"]["fallback"] == {"provider": "gemini", "model": "gemini-3.5-flash-lite"}

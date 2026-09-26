@@ -4,6 +4,7 @@
 Started by main.py as: sudo -u $USER python3 -u paste_helper.py
 Main app sends commands via stdin:
   PASTE\n              → send Ctrl+V via portal
+  PASTE_TERMINAL\n     → send Ctrl+Shift+V (terminal emulators)
   COPY\n               → send Ctrl+C via portal
   CLIPBOARD:<base64>\n → set clipboard via wl-copy (runs as user, no sudo issues)
   CLIPBOARD_GET\n      → get clipboard via wl-paste
@@ -32,6 +33,7 @@ except Exception:
     _ATSPI_AVAILABLE = False
 
 KEY_LEFTCTRL = 29
+KEY_LEFTSHIFT = 42
 KEY_V = 47
 KEY_C = 46
 
@@ -87,15 +89,18 @@ if phase != 3 or not session_path:
 print("READY", flush=True)
 
 
-def send_keycombo(key_code: int) -> None:
-    """Press Ctrl+<key>, release."""
-    rd.NotifyKeyboardKeycode(session_path, {}, dbus.Int32(KEY_LEFTCTRL), dbus.UInt32(1))
-    time.sleep(0.02)
+def send_keycombo(key_code: int, shift: bool = False) -> None:
+    """Press Ctrl(+Shift)+<key>, release."""
+    mods = [KEY_LEFTCTRL] + ([KEY_LEFTSHIFT] if shift else [])
+    for mod in mods:
+        rd.NotifyKeyboardKeycode(session_path, {}, dbus.Int32(mod), dbus.UInt32(1))
+        time.sleep(0.02)
     rd.NotifyKeyboardKeycode(session_path, {}, dbus.Int32(key_code), dbus.UInt32(1))
     time.sleep(0.04)
     rd.NotifyKeyboardKeycode(session_path, {}, dbus.Int32(key_code), dbus.UInt32(0))
-    time.sleep(0.02)
-    rd.NotifyKeyboardKeycode(session_path, {}, dbus.Int32(KEY_LEFTCTRL), dbus.UInt32(0))
+    for mod in reversed(mods):
+        time.sleep(0.02)
+        rd.NotifyKeyboardKeycode(session_path, {}, dbus.Int32(mod), dbus.UInt32(0))
 
 
 def _atspi_get_focused() -> tuple[str, int, str] | None:
@@ -211,9 +216,9 @@ for line in sys.stdin:
     if cmd == "QUIT":
         print("OK", flush=True)
         break
-    elif cmd == "PASTE":
+    elif cmd in ("PASTE", "PASTE_TERMINAL"):
         try:
-            send_keycombo(KEY_V)
+            send_keycombo(KEY_V, shift=cmd == "PASTE_TERMINAL")
             print("OK", flush=True)
         except Exception as exc:
             print(f"ERR:{exc}", flush=True)

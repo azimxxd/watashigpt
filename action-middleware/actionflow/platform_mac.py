@@ -170,20 +170,20 @@ def clipboard_set(text: str) -> bool:
 
 
 def clipboard_set_image(path: str) -> bool:
-    """Put a PNG file on the clipboard so Cmd+V pastes the image."""
+    """Put an image file (PNG/JPEG/WebP…) on the clipboard so Cmd+V pastes it."""
     try:
-        from AppKit import NSPasteboardTypePNG
-        from Foundation import NSData
-        data = NSData.dataWithContentsOfFile_(path)
-        if data is None:
+        from AppKit import NSImage
+        image = NSImage.alloc().initWithContentsOfFile_(path)
+        if image is None:
             return False
         pb = _pasteboard()
         pb.clearContents()
-        return bool(pb.setData_forType_(data, NSPasteboardTypePNG))
+        return bool(pb.writeObjects_([image]))
     except ImportError:
+        kind = "JPEG picture" if path.lower().endswith((".jpg", ".jpeg")) else "«class PNGf»"
         script = [
             "on run argv",
-            "set the clipboard to (read (POSIX file (item 1 of argv)) as «class PNGf»)",
+            f"set the clipboard to (read (POSIX file (item 1 of argv)) as {kind})",
             "end run",
         ]
         args = ["osascript"] + [a for line in script for a in ("-e", line)] + [path]
