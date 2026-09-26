@@ -137,10 +137,11 @@ No root, no system packages. Needs Python 3.9+ with **Tk 8.6+** for the command 
 
 ```bash
 cd action-middleware
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python main.py
+./run.sh            # creates .venv on first run (uses uv if installed), then starts
 ```
+
+No suitable Python? `curl -LsSf https://astral.sh/uv/install.sh | sh` — `run.sh` then
+creates a Python 3.12 venv with a bundled Tk automatically.
 
 On first launch grant your terminal app (Terminal, iTerm2, VS Code, …) two permissions in
 **System Settings → Privacy & Security**, then restart the terminal:
@@ -150,11 +151,29 @@ On first launch grant your terminal app (Terminal, iTerm2, VS Code, …) two per
 | **Accessibility** | Send ⌘C / ⌘V to the focused app, swallow the hotkey |
 | **Input Monitoring** | Listen for the global hotkey |
 
+**Menu bar icon** (✨): mode, silent toggle, recent history, open/reload config, quit.
+
+**API keys** are stored in the macOS Keychain — the first-run setup offers it, or:
+
+```bash
+python main.py --set-key groq                 # any provider name
+python main.py --set-key image:pollinations
+```
+
+**Start at login** (runs in the menu bar, no terminal window):
+
+```bash
+python main.py --install      # LaunchAgent, logs → ~/Library/Logs/ActionFlow.log
+python main.py --uninstall
+```
+
+The login agent runs Python directly, so grant Accessibility + Input Monitoring to the
+Python binary path that `--install` prints (in addition to your terminal).
+
 How it works on macOS: a Quartz event tap matches hotkeys by physical key (works with any
 keyboard layout, e.g. Russian), the selection is captured with ⌘C while the full clipboard
 (including images and rich text) is snapshotted and restored, the source app is re-activated
 by PID via `NSRunningApplication`, and notifications go through Notification Center.
-The tray icon is Linux-only for now.
 
 ## Linux
 
@@ -254,6 +273,7 @@ Hotkey (Ctrl+Alt+X)
 - **`sudo -E` with `_run_as_user()`**: runs as root for `/dev/input` access but clipboard/notification commands run as the original user
 - **Pattern learning**: `PatternLearner` reads history, computes usage-frequency weights per app context after 20+ samples
 - **Safe math eval**: `CALC:` uses `ast.parse()` + AST node whitelisting — never raw `eval()`
+- **Privacy**: history stores only text lengths unless `history.log_text: true`; API keys live in env/keychain, never in `config.yaml`
 - **Explicit intent**: without the popup, only prefixed text is processed (`smart_routing: true` enables keyword/LLM guessing)
 
 ## Project Structure
@@ -267,6 +287,7 @@ watashigpt/
 │   ├── config.yaml.example  # Example config — copied to config.yaml on first run
 │   ├── requirements.txt     # Python dependencies (platform markers)
 │   ├── requirements-dev.txt # + pytest
+│   ├── run.sh               # Launcher: creates the venv, then starts the app
 │   └── tests/               # pytest suite: python -m pytest tests
 ├── .gitignore
 └── README.md

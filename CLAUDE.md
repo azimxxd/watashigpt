@@ -84,6 +84,9 @@ instead of touching the real clipboard. End-to-end check (manual):
 - **Handler pattern**: `_BUILTIN_HANDLERS` dict maps command names → `handle_<command>()` functions. LLM commands route through `handle_llm_command()` automatically.
 - **Platform abstraction**: `_IS_MAC` / `_IS_LINUX` / `_IS_WAYLAND` branches in the OS-facing functions (`clipboard_copy`, `_send_paste_keys`, `detect_active_window`, `_focus_window`, `notify`, ...). macOS implementations live in `platform_mac.py` (imported as `mac`); keep PyObjC imports lazy there so tests import on any OS
 - **macOS hotkeys**: `platform_mac.HotkeyListener` matches physical keycodes + exact modifier set (layout-independent), swallows the event when Accessibility is granted, runs callbacks on new threads
+- **macOS menu bar**: `platform_mac.StatusBar` (NSStatusItem) replaces the pystray tray on macOS. Clicks arrive while Tk pumps events; anything touching AppKit/Tk from worker threads goes through `_run_on_main()`
+- **API keys**: `_resolve_api_key()` — env var → config.yaml → keyring (`ActionFlow` service, accounts `llm:<provider>` / `image:<provider>`). `--set-key` stores one
+- **Autostart**: macOS `--install` writes a LaunchAgent (`com.watashigpt.actionflow`), Linux `--install` a systemd unit. Without a TTY the TUI prints plain text; `_acquire_single_instance_lock()` prevents two instances
 - **macOS Tk**: Tk must stay on the main thread; the main loop calls `_tk_root.update()` every tick; `_present_popup()` activates our own process so the popup gets keyboard focus
 - **`_run_as_user()`**: runs subprocess commands as the real user when executing under `sudo` (Linux only; never run with sudo on macOS)
 - **Provider registry**: `_PROVIDER_BASE_URLS` and `_PROVIDER_DEFAULT_MODELS` dicts for clean multi-provider support
@@ -97,7 +100,7 @@ instead of touching the real clipboard. End-to-end check (manual):
 - **Clipboard stack**: in-memory `_clipboard_stack` list for `STACK:`/`POP:` push/pop operations
 - **Safe math eval**: `CALC:` uses `ast.parse()` + AST node whitelisting — never raw `eval()`
 - **Undo**: CTRL+ALT+Z restores the original text by writing it to clipboard and pasting (not Ctrl+Z). Notification: "Undone · restored previous text"
-- **History log**: `~/.actionflow_history.jsonl` with `ts`, `command`, `input`, `output`, `duration_ms`, `provider`, `app_context`, `text_length`, `text_language`, `trigger` fields
+- **History log**: text is replaced by `[N chars]` unless `history.log_text: true`. `~/.actionflow_history.jsonl` with `ts`, `command`, `input`, `output`, `duration_ms`, `provider`, `app_context`, `text_length`, `text_language`, `trigger` fields
 - **LLM fallback**: if primary provider errors/times out, auto-retry with secondary provider configured in `config.yaml` under `llm.fallback`
 - **Per-command model override**: optional `model:` key per command in config.yaml overrides the global model
 - **Notification level**: optional `notify:` field per command (`always` | `errors_only` | `never`) to suppress desktop notifications for noisy commands
