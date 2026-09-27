@@ -1,5 +1,12 @@
 <div align="center">
 
+<p>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/media/actionflow-logo-dark.png">
+    <img src="docs/media/actionflow-logo.png" alt="ActionFlow logo: a flowing stroke running through lines of text with a red and green diff" width="240">
+  </picture>
+</p>
+
 # ActionFlow
 
 ### Better writing, right where you work.
@@ -52,6 +59,17 @@ Only the instruction and its name are saved. You can remove saved actions in Set
 
 ## How it works
 
+**macOS shortcut:** hold **Control (⌃)** and **Option (⌥)**, then press the physical
+**X / Ч** key and release the keys. This works with English and Russian layouts.
+**Command (⌘) + X is Cut**, not the ActionFlow shortcut. Check **Shortcuts: ready**
+in the menu bar if the palette does not open. Both macOS permissions are required;
+the app never falls back to a shortcut listener that also passes the shortcut to the editor.
+
+**No permissions yet?** The menu bar shows **Shortcuts: waiting for permissions** until both
+are granted. Until then — and anytime — copy text with **⌘C** and choose **Open copied text…**
+from the same menu. It opens the usual palette in a floating window, and accepting a result
+copies it back to your clipboard, ready to paste. This path needs no permissions at all.
+
 1. **Select** text in your editor, browser, mail app or messenger.
 2. **Open** ActionFlow with **⌃⌥X** on macOS or **Ctrl+Alt+X** on Linux.
 3. **Choose** one of the four actions, or write your own instruction.
@@ -69,14 +87,41 @@ is remembered too. There is no YAML to edit for ordinary use.
 
 ## Quick start
 
-### macOS
+### macOS app (no terminal for everyday use)
+
+Build **ActionFlow.app** once on a Mac:
+
+```sh
+cd action-middleware
+./build-macos.sh
+```
+
+Drag `action-middleware/dist/ActionFlow.app` into **Applications**, then double-click it.
+Python and dependencies are included. You can launch it through Finder or Spotlight,
+or drag the app from Finder to the Dock. It runs in the menu bar without a terminal window.
+
+On first launch, allow **ActionFlow** in **System Settings → Privacy & Security →
+Accessibility** and **Input Monitoring**. Close the permission notice; the app retries
+automatically. If macOS asks for a restart, quit and reopen it. Its menu also
+links to these permissions and **Settings & practice…**.
+
+To launch automatically, add ActionFlow under **System Settings → General → Login Items →
+Open at Login**. Remove an older Python login agent first, if you installed one.
+
+The app stores configuration in `~/Library/Application Support/ActionFlow/config.yaml` and
+startup logs in `~/Library/Logs/ActionFlow/`. Existing language and saved-action preferences
+are shared with the source version. Connect your provider in Settings, or copy your source
+`config.yaml` into the app's configuration directory before its first launch.
+
+This is a local build for the build Mac's architecture. Public distribution requires
+Developer ID signing and Apple notarization. Build details: [macOS packaging](docs/advanced.md#macos-packaging).
+
+<details>
+<summary><strong>Run from source instead</strong></summary>
 
 ```sh
 git clone https://github.com/azimxxd/watashigpt.git
-cd watashigpt
-# This writing-focused version is currently on the macos-support branch.
-git switch macos-support
-cd action-middleware
+cd watashigpt/action-middleware
 ./run.sh
 ```
 
@@ -88,6 +133,8 @@ Use Python **3.9+**, or an installed `uv` to let the launcher provision Python 3
 - Connect an AI provider in the first-run practice window. Enter an API key and choose a model
   available to your account, or connect a local model.
 - Try the sample sentence. The practice window never replaces text in another app.
+
+</details>
 
 Return to setup through **Settings & practice…** in the menu bar. Existing provider configuration
 is retained. Start-at-login instructions are in [advanced setup](docs/advanced.md#start-at-login).
@@ -105,7 +152,7 @@ sudo apt-get install python3-tk wl-clipboard libnotify-bin python3-gi gir1.2-ats
 sudo apt-get install python3-tk xclip xdotool libnotify-bin
 ```
 
-Then clone the repository, select `macos-support`, and run `action-middleware/run.sh` as above.
+Then clone the repository and run `action-middleware/run.sh` as above.
 The Tk window provides the same four actions, custom instructions, streaming preview and saved actions.
 
 Global hotkeys currently require root, so the launcher uses `sudo -E`.
@@ -193,13 +240,15 @@ If your virtual environment was created with `uv` and has no pip, install develo
 | `product.py` | Four writing actions, optional groups and word-level diffs. |
 | `palette.py` | Shared product logic for the macOS and Linux interfaces. |
 | `mac_ui.py` / `tk_ui.py` | Native AppKit and Tk windows. |
+| `platform_mac.py` | macOS event tap, selection capture, clipboard restore and permissions. |
 | `preferences.py` | Local settings, saved instructions and opt-in counters. |
 | `connection.py` / `llm.py` | Connection setup, provider requests, streaming and fallback. |
 | `main.py` | Selection capture, dispatch, safe replacement and undo. |
+| `macos/` | PyInstaller packaging, app icon and build scripts. |
 
-Tests cover routing, privacy, command restrictions, preferences, provider setup and preview safety.
-Native AppKit checks run when available. For desktop integration, use the
-[manual smoke checklist](docs/advanced.md#manual-smoke-checks).
+Tests cover routing, privacy, command restrictions, preferences, provider setup, preview
+safety and macOS hotkey safety. Native AppKit checks run when available. For desktop
+integration, use the [manual smoke checklist](docs/advanced.md#manual-smoke-checks).
 
 ---
 
