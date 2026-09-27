@@ -41,9 +41,41 @@ instructions, prefer Save action in the preview. It needs no YAML and stores no 
 `history.log_text: true` opts into text in history/diagnostic logs. Password, redaction, command
 and repeat output remain masked. Previously written logs are not rewritten on upgrade.
 
+## macOS packaging
+
+Run `./build-macos.sh` in `action-middleware` on macOS. PyInstaller builds a windowless
+`dist/ActionFlow.app` with Python, PyObjC and the runtime dependencies included.
+The build packages only `config.yaml.example`, never your `config.yaml`, preferences or API keys.
+The source checkout and virtual environment are not needed after installing the app.
+
+Builds are ad-hoc signed for local use, not notarized release downloads. Build separately for
+Apple Silicon and Intel with the appropriate Python architecture. For public releases, use a
+Developer ID certificate, hardened runtime signing and Apple's notarization workflow. Do not
+work around Gatekeeper by disabling it globally.
+
+The app's configuration lives outside the signed bundle in
+`~/Library/Application Support/ActionFlow/config.yaml`; updating the app preserves it.
+Startup logs go to `~/Library/Logs/ActionFlow/app.log` with one previous log retained
+when the file exceeds 2 MB at startup. The packaged entry point supplies noninteractive
+standard streams, so no terminal is needed.
+
+A packaging smoke check (no provider requests or permission prompts):
+
+```sh
+dist/ActionFlow.app/Contents/MacOS/ActionFlow --smoke-test
+```
+
+Look for `BUNDLE_SMOKE_OK` in the startup log. This checks imports, bundled resources,
+the macOS keyring backend and AppKit initialization. Also verify the installed app manually:
+open in Finder, grant permissions to ActionFlow, quit and reopen, open Settings from the
+menu bar, and perform the writing workflow below.
+
 ## Start at login
 
-macOS:
+For the macOS app, add **ActionFlow.app** to **System Settings → General → Login Items → Open at Login**.
+Do not also run the source LaunchAgent.
+
+For the source version on macOS:
 
 ```sh
 python main.py --install

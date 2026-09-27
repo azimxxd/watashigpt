@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import copy
 import re
-import shutil
+import sys
 from pathlib import Path
 
 import yaml
 from actionflow.product import writing_commands
 
-APP_DIR = Path(__file__).resolve().parent.parent          # action-middleware/
+RESOURCE_DIR = Path(__file__).resolve().parent.parent
+APP_DIR = (Path.home() / "Library" / "Application Support" / "ActionFlow"
+           if getattr(sys, "frozen", False) and sys.platform == "darwin"
+           else RESOURCE_DIR)
 CONFIG_PATH = APP_DIR / "config.yaml"
-CONFIG_EXAMPLE_PATH = APP_DIR / "config.yaml.example"
+CONFIG_EXAMPLE_PATH = RESOURCE_DIR / "config.yaml.example"
 
 DEFAULT_CONFIG = {
     "hotkeys": {"intercept": "ctrl+alt+x", "undo": "ctrl+alt+z"},
@@ -87,7 +90,10 @@ def ensure_user_config() -> bool:
     """First run: copy config.yaml.example → config.yaml. Returns True if created."""
     if CONFIG_PATH.exists() or not CONFIG_EXAMPLE_PATH.exists():
         return False
-    shutil.copyfile(CONFIG_EXAMPLE_PATH, CONFIG_PATH)
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with CONFIG_PATH.open("x", encoding="utf-8") as target:
+        CONFIG_PATH.chmod(0o600)
+        target.write(CONFIG_EXAMPLE_PATH.read_text(encoding="utf-8"))
     return True
 
 

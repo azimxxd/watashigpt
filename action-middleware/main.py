@@ -115,6 +115,7 @@ _silent_mode_lock = threading.Lock()
 _tray_icon = None  # pystray icon, set in _start_tray()
 _mac_menubar = None  # platform_mac.StatusBar, set in _start_mac_menubar()
 _mac_menubar_silent_item = None
+_mac_menubar_hotkey_status = None
 
 
 _main_thread_calls: queue.Queue = queue.Queue()  # drained by the main loop
@@ -393,8 +394,13 @@ def _writing_palette(text: str, source_window: str | None, *, demo=False, settin
     controller = palette.PaletteController(text, CONFIG.get('commands',{}), prompt_for=_llm_prompt_for)
     controller.demo = demo
     context = ('Practice text · no other application will be changed' if demo else _palette_context_line(text))
+    copy_only = source_window is None and not demo
+    if copy_only:
+        context = 'Copied text · copy the result and paste it into your app'
     if _NATIVE_UI:
         ui = mac_ui.CommandPalette(controller, context=context, status=_palette_status_line())
+        ui.copy_only = copy_only
+        if copy_only: ui.preview_buttons[5].setTitle_('Copy & close')
         if settings:
             ui.submenu = {'id':'settings','title':'Settings'}
             ui.reload()
@@ -412,6 +418,11 @@ def _writing_palette(text: str, source_window: str | None, *, demo=False, settin
         # The practice palette can preview/copy text but never inject keys into another app.
         if outcome['kind'] == 'replace':
             controller.remember(ui._stream_spec or {})
+        return
+    if copy_only and outcome['kind'] == 'replace':
+        clipboard_copy(outcome['text'])
+        controller.remember(ui._stream_spec or {})
+        preferences.record('copied')
         return
     _popup_trigger = 'popup'
     _current_source_window = source_window
@@ -442,6 +453,21 @@ def _show_welcome(settings=False) -> None:
                          None,demo=True,settings=settings)
         try: preferences.update(onboarded=True)
         except OSError: pass
+    finally:
+        _job_lock.release()
+
+
+def _open_copied_text() -> None:
+    """Open a floating editor without global shortcuts or synthetic keypresses."""
+    if not _job_lock.acquire(blocking=False):
+        return
+    try:
+        text = clipboard_paste()
+        if not text.strip():
+            _result_queue.put(("Copy some text first",
+                               "Select text in your app and press Command+C, then choose Open copied text… from the ActionFlow menu."))
+            return
+        _writing_palette(text, None)
     finally:
         _job_lock.release()
 
@@ -1823,8 +1849,9 @@ def _do_intercept() -> None:
             text: str = mac.capture_selection()
             if not text:
                 if mac.is_accessibility_trusted() is False:
-                    TUI.warn("Cmd+C was blocked — grant Accessibility to your terminal app")
-                    notify(APP_NAME, "Grant Accessibility permission to your terminal app.")
+                    target = "ActionFlow" if getattr(sys, "frozen", False) else "your terminal app"
+                    TUI.warn(f"Cmd+C was blocked — grant Accessibility to {target}")
+                    notify(APP_NAME, f"Grant Accessibility permission to {target}.")
                 else:
                     TUI.warn("No text copied from selection")
                     notify(APP_NAME, "No text selected.")
@@ -2021,7 +2048,7 @@ def _create_tray_icon_image(color: str = "green"):
 
 def _start_mac_menubar() -> None:
     """Menu bar icon on macOS (the pystray tray is Linux-only)."""
-    global _mac_menubar, _mac_menubar_silent_item
+    global _mac_menubar, _mac_menubar_silent_item, _mac_menubar_hotkey_status
     try:
         bar = mac.StatusBar()
     except Exception as exc:
@@ -2029,6 +2056,8 @@ def _start_mac_menubar() -> None:
         return
 
     bar.add_item("ActionFlow — writing assistant")
+    _mac_menubar_hotkey_status = bar.add_item("Shortcuts: waiting for permissions")
+    bar.add_item("Use Control + Option + X (not Command + X)")
     bar.add_item(f"{mac.format_hotkey(HOTKEY)}  process selection   "
                  f"{mac.format_hotkey(UNDO_HOTKEY)}  undo")
     bar.add_separator()
@@ -2042,7 +2071,10 @@ def _start_mac_menubar() -> None:
     bar.add_item("Recent history…", lambda: _result_queue.put(("History (last 20)",
                                                                 history.recent_text())))
     bar.add_separator()
+    bar.add_item("Open copied text…", lambda: _run_on_main(_open_copied_text))
     bar.add_item("Settings & practice…", lambda: _run_on_main(lambda: _show_welcome(settings=True)))
+    bar.add_item("Accessibility settings…", lambda: mac.open_privacy_settings("Accessibility"))
+    bar.add_item("Input Monitoring settings…", lambda: mac.open_privacy_settings("ListenEvent"))
     bar.add_item("Advanced configuration…", lambda: mac.open_path(str(_CONFIG_PATH)))
     bar.add_item("Reload config", _reload_config)
     bar.add_separator()
@@ -2131,16 +2163,18 @@ def _start_mac_hotkeys(bindings: list) -> bool:
     trusted = mac.is_accessibility_trusted()
     listening = mac.has_input_monitoring()
     if not trusted or not listening:
+        permission_target = "ActionFlow" if getattr(sys, "frozen", False) else "your terminal app"
         missing = [name for name, ok in (("Accessibility", trusted),
                                          ("Input Monitoring", listening)) if not ok]
         TUI.box("macOS permissions needed", [
             f"  {TUI.YELLOW}Missing: {', '.join(missing)}{TUI.RESET}",
-            f"  {TUI.DIM}System Settings → Privacy & Security → enable your terminal app{TUI.RESET}",
-            f"  {TUI.DIM}(Terminal / iTerm2 / VS Code …) in both lists, then restart it.{TUI.RESET}",
+            f"  {TUI.DIM}System Settings → Privacy & Security → enable {permission_target}{TUI.RESET}",
+            f"  {TUI.DIM}Enable both permissions, then quit and reopen {permission_target}.{TUI.RESET}",
         ], TUI.YELLOW)
         mac.request_permissions()
         if not trusted:
             mac.open_privacy_settings("Accessibility")
+        return False
 
     listener = mac.HotkeyListener()
     try:
@@ -2152,10 +2186,19 @@ def _start_mac_hotkeys(bindings: list) -> bool:
     if not listener.start():
         TUI.error(f"Global hotkeys unavailable: {listener.error}")
         return False
-    if listener.listen_only:
-        TUI.warn("Hotkeys work but are not swallowed (no Accessibility permission yet)")
     _mac_hotkeys = listener
+    if _mac_menubar is not None and _mac_menubar_hotkey_status is not None:
+        _mac_menubar.set_title(_mac_menubar_hotkey_status, "Shortcuts: ready")
     return True
+
+
+def _retry_mac_hotkeys(bindings: list) -> bool:
+    """Retry after permissions are granted, without repeating system prompts."""
+    if _mac_hotkeys is not None:
+        return True
+    if not mac.is_accessibility_trusted() or not mac.has_input_monitoring():
+        return False
+    return _start_mac_hotkeys(bindings)
 
 
 # ============================================================
@@ -2307,22 +2350,35 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
         (UNDO_HOTKEY, on_undo_triggered),
         (silent_hotkey, on_silent_triggered),
     ]
+    hotkeys_ready = True
     if _IS_MAC:
-        if not _start_mac_hotkeys(hotkey_bindings):
-            return
+        hotkeys_ready = _start_mac_hotkeys(hotkey_bindings)
+        if not hotkeys_ready:
+            if not (_NATIVE_UI and getattr(sys, "frozen", False)):
+                return
+            alert = mac_ui.NSAlert.alloc().init()
+            alert.setMessageText_("Allow ActionFlow to use global shortcuts")
+            alert.setInformativeText_(
+                "In System Settings → Privacy & Security, enable ActionFlow under "
+                "Accessibility and Input Monitoring. Shortcuts will activate automatically "
+                "after you close this message. If macOS asks you to restart, quit and reopen "
+                "ActionFlow. Use Control + Option + X, not Command + X (Cut).")
+            alert.addButtonWithTitle_("OK")
+            alert.runModal()
     else:
         for spec, callback in hotkey_bindings:
             linux.add_hotkey(spec, callback)
 
     notify(
-        "ActionFlow Active",
-        f"{HOTKEY.upper()} to intercept | {UNDO_HOTKEY.upper()} to undo | Ctrl+C to exit",
+        "ActionFlow Active" if hotkeys_ready else "ActionFlow needs permissions",
+        (f"{HOTKEY.upper()} to edit | {UNDO_HOTKEY.upper()} to undo"
+         if hotkeys_ready else "Enable permissions, then quit and reopen ActionFlow."),
     )
 
     TUI.separator()
     cmd_count = len(CONFIG.get("commands", {}))
     llm_label = f"LLM: {llm.provider}" if llm.MODE == "live" else "Mock mode"
-    TUI.micro_log(f"{TUI.GREEN}✓{TUI.RESET} Listening for hotkeys...")
+    TUI.micro_log("Listening for hotkeys..." if hotkeys_ready else "Waiting for macOS permissions; restart after granting them.")
     TUI.micro_log(f"{cmd_count} commands loaded | {llm_label} | {HOTKEY.upper()} to intercept")
     TUI.micro_log(f"{TUI.DIM}/ = search  S = export session  Ctrl+C = exit{TUI.RESET}")
     print()
@@ -2331,6 +2387,7 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
         _show_welcome()
 
     interactive = sys.stdin.isatty()
+    next_hotkey_retry = 0.0
     try:
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd) if interactive else None
@@ -2338,6 +2395,11 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
             tty.setcbreak(fd)
         try:
             while not _exit_event.is_set():
+                if _IS_MAC and not hotkeys_ready and time.monotonic() >= next_hotkey_retry:
+                    next_hotkey_retry = time.monotonic() + 2.0
+                    hotkeys_ready = _retry_mac_hotkeys(hotkey_bindings)
+                    if hotkeys_ready:
+                        TUI.micro_log("macOS permissions granted; global shortcuts are ready")
                 if not interactive:
                     time.sleep(0.1)  # no terminal (launchd/systemd) — just pump queues
                 elif select.select([sys.stdin], [], [], 0.1)[0]:
@@ -2358,7 +2420,9 @@ def main(keep_banner: bool = False, no_tray: bool = False) -> None:
                 # Keep the Cocoa / Tk event loop alive between popups (menu bar
                 # clicks; otherwise macOS marks the process as "not responding")
                 if _NATIVE_UI:
-                    mac_ui.pump(0)
+                    # Give AppKit time to service menu/accessibility events even
+                    # while no keyboard/mouse NSEvent is queued.
+                    mac_ui.pump(0.01)
                 elif tk_ui is not None and tk_ui.root_if_created() is not None:
                     try:
                         tk_ui.root_if_created().update()

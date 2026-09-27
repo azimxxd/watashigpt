@@ -467,3 +467,17 @@ def test_prompts_keep_the_text_language():
     trans, _ = main.prompts.prompt_for("trans", cmds["trans"], "EN: Привет")
     assert main.prompts.LANGUAGE_RULE not in trans
     assert main.llm.tidy("- a  \n- b  ") == "- a\n- b"
+
+
+def test_first_config_creates_private_writable_directory(tmp_path, monkeypatch):
+    path = tmp_path / "Application Support" / "ActionFlow" / "config.yaml"
+    example = tmp_path / "defaults.yaml"
+    example.write_text("llm: {provider: ''}\n")
+    monkeypatch.setattr(af_config, "CONFIG_PATH", path)
+    monkeypatch.setattr(af_config, "CONFIG_EXAMPLE_PATH", example)
+    assert af_config.ensure_user_config()
+    assert path.read_text() == example.read_text()
+    assert path.stat().st_mode & 0o777 == 0o600
+    path.write_text("llm: {provider: local}\n")
+    assert not af_config.ensure_user_config()
+    assert "local" in path.read_text()

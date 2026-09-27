@@ -696,7 +696,8 @@ class CommandPalette:
             can_save = bool((self._stream_spec or {}).get("cmd_config",{}).get("instruction")) and not (self._stream_spec or {}).get("refinement")
             self.preview_buttons[3].setEnabled_(can_save)
             self.controller.record("generated", (self._stream_spec or {}).get("cmd_name", ""))
-            self._set_hints([("Replace", "↵"), ("Copy", "⌘C"), ("Retry", "⇥"), ("Back", "esc")])
+            accept = "Copy & close" if getattr(self, 'copy_only', False) else "Replace"
+            self._set_hints([(accept, "↵"), ("Copy", "⌘C"), ("Retry", "⇥"), ("Back", "esc")])
 
     def _drain_ui_queue(self) -> None:
         dirty = False

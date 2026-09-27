@@ -293,7 +293,8 @@ def send_paste() -> bool:
 def capture_selection(timeout: float = 0.6) -> str:
     """Copy the current selection via Cmd+C and return it, leaving the user's
     clipboard exactly as it was. Returns '' when nothing was selected."""
-    wait_for_modifiers_released()
+    if not wait_for_modifiers_released():
+        return ""  # Never inject Cmd+C while the user's modifiers are held.
     snapshot = clipboard_snapshot()
     before = clipboard_change_count()
     marker = None
@@ -301,7 +302,10 @@ def capture_selection(timeout: float = 0.6) -> str:
         # No change counter without PyObjC — fall back to a marker string.
         marker = f"__ACTIONFLOW_MARKER_{time.time_ns()}__"
         clipboard_set(marker)
-    send_copy()
+    if not send_copy():
+        if marker is not None:
+            clipboard_restore(snapshot)
+        return ""
 
     text = ""
     deadline = time.time() + timeout
@@ -407,8 +411,8 @@ class HotkeyListener:
 
     Matches on physical key codes + exact modifier set, so hotkeys work in any
     keyboard layout. Matching key presses are swallowed (not delivered to the
-    focused app) when the tap has Accessibility access; otherwise the tap falls
-    back to listen-only mode (Input Monitoring is enough).
+    focused app). We require a suppressing tap: a listen-only tap could let
+    the same shortcut edit the source text while capture is running.
     """
 
     def __init__(self) -> None:
@@ -418,6 +422,7 @@ class HotkeyListener:
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self.listen_only = False
+        self._pressed: set[int] = set()
         self.error = ""
 
     def add_hotkey(self, spec: str, callback: Callable[[], None]) -> None:
@@ -429,32 +434,37 @@ class HotkeyListener:
                           Quartz.kCGEventTapDisabledByUserInput):
             Quartz.CGEventTapEnable(self._tap, True)
             return event
-        if event_type != Quartz.kCGEventKeyDown:
+        if event_type not in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
             return event
-        keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+        keycode = int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode))
+        if event_type == Quartz.kCGEventKeyUp:
+            if keycode in self._pressed:
+                self._pressed.discard(keycode)
+                return None
+            return event
+        if keycode in self._pressed:
+            return None  # Swallow repeats even if modifiers were released first.
         flags = int(Quartz.CGEventGetFlags(event)) & _MOD_MASK
         callback = self._bindings.get((flags, int(keycode)))
         if callback is None:
             return event
+        self._pressed.add(keycode)
         if not Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat):
             # Never block the tap — macOS disables slow taps.
             threading.Thread(target=callback, daemon=True).start()
-        return None  # swallow (ignored in listen-only mode)
+        return None
 
     def _run(self) -> None:
         import Quartz
-        mask = Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
-        for option in (Quartz.kCGEventTapOptionDefault, Quartz.kCGEventTapOptionListenOnly):
-            self._tap = Quartz.CGEventTapCreate(
-                Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
-                option, mask, self._callback, None,
-            )
-            if self._tap is not None:
-                self.listen_only = option == Quartz.kCGEventTapOptionListenOnly
-                break
+        mask = (Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
+                | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp))
+        self._tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault, mask, self._callback, None,
+        )
         if self._tap is None:
-            self.error = ("could not create event tap — grant Input Monitoring and "
-                          "Accessibility to your terminal app, then restart it")
+            self.error = ("could not create a suppressing event tap — grant Input Monitoring "
+                          "and Accessibility to ActionFlow (or the terminal for source runs)")
             self._ready.set()
             return
 
