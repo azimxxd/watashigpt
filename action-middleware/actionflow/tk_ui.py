@@ -295,6 +295,7 @@ class WritingPalette:
         elif kind == 'message':
             messagebox.showinfo(action['title'],action['text'],parent=self.win)
         elif kind == 'connect': self.connect(action['provider'])
+        elif kind == 'edit_action': self.edit_command(action.get('action'))
         elif kind == 'delete':
             if messagebox.askyesno('Remove action','Remove ' + action['title'] + '?',parent=self.win):
                 try:
@@ -302,6 +303,55 @@ class WritingPalette:
                     self.controller.refresh()
                     self.reload()
                 except OSError: messagebox.showerror('Could not save','Check access to your home folder.',parent=self.win)
+
+    def edit_command(self, saved=None):
+        from tkinter import messagebox
+        from actionflow import preferences
+        dialog = tk.Toplevel(self.win)
+        dialog.title('Edit command' if saved else 'New command')
+        dialog.transient(self.win)
+        dialog.grab_set()
+        body = tk.Frame(dialog, padx=18, pady=18)
+        body.pack(fill='both', expand=True)
+        tk.Label(body, text='Name (up to 60 characters)').pack(anchor='w')
+        name = tk.Entry(body, width=56)
+        name.pack(fill='x', pady=(4, 12))
+        name.insert(0, saved['name'] if saved else '')
+        tk.Label(body, text='Instruction (up to 2,000 characters)').pack(anchor='w')
+        instruction = tk.Text(body, width=56, height=7, wrap='word')
+        instruction.pack(fill='both', expand=True, pady=(4, 8))
+        instruction.insert('1.0', saved['instruction'] if saved else '')
+        tk.Label(body, text='Only the instruction is saved, never the selected text.').pack(anchor='w')
+        error = tk.Label(body, text='', fg='#b91c1c', wraplength=420)
+        error.pack(anchor='w', pady=6)
+        buttons = tk.Frame(body)
+        buttons.pack(fill='x')
+        def save():
+            try:
+                self.controller.save_named_action(name.get(), instruction.get('1.0', 'end-1c'),
+                                                  saved['id'] if saved else None)
+            except (ValueError, OSError) as exc:
+                error.config(text=str(exc))
+                return
+            dialog.destroy()
+            self.query.set('')
+            self.reload()
+        def delete():
+            if messagebox.askyesno('Delete command', 'Delete ' + saved['name'] + '?', parent=dialog):
+                try:
+                    preferences.remove_action(saved['id'])
+                    self.controller.refresh()
+                except OSError as exc:
+                    error.config(text=str(exc))
+                    return
+                dialog.destroy()
+                self.reload()
+        tk.Button(buttons, text='Save', command=save).pack(side='right')
+        tk.Button(buttons, text='Cancel', command=dialog.destroy).pack(side='right', padx=8)
+        if saved: tk.Button(buttons, text='Delete…', command=delete).pack(side='left')
+        dialog.bind('<Escape>', lambda event: dialog.destroy())
+        name.focus_set()
+        self.win.wait_window(dialog)
 
     def enter(self):
         if self._running: return 'break'

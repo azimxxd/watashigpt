@@ -1,8 +1,8 @@
 # ActionFlow — native macOS interface
 #
 # A Spotlight/Raycast-style command palette built with AppKit (PyObjC):
-#   - non-activating floating panel: the app you were typing in stays active,
-#     replacement is verified separately by main.py before any paste
+#   - floating panel takes keyboard focus; main.py restores the source app
+#     and verifies its selection before any replacement
 #   - high-contrast dark surface, rounded corners and SF Symbols
 #   - search field doubles as a free-form instruction ("make it shorter")
 #   - streaming preview for LLM results: ↵ replace, ⇥ retry, type to refine
@@ -41,14 +41,13 @@ from AppKit import (
     NSAnimationContext, NSPasteboard, NSPasteboardTypeString,
     NSAttributedString, NSForegroundColorAttributeName, NSFontAttributeName,
     NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSMouseInRect,
-    NSLineBreakByTruncatingTail, NSButton, NSAlert, NSSecureTextField, NSAppearance, NSAppearanceNameDarkAqua,
+    NSLineBreakByTruncatingTail, NSButton, NSAlert, NSSecureTextField, NSWorkspace, NSVisualEffectView,
     NSMutableAttributedString, NSBackgroundColorAttributeName, NSStrikethroughStyleAttributeName,
 )
 from Foundation import NSObject
 
 # ── Constants (numeric where PyObjC doesn't export the enum name) ──
 _STYLE_BORDERLESS = 0
-_STYLE_NONACTIVATING = 1 << 7
 _STYLE_FULLSIZE = 1 << 15
 _BACKING_BUFFERED = 2
 _LEVEL_POPUP = 101                       # NSPopUpMenuWindowLevel
@@ -96,7 +95,7 @@ def _label(text: str, size: float = 13, weight=NSFontWeightRegular, color=None,
            frame=None) -> NSTextField:
     field = NSTextField.labelWithString_(text)
     field.setFont_(NSFont.systemFontOfSize_weight_(size, weight))
-    field.setTextColor_(color or NSColor.colorWithCalibratedWhite_alpha_(0.95, 1))
+    field.setTextColor_(color or NSColor.labelColor())
     field.setLineBreakMode_(NSLineBreakByTruncatingTail)
     field.cell().setTruncatesLastVisibleLine_(True)
     if frame is not None:
@@ -149,13 +148,12 @@ def pump(timeout: float = 0.0) -> None:
 
 def _hold_key_window_until_accept_released(timeout: float = 0.8) -> None:
     """After an accepted result, keep the finalized panel as the key window
-    until the accepting Return/Enter is physically released. The panel is
-    non-activating, so the source app is still active underneath and would
-    receive the trailing keyUp and auto-repeats — a leaked Return sends the
-    old draft in chat apps like Telegram."""
-    if platform_mac.wait_for_keys_released(platform_mac.ACCEPT_KEYS,
-                                           timeout=timeout, pump=pump):
-        pump(0.05)  # consume the keyUp itself while this app still owns focus
+    until the accepting Return/Enter is physically released. A leaked Return
+    can send the old draft in chat apps like Telegram."""
+    while not platform_mac.wait_for_keys_released(platform_mac.ACCEPT_KEYS,
+                                                  timeout=timeout, pump=pump):
+        pass  # Keep the key window until release, even after a long hold.
+    pump(0.05)  # consume the keyUp itself while this app still owns focus
 
 
 # ============================================================
@@ -177,7 +175,7 @@ class AFRowView(NSTableRowView):
 
     def drawSelectionInRect_(self, rect):
         bounds = NSMakeRect(6, 1, self.bounds().size.width - 12, self.bounds().size.height - 2)
-        NSColor.colorWithCalibratedWhite_alpha_(0.95, 1).colorWithAlphaComponent_(0.10).setFill()
+        NSColor.labelColor().colorWithAlphaComponent_(0.10).setFill()
         NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, 8, 8).fill()
 
     def isEmphasized(self):
@@ -282,9 +280,8 @@ class CommandPalette:
     def _build_window(self) -> None:
         panel = AFPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H),
-            _STYLE_BORDERLESS | _STYLE_NONACTIVATING | _STYLE_FULLSIZE,
+            _STYLE_BORDERLESS | _STYLE_FULLSIZE,
             _BACKING_BUFFERED, False)
-        panel.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameDarkAqua))
         panel.setLevel_(_LEVEL_POPUP)
         panel.setCollectionBehavior_(_COLLECTION)
         panel.setFloatingPanel_(True)
@@ -298,21 +295,52 @@ class CommandPalette:
         panel.setDelegate_(self.delegate)
         self.panel = panel
 
-        root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
-        root.setWantsLayer_(True)
-        root.layer().setBackgroundColor_(NSColor.colorWithCalibratedWhite_alpha_(0.10, 1).CGColor())
-        root.layer().setCornerRadius_(16)
-        root.layer().setMasksToBounds_(True)
-        root.layer().setBorderWidth_(0.5)
-        root.layer().setBorderColor_(NSColor.separatorColor().CGColor())
-        panel.setContentView_(root)
+        frame = NSMakeRect(0, 0, W, H)
+        root = NSView.alloc().initWithFrame_(frame)
+        root.setAutoresizingMask_(18)  # width + height
+        container = NSView.alloc().initWithFrame_(frame)
+        container.setAutoresizingMask_(18)
+        workspace = NSWorkspace.sharedWorkspace()
+        reduced = workspace.accessibilityDisplayShouldReduceTransparency()
+        if reduced:
+            root.setWantsLayer_(True)
+            root.layer().setBackgroundColor_(NSColor.windowBackgroundColor().CGColor())
+            root.layer().setCornerRadius_(24)
+            root.layer().setMasksToBounds_(True)
+            self.surface_style = 'solid'
+        else:
+            try:
+                glass_class = objc.lookUpClass('NSGlassEffectView')
+            except objc.nosuchclass_error:
+                glass_class = None
+            if glass_class is not None:
+                surface = glass_class.alloc().initWithFrame_(frame)
+                surface.setStyle_(0)  # native regular Liquid Glass
+                surface.setCornerRadius_(24)
+                self.surface_style = 'glass'
+            else:
+                surface = NSVisualEffectView.alloc().initWithFrame_(frame)
+                surface.setMaterial_(_MATERIAL_POPOVER)
+                surface.setBlendingMode_(_BLENDING_BEHIND)
+                surface.setState_(_STATE_ACTIVE)
+                surface.setWantsLayer_(True)
+                surface.layer().setCornerRadius_(24)
+                surface.layer().setMasksToBounds_(True)
+                self.surface_style = 'vibrancy'
+            surface.setAutoresizingMask_(18)
+            container.addSubview_(surface)
+        # NSGlassEffectView's hitTest returns itself even over its contentView.
+        # Keep the controls in a sibling above the effect so clicks reach them.
+        container.addSubview_(root)
+        panel.setContentView_(container)
+        self.surface = surface if not reduced else root
         self.root = root
 
         # Search row
         top = H - _SEARCH_H
         self.search_icon = NSImageView.alloc().initWithFrame_(NSMakeRect(20, top + 18, 22, 22))
         self.search_icon.setImage_(_symbol("magnifyingglass", 17))
-        self.search_icon.setContentTintColor_(NSColor.colorWithCalibratedWhite_alpha_(0.70, 1))
+        self.search_icon.setContentTintColor_(NSColor.secondaryLabelColor())
         root.addSubview_(self.search_icon)
 
         field = NSTextField.alloc().initWithFrame_(NSMakeRect(52, top + 15, W - 110, 28))
@@ -321,7 +349,7 @@ class CommandPalette:
         field.setDrawsBackground_(False)
         field.setFocusRingType_(1)  # none
         field.setFont_(NSFont.systemFontOfSize_weight_(20, NSFontWeightRegular))
-        field.setTextColor_(NSColor.colorWithCalibratedWhite_alpha_(0.95, 1))
+        field.setTextColor_(NSColor.labelColor())
         field.cell().setUsesSingleLineMode_(True)
         field.cell().setScrollable_(True)
         field.setDelegate_(self.delegate)
@@ -337,7 +365,7 @@ class CommandPalette:
 
         # Context line (what was selected, where)
         ctx_y = top - _CONTEXT_H
-        self.context_label = _label(self.context_text, 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.70, 1),
+        self.context_label = _label(self.context_text, 12, color=NSColor.secondaryLabelColor(),
                                     frame=NSMakeRect(22, ctx_y + 4, W - 260, 16))
         root.addSubview_(self.context_label)
         self.language_button = NSButton.alloc().initWithFrame_(NSMakeRect(W-235,ctx_y,215,24))
@@ -397,7 +425,7 @@ class CommandPalette:
         self.preview_title = _label("", 14, NSFontWeightSemibold,
                                     frame=NSMakeRect(56, ph - 36, W - 200, 20))
         preview.addSubview_(self.preview_title)
-        self.preview_meta = _label("", 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.58, 1),
+        self.preview_meta = _label("", 12, color=NSColor.tertiaryLabelColor(),
                                    frame=NSMakeRect(W - 220, ph - 35, 200, 18))
         self.preview_meta.setAlignment_(2)  # right
         preview.addSubview_(self.preview_meta)
@@ -440,13 +468,13 @@ class CommandPalette:
         root.addSubview_(_layer_view(NSMakeRect(0, _FOOTER_H, W, 1),
                                      NSColor.separatorColor().colorWithAlphaComponent_(0.6)))
         footer_bg = _layer_view(NSMakeRect(0, 0, W, _FOOTER_H),
-                                NSColor.colorWithCalibratedWhite_alpha_(0.95, 1).colorWithAlphaComponent_(0.03))
+                                NSColor.labelColor().colorWithAlphaComponent_(0.03))
         root.addSubview_(footer_bg)
         logo = NSImageView.alloc().initWithFrame_(NSMakeRect(18, 11, 16, 16))
         logo.setImage_(_symbol("wand.and.stars", 12, NSFontWeightSemibold))
         logo.setContentTintColor_(NSColor.systemPurpleColor())
         root.addSubview_(logo)
-        self.status_label = _label(self.status_text, 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.70, 1),
+        self.status_label = _label(self.status_text, 12, color=NSColor.secondaryLabelColor(),
                                    frame=NSMakeRect(40, 11, 280, 16))
         root.addSubview_(self.status_label)
         self.hints_view = NSView.alloc().initWithFrame_(NSMakeRect(W / 2 - 20, 0, W / 2 + 10, _FOOTER_H))
@@ -454,7 +482,7 @@ class CommandPalette:
 
     def _set_placeholder(self, text: str) -> None:
         attrs = {
-            NSForegroundColorAttributeName: NSColor.colorWithCalibratedWhite_alpha_(0.62, 1),
+            NSForegroundColorAttributeName: NSColor.secondaryLabelColor(),
             NSFontAttributeName: NSFont.systemFontOfSize_weight_(20, NSFontWeightRegular),
         }
         self.field.setPlaceholderAttributedString_(
@@ -466,17 +494,17 @@ class CommandPalette:
             sub.removeFromSuperview()
         x = self.hints_view.frame().size.width - 16
         for label, key in reversed(hints):
-            key_label = _label(key, 11, NSFontWeightMedium, NSColor.colorWithCalibratedWhite_alpha_(0.70, 1))
+            key_label = _label(key, 11, NSFontWeightMedium, NSColor.secondaryLabelColor())
             key_label.sizeToFit()
             key_w = max(22, key_label.frame().size.width + 12)
             x -= key_w
             cap = _layer_view(NSMakeRect(x, 9, key_w, 20),
-                              NSColor.colorWithCalibratedWhite_alpha_(0.95, 1).colorWithAlphaComponent_(0.08), radius=5)
+                              NSColor.labelColor().colorWithAlphaComponent_(0.08), radius=5)
             key_label.setFrame_(NSMakeRect(0, 2, key_w, 15))
             key_label.setAlignment_(1)  # center
             cap.addSubview_(key_label)
             self.hints_view.addSubview_(cap)
-            text = _label(label, 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.70, 1))
+            text = _label(label, 12, color=NSColor.secondaryLabelColor())
             text.sizeToFit()
             text_w = text.frame().size.width
             x -= text_w + 6
@@ -491,7 +519,7 @@ class CommandPalette:
         if item.get("header"):
             view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, _HEADER_H))
             view.addSubview_(_label(item["title"].upper(), 11, NSFontWeightSemibold,
-                                    NSColor.colorWithCalibratedWhite_alpha_(0.58, 1),
+                                    NSColor.tertiaryLabelColor(),
                                     frame=NSMakeRect(22, 5, W - 44, 14)))
             return view
 
@@ -520,7 +548,7 @@ class CommandPalette:
         right = W - 30 - 62
         shortcut = item.get("shortcut")
         if shortcut:
-            hint = _label(shortcut, 12, color=NSColor.colorWithCalibratedWhite_alpha_(0.58, 1),
+            hint = _label(shortcut, 12, color=NSColor.tertiaryLabelColor(),
                           frame=NSMakeRect(right - 34, 12, 34, 16))
             hint.setAlignment_(2)
             view.addSubview_(hint)
@@ -534,7 +562,7 @@ class CommandPalette:
         subtitle = item.get("subtitle", "")
         if subtitle:
             sub_x = 56 + title_w + 10
-            view.addSubview_(_label(subtitle, 12.5, color=NSColor.colorWithCalibratedWhite_alpha_(0.70, 1),
+            view.addSubview_(_label(subtitle, 12.5, color=NSColor.secondaryLabelColor(),
                                     frame=NSMakeRect(sub_x, 12.5, max(0, right - sub_x - 8), 17)))
         return view
 
@@ -608,6 +636,9 @@ class CommandPalette:
             self.field.setStringValue_('')
             self.reload()
             return
+        if kind == 'edit_action':
+            self._edit_command(action.get('action'))
+            return
         if kind == 'connect':
             self._connect(action['provider'])
             return
@@ -655,7 +686,7 @@ class CommandPalette:
         style.setLineSpacing_(3)
         attrs = {
             NSFontAttributeName: NSFont.systemFontOfSize_(14),
-            NSForegroundColorAttributeName: NSColor.colorWithCalibratedWhite_alpha_(0.95, 1),
+            NSForegroundColorAttributeName: NSColor.labelColor(),
             NSParagraphStyleAttributeName: style,
         }
         self.text_view.textStorage().setAttributedString_(
@@ -685,7 +716,9 @@ class CommandPalette:
                     self._ui_queue.put(("chunk", token, chunk))
                 self._ui_queue.put(("done", token, None))
             except Exception as exc:
-                self._ui_queue.put(("error", token, str(exc)))
+                cause = exc.__cause__ or exc
+                self._ui_queue.put(("error", token,
+                                    (type(cause).__name__, getattr(cause, 'status_code', None))))
 
         threading.Thread(target=worker, daemon=True, name="palette-stream").start()
 
@@ -753,14 +786,27 @@ class CommandPalette:
                 self._streaming = False
                 self.spinner.stopAnimation_(None)
                 self.preview_meta.setStringValue_("Failed")
-                self._set_preview_text("Could not complete the request. Check your AI connection and retry.\n\nYour text was not changed.")
+                error_type, status = payload if isinstance(payload, tuple) else (str(payload), None)
+                if status in (401, 403) or error_type == 'AuthenticationError':
+                    reason = 'The AI service rejected the API key. Reconnect it in Settings.'
+                elif status == 429 or error_type == 'RateLimitError':
+                    reason = 'The AI service limit was reached. Wait a little and retry.'
+                elif status == 404 or error_type == 'NotFoundError':
+                    reason = 'The selected AI model is unavailable. Choose another model in Settings.'
+                elif error_type in ('APIConnectionError', 'APITimeoutError'):
+                    reason = 'Could not reach the AI service. Check your connection and retry.'
+                else:
+                    reason = 'The AI request failed. Check your connection in Settings and retry.'
+                self._set_preview_text(reason + '\n\nYour selected text was not changed.')
                 self._stream_text = ""
                 self._set_hints(([ ("Retry", "⇥") ] if self._stream_spec else []) + [("Back", "esc")])
         if dirty:
             self._set_preview_text(self._stream_text)
 
     def _copy_result(self) -> None:
-        text = self._stream_text or str(self.text_view.string() or "")
+        text = str(self.text_view.string() or "") if self._result_mode else self._stream_text
+        if not text:
+            return
         pb = NSPasteboard.generalPasteboard()
         pb.clearContents()
         if not pb.setString_forType_(text, NSPasteboardTypeString):
@@ -798,7 +844,7 @@ class CommandPalette:
             value = NSMutableAttributedString.alloc().initWithString_('')
             for kind, text in product.diff_segments(self.controller.text, self._stream_text):
                 attrs = {NSFontAttributeName:NSFont.systemFontOfSize_(14),
-                         NSForegroundColorAttributeName:NSColor.colorWithCalibratedWhite_alpha_(0.95, 1)}
+                         NSForegroundColorAttributeName:NSColor.labelColor()}
                 if kind == 'delete':
                     attrs[NSForegroundColorAttributeName] = NSColor.systemRedColor()
                     attrs[NSStrikethroughStyleAttributeName] = 1
@@ -860,6 +906,76 @@ class CommandPalette:
             self.panel.makeKeyAndOrderFront_(None)
             self.panel.makeFirstResponder_(self.field)
 
+    def _edit_command(self, saved=None):
+        """A native, multiline editor. Saving does not invoke the model."""
+        self._modal = True
+        self.panel.setLevel_(3)
+        try:
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_('Edit command' if saved else 'New command')
+            alert.setInformativeText_('Give it a name and describe what to do with selected text. Only the instruction is saved.')
+            alert.addButtonWithTitle_('Save')
+            alert.addButtonWithTitle_('Cancel')
+            if saved:
+                alert.addButtonWithTitle_('Delete…')
+            form = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 440, 260))
+            form.addSubview_(_label('Name', 12, NSFontWeightSemibold, frame=NSMakeRect(0, 234, 440, 18)))
+            name = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 197, 440, 30))
+            name.setStringValue_(saved['name'] if saved else '')
+            name.setPlaceholderString_('For example: Friendly reply')
+            form.addSubview_(name)
+            form.addSubview_(_label('Instruction', 12, NSFontWeightSemibold, frame=NSMakeRect(0, 165, 440, 18)))
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 31, 440, 128))
+            scroll.setBorderType_(2)
+            scroll.setHasVerticalScroller_(True)
+            instruction = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 420, 128))
+            instruction.setRichText_(False)
+            instruction.setFont_(NSFont.systemFontOfSize_(14))
+            instruction.setTextContainerInset_((8, 8))
+            instruction.setVerticallyResizable_(True)
+            instruction.textContainer().setWidthTracksTextView_(True)
+            instruction.setString_(saved['instruction'] if saved else '')
+            scroll.setDocumentView_(instruction)
+            form.addSubview_(scroll)
+            error = _label('Name: up to 60 characters · Instruction: up to 2,000', 11,
+                           color=NSColor.secondaryLabelColor(), frame=NSMakeRect(0, 0, 440, 25))
+            form.addSubview_(error)
+            alert.setAccessoryView_(form)
+            alert.window().setInitialFirstResponder_(name)
+            while True:
+                response = alert.runModal()
+                if response == 1001:
+                    return
+                try:
+                    if response == 1002 and saved:
+                        confirm = NSAlert.alloc().init()
+                        confirm.setMessageText_('Delete “' + saved['name'] + '”?')
+                        confirm.setInformativeText_('This removes only the saved command.')
+                        confirm.addButtonWithTitle_('Delete')
+                        confirm.addButtonWithTitle_('Cancel')
+                        if confirm.runModal() != 1000:
+                            continue
+                        preferences.remove_action(saved['id'])
+                        self.controller.refresh()
+                    elif response == 1000:
+                        self.controller.save_named_action(str(name.stringValue()), str(instruction.string()),
+                                                          saved['id'] if saved else None)
+                    else:
+                        return
+                except (ValueError, OSError) as exc:
+                    error.setTextColor_(NSColor.systemRedColor())
+                    error.setStringValue_(str(exc) if isinstance(exc, ValueError) else 'Could not save. Check access to your home folder.')
+                    continue
+                self.field.setStringValue_('')
+                self.reload()
+                return
+        finally:
+            self._modal = False
+            self._opened_at = time.time()
+            self.panel.setLevel_(_LEVEL_POPUP)
+            self.panel.makeKeyAndOrderFront_(None)
+            self.panel.makeFirstResponder_(self.field)
+
     def _connect(self, provider: str) -> None:
         info = llm.PROVIDERS[provider]
         key = ''
@@ -891,6 +1007,8 @@ class CommandPalette:
 
     def handle_key(self, event):
         """Local key monitor. Return None to swallow the event."""
+        if self._modal:
+            return event
         if event.window() is not None and event.window() != self.panel:
             return event
         code = event.keyCode()
@@ -916,6 +1034,9 @@ class CommandPalette:
             return None
 
         if self.state == "list":
+            if cmd and code == 45:  # Command+N
+                self._edit_command()
+                return None
             if code == _KEY_UP:
                 self._move(-1)
                 return None
@@ -990,16 +1111,45 @@ class CommandPalette:
         self.outcome = outcome
         self._stream_token += 1
 
+    def _animate_in(self) -> None:
+        """Short native fade and lift, respecting the system Reduce Motion setting."""
+        target = self.panel.frame()
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        reduced = NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+        if reduced:
+            self.panel.setAlphaValue_(1.0)
+            self.panel.makeKeyAndOrderFront_(None)
+            return
+        self.panel.setFrameOrigin_((target.origin.x, target.origin.y - 12))
+        self.panel.setAlphaValue_(0.0)
+        self.panel.makeKeyAndOrderFront_(None)
+        from Quartz import CAMediaTimingFunction
+        NSAnimationContext.beginGrouping()
+        context = NSAnimationContext.currentContext()
+        context.setDuration_(0.22)
+        context.setTimingFunction_(CAMediaTimingFunction.functionWithName_('easeOut'))
+        self.panel.animator().setFrame_display_(target, True)
+        self.panel.animator().setAlphaValue_(1.0)
+        NSAnimationContext.endGrouping()
+
+    def _animate_out(self) -> None:
+        if NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion():
+            return
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.currentContext().setDuration_(0.10)
+        self.panel.animator().setAlphaValue_(0.0)
+        NSAnimationContext.endGrouping()
+        deadline = time.monotonic() + 0.10
+        while time.monotonic() < deadline:
+            pump(0.01)
+
     def run(self):
         """Show the palette and block (pumping events) until it closes."""
         self._position()
-        self.panel.setAlphaValue_(0.0)
+        self._animate_in()
+        pump(0.01)
         self.panel.makeKeyAndOrderFront_(None)
         self.panel.makeFirstResponder_(self.field)
-        NSAnimationContext.beginGrouping()
-        NSAnimationContext.currentContext().setDuration_(0.12)
-        self.panel.animator().setAlphaValue_(1.0)
-        NSAnimationContext.endGrouping()
 
         monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
             _EVENT_KEYDOWN_MASK, self.handle_key)
@@ -1010,6 +1160,7 @@ class CommandPalette:
             if self.outcome is not None:
                 _hold_key_window_until_accept_released()
         finally:
+            self._animate_out()
             NSEvent.removeMonitor_(monitor)
             self.panel.orderOut_(None)
             self.panel.close()

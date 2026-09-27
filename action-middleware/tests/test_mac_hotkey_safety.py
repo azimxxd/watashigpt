@@ -66,6 +66,30 @@ def test_capture_does_not_copy_when_modifiers_still_held(monkeypatch):
     assert mac.capture_selection() == ''
 
 
+def test_modifier_check_uses_physical_keys_not_synthetic_event_flags(monkeypatch):
+    down = set()
+    q = SimpleNamespace(
+        kCGEventSourceStateHIDSystemState=1,
+        CGEventSourceFlagsState=lambda source: mac.FLAG_CMD,
+        CGEventSourceKeyState=lambda source, code: code in down,
+    )
+    monkeypatch.setitem(sys.modules, 'Quartz', q)
+    assert not mac._modifiers_down()
+    down.add(62)  # right Control
+    assert mac._modifiers_down()
+
+
+def test_paste_is_not_cancelled_by_stale_modifier_state(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, '_IS_MAC', True)
+    monkeypatch.setattr(main.mac, 'wait_for_modifiers_released',
+                        lambda **kw: (_ for _ in ()).throw(AssertionError('stale modifier queried')))
+    monkeypatch.setattr(main.mac, 'send_paste', lambda: calls.append('paste') or True)
+    monkeypatch.setattr(main.time, 'sleep', lambda delay: None)
+    main._send_paste_keys()
+    assert calls == ['paste']
+
+
 def test_permissions_retry_waits_then_starts_only_once(monkeypatch):
     state = {'trusted': False, 'listening': True}
     calls = []
@@ -132,3 +156,16 @@ def test_palette_holds_key_window_until_accept_key_released(monkeypatch):
     assert waits == [(36, 76)]
     assert len(pumps) == 1  # trailing pump consumes the keyUp itself
 
+
+
+def test_long_enter_hold_does_not_release_palette_on_timeout(monkeypatch):
+    from actionflow import mac_ui
+    outcomes = iter([False, False, True])
+    waits = []
+    def wait(keys, timeout, pump):
+        waits.append(keys)
+        return next(outcomes)
+    monkeypatch.setattr(mac_ui.platform_mac, 'wait_for_keys_released', wait)
+    monkeypatch.setattr(mac_ui, 'pump', lambda timeout: None)
+    mac_ui._hold_key_window_until_accept_released()
+    assert len(waits) == 3

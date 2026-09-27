@@ -65,15 +65,21 @@ def update(**values) -> dict:
         return data
 
 
-def save_action(name: str, instruction: str) -> dict:
+def save_action(name: str, instruction: str, action_id: str | None = None) -> dict:
     name, instruction = name.strip(), instruction.strip()
     if not name or len(name) > 60 or not instruction or len(instruction) > 2000:
         raise ValueError('Use a name up to 60 characters and an instruction up to 2000 characters')
     with _LOCK:
         data = load()
-        existing = next((x for x in data['saved_actions'] if x['instruction'] == instruction), None)
+        if action_id is not None:
+            existing = next((x for x in data['saved_actions'] if x['id'] == action_id), None)
+            if existing is None:
+                raise ValueError('This command no longer exists. Create a new command instead.')
+        else:
+            existing = next((x for x in data['saved_actions'] if x['instruction'] == instruction), None)
         if existing:
             existing['name'] = name
+            existing['instruction'] = instruction
             item = existing
         else:
             if len(data['saved_actions']) >= 20: raise ValueError('Remove a saved action first (maximum 20)')

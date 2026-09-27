@@ -48,7 +48,13 @@ Run `./build-macos.sh` in `action-middleware` on macOS. PyInstaller builds a win
 The build packages only `config.yaml.example`, never your `config.yaml`, preferences or API keys.
 The source checkout and virtual environment are not needed after installing the app.
 
-Builds are ad-hoc signed for local use, not notarized release downloads. Build separately for
+By default, builds are ad-hoc signed. macOS identifies each rebuilt app by its changing
+signature, so replacing the installed app requires granting Accessibility and Input Monitoring
+again. Ordinary launches of the same installed build keep their permissions. For repeat local
+builds, set `ACTIONFLOW_CODESIGN_IDENTITY` to the name of a valid, stable certificate in your
+login keychain before running `./build-macos.sh`. Keep that certificate and its private key:
+future builds signed with the same identity can retain the permissions. A local certificate
+does not make a public download trusted or notarized. Build separately for
 Apple Silicon and Intel with the appropriate Python architecture. For public releases, use a
 Developer ID certificate, hardened runtime signing and Apple's notarization workflow. Do not
 work around Gatekeeper by disabling it globally.

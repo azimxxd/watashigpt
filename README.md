@@ -54,8 +54,19 @@ Need something different? Type an instruction:
 >
 > Translate into English using simple, natural wording.
 
-After a successful custom instruction, choose **Save action** to use it again on different text.
-Only the instruction and its name are saved. You can remove saved actions in Settings.
+Choose **New command…** in the main palette, or press **⌘N** on macOS, to save a
+command before running it. Enter a name and a multiline instruction, then choose **Save**.
+Your command appears in the main list and is searchable. Creating commands works without
+an AI connection; running them uses your configured model.
+
+Open **Settings → Your commands** to edit names and instructions or delete commands.
+Up to 20 commands are stored locally. Only the name and instruction are saved, never the
+selected text or generated result. You can also choose **Save action** after a successful
+standalone custom instruction.
+
+On macOS, the palette uses the system Liquid Glass surface where available, follows your
+light/dark appearance, and animates in with a short fade and lift. Older versions use a
+native vibrancy fallback. Reduce Motion and Reduce Transparency settings are respected.
 
 ## How it works
 
@@ -104,6 +115,10 @@ On first launch, allow **ActionFlow** in **System Settings → Privacy & Securit
 Accessibility** and **Input Monitoring**. Close the permission notice; the app retries
 automatically. If macOS asks for a restart, quit and reopen it. Its menu also
 links to these permissions and **Settings & practice…**.
+You do not need to grant these permissions on every launch. A new ad-hoc build has a
+different macOS signing identity, so replacing the app can require granting them again.
+For repeat builds, use a stable signing certificate as described in
+[macOS packaging](docs/advanced.md#macos-packaging).
 
 To launch automatically, add ActionFlow under **System Settings → General → Login Items →
 Open at Login**. Remove an older Python login agent first, if you installed one.

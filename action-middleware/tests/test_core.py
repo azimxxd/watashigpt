@@ -295,7 +295,7 @@ def test_palette_items_sections_and_search(monkeypatch, tmp_path):
     monkeypatch.setattr(main.llm, 'ready', True)
     ctl, cmds = _controller()
     rows = ctl.items('', None)
-    assert [r['id'] for r in rows] == ['proofread','clarify','shorten','trans','settings']
+    assert [r['id'] for r in rows] == ['proofread','clarify','shorten','trans','new_action','settings']
     assert ctl.items('fix', None)[0]['id'] == 'proofread'
     assert all(r['id'] != 'b64' for r in ctl.items('b64',None))
     sentence = ctl.items('make it shorter',None)

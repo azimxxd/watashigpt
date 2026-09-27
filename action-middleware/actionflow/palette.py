@@ -144,7 +144,7 @@ class PaletteController:
                           llm.provider if llm.ready else 'Bring your API key or use a local model', 'network'),
                 self._nav('toggle:show_tools', 'Additional tools', 'On' if p['show_tools'] else 'Off'),
                 self._nav('toggle:developer_tools', 'Developer tools', 'On' if p['developer_tools'] else 'Off'),
-                self._nav('saved', 'Manage saved actions', f"{len(p['saved_actions'])} saved", 'star'),
+                self._nav('saved', 'Your commands', f"{len(p['saved_actions'])} saved · create, edit or remove", 'star'),
                 self._nav('toggle:metrics_enabled', 'Local usage counts', 'On · never sent anywhere' if p['metrics_enabled'] else 'Off · no text collected'),
                 self._nav('metrics', 'View local counts'),
                 self._nav('help', 'How to use ActionFlow', 'Shortcuts, privacy and safe undo', 'questionmark.circle')]
@@ -166,7 +166,8 @@ class PaletteController:
                              'Runs on your machine' if info.local else 'API key required', 'network')
                     for name, info in llm.PROVIDERS.items()]
         elif submenu == 'saved':
-            rows = [self._nav('delete:' + x['id'], x['name'], 'Remove saved action', 'trash')
+            rows = [self._nav('new_action', 'New command…', 'Save an instruction for any text', 'plus')]
+            rows += [self._nav('edit:' + x['id'], x['name'], x['instruction'], 'pencil')
                     for x in self.preferences['saved_actions']]
         elif submenu in ('tools','developer'):
             names = TOOLS if submenu == 'tools' else DEVELOPER_TOOLS
@@ -179,6 +180,7 @@ class PaletteController:
             # Existing personal commands stay accessible as favorites.
             rows += [self._item(n,c) for n,c in self.commands.items() if c.get('_personal')]
             if not query:
+                rows.append(self._nav('new_action', 'New command…', 'Create and save your own instruction', 'plus'))
                 if self.preferences['show_tools']: rows.append(self._nav('tools','Additional tools',icon='wrench'))
                 if self.preferences['developer_tools']: rows.append(self._nav('developer','Developer tools',icon='chevron.left.forwardslash.chevron.right'))
                 rows.append(self._nav('settings','Settings', 'Language, saved actions and AI connection'))
@@ -205,10 +207,18 @@ class PaletteController:
     def activate(self, item: dict, query: str) -> dict:
         key = item['id']
         menus = {'settings':'Settings', 'languages':'Choose a translation language',
-                 'providers':'Connect AI', 'saved':'Remove a saved action',
+                 'providers':'Connect AI', 'saved':'Your commands',
                  'tools':'Additional tools', 'developer':'Developer tools', 'tone':'Choose a tone'}
         if key in menus:
             return {'kind':'submenu','id':'trans' if key == 'languages' else key,'title':menus[key]}
+        if key == 'new_action':
+            return {'kind':'edit_action', 'action':None}
+        if key.startswith('edit:'):
+            saved = next((x for x in self.preferences['saved_actions'] if x['id'] == key[5:]), None)
+            if saved is None:
+                self.refresh()
+                return {'kind':'reload'}
+            return {'kind':'edit_action', 'action':dict(saved)}
         if key.startswith('toggle:'):
             name = key.split(':',1)[1]
             if name not in {'show_tools','developer_tools','metrics_enabled'}: raise ValueError('Unknown setting')
@@ -264,5 +274,10 @@ class PaletteController:
         if spec.get('refinement') or not spec.get('cmd_config',{}).get('instruction'):
             raise ValueError('Only a standalone custom instruction can be saved')
         result = preferences.save_action(name,spec['cmd_config']['instruction'])
+        self.refresh()
+        return result
+
+    def save_named_action(self, name: str, instruction: str, action_id: str | None = None) -> dict:
+        result = preferences.save_action(name, instruction, action_id)
         self.refresh()
         return result

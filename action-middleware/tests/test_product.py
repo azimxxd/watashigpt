@@ -35,7 +35,7 @@ def test_old_config_gets_four_core_commands_without_rewriting(tmp_path):
 
 def test_home_stays_small_and_extra_packs_are_opt_in():
     ctl=controller()
-    assert [r['id'] for r in ctl.items('',None)] == [*product.CORE_COMMANDS,'settings']
+    assert [r['id'] for r in ctl.items('',None)] == [*product.CORE_COMMANDS,'new_action','settings']
     for query in ['image','wiki','command','haiku','roast','base64','review']:
         assert ctl.items(query,None)[0]['id'] == 'custom'
     ctl.activate({'id':'toggle:show_tools'},'')
@@ -250,6 +250,16 @@ def test_native_preview_keeps_views_separate_from_replacement(native_ui):
     assert ui.outcome['text']=='I have a plan.'
 
 
+def test_native_glass_does_not_block_replace_button(native_ui):
+    from AppKit import NSMakePoint
+    ui = native_ui
+    _complete(ui)
+    # Hit-test the actual panel surface, not the button directly. The glass
+    # layer used to win this hit and silently swallow mouse clicks.
+    hit = ui.panel.contentView().hitTest_(NSMakePoint(535, 55))
+    assert hit == ui.preview_buttons[5]
+
+
 def test_native_copy_uses_result_even_when_original_is_shown(native_ui,monkeypatch):
     ui=native_ui
     _complete(ui)
@@ -274,6 +284,20 @@ def test_native_partial_failure_cannot_be_accepted(native_ui):
     assert not ui.preview_buttons[5].isEnabled()
 
 
+def test_native_failure_cannot_copy_error_message(native_ui, monkeypatch):
+    ui = native_ui
+    ui._enter_preview({'title': 'Fix mistakes'})
+    ui._stream_spec = {'cmd_name': 'proofread'}
+    ui._ui_queue.put(('error', ui._stream_token, ('AuthenticationError', 401)))
+    ui._drain_ui_queue()
+    board = Mock()
+    monkeypatch.setattr(main.mac_ui, 'NSPasteboard', SimpleNamespace(generalPasteboard=lambda: board))
+    ui._copy_result()
+    board.clearContents.assert_not_called()
+    assert ui.outcome is None
+    assert 'API key' in str(ui.text_view.string())
+
+
 def test_native_cancel_ignores_late_connection_result(native_ui,monkeypatch):
     ui=native_ui
     finish=Mock()
@@ -289,3 +313,33 @@ def test_native_empty_response_has_no_replace_action(native_ui):
     _complete(native_ui,'')
     native_ui.preview_action(5)
     assert native_ui.outcome is None and not native_ui.preview_buttons[5].isEnabled()
+
+
+def test_create_and_edit_command_offline_preserves_identity_and_private_text(monkeypatch):
+    monkeypatch.setattr(llm, 'ready', False)
+    stream = Mock(side_effect=AssertionError('Saving must not call a model'))
+    monkeypatch.setattr(llm, 'stream', stream)
+    ctl = controller('SECRET_SOURCE')
+    assert ctl.activate({'id':'new_action'}, '') == {'kind':'edit_action', 'action':None}
+    created = ctl.save_named_action('My reply', 'Write a friendly reply.\nKeep it brief.')
+    other = ctl.save_named_action('Other command', 'Translate to French')
+    edited = ctl.save_named_action('Better reply', 'Write a polite reply.', created['id'])
+    assert edited['id'] == created['id']
+    restarted = controller()
+    stored = restarted.preferences['saved_actions']
+    assert len(stored) == 2 and other in stored
+    assert stored[0]['name'] == 'Better reply' and stored[0]['instruction'] == 'Write a polite reply.'
+    assert 'SECRET_SOURCE' not in preferences.PATH.read_text()
+    entry = next(x for x in restarted.items('', 'saved') if x['id'] == 'edit:' + created['id'])
+    assert restarted.activate(entry, '')['action'] == edited
+    stream.assert_not_called()
+
+
+def test_invalid_edit_does_not_change_saved_commands():
+    item = preferences.save_action('Keep', 'Keep this instruction')
+    before = preferences.PATH.read_bytes()
+    for name, instruction, action_id in [('', 'valid', item['id']), ('valid', 'x'*2001, item['id']),
+                                         ('valid', 'valid', 'deleted-id')]:
+        with pytest.raises(ValueError):
+            preferences.save_action(name, instruction, action_id)
+        assert preferences.PATH.read_bytes() == before

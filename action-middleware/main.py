@@ -436,8 +436,10 @@ def _writing_palette(text: str, source_window: str | None, *, demo=False, settin
         else:
             name = outcome['item']['id']
             dispatch(name,text,text,controller.commands.get(name,{}))
-    except Exception:
+    except Exception as exc:
         preferences.record('failed')
+        TUI.warn('Replacement cancelled: ' + (str(exc) if isinstance(exc, RuntimeError)
+                                               else type(exc).__name__))
         # Keep the generated result available when focus/selection changed before the commit.
         _result_queue.put(('Replacement cancelled — copy your result',outcome.get('text','') or
                            'Your selection was not changed. Select the source text and try again.'))
@@ -504,8 +506,12 @@ def _reset_keyboard_state() -> None:
 def _send_paste_keys() -> None:
     """Raise if the platform could not send the paste shortcut."""
     if _IS_MAC:
-        if not mac.wait_for_modifiers_released() or not mac.send_paste():
-            raise RuntimeError("Paste failed — check Accessibility permissions")
+        # A fresh selection check has just posted Cmd+C. Quartz can report its
+        # synthetic Command key as still down even after the key-up was posted.
+        # send_paste supplies explicit Cmd-only flags, so that state must not
+        # prevent the verified source selection from being replaced.
+        if not mac.send_paste():
+            raise RuntimeError("Could not send paste shortcut; check Accessibility permission")
         time.sleep(0.08)
     else:
         is_terminal = (_current_app_context is not None
@@ -538,8 +544,8 @@ _DISPLAY_ONLY_COMMANDS = frozenset([
 _CLIPBOARD_SYNC_TIMEOUT = 0.25
 _CLIPBOARD_SYNC_POLL = 0.01
 _CLIPBOARD_RESTORE_DELAY = 2.0
-_FOCUS_RETRY_COUNT = 3
-_FOCUS_RETRY_DELAY = 0.06
+_FOCUS_RETRY_COUNT = 10
+_FOCUS_RETRY_DELAY = 0.10
 _clipboard_restore_token = 0
 _clipboard_restore_lock = threading.Lock()
 

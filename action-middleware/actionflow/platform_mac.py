@@ -45,6 +45,11 @@ FLAG_ALT = 0x00080000
 FLAG_CMD = 0x00100000
 _MOD_MASK = FLAG_SHIFT | FLAG_CTRL | FLAG_ALT | FLAG_CMD
 
+# Left/right Command, Shift, Option and Control. Query the hardware key state
+# rather than accumulated event flags: our synthetic Cmd+C can leave those
+# flags set briefly even though no modifier is physically held.
+_MODIFIER_KEYCODES = (54, 55, 56, 60, 58, 61, 59, 62)
+
 _MODIFIER_NAMES = {
     "ctrl": FLAG_CTRL, "control": FLAG_CTRL,
     "alt": FLAG_ALT, "option": FLAG_ALT, "opt": FLAG_ALT,
@@ -233,9 +238,10 @@ def clipboard_restore(snapshot: list[dict] | str) -> None:
 # Keyboard injection
 # ============================================================
 
-def _modifiers_down() -> int:
+def _modifiers_down() -> bool:
     import Quartz
-    return int(Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)) & _MOD_MASK
+    source = Quartz.kCGEventSourceStateHIDSystemState
+    return any(Quartz.CGEventSourceKeyState(source, code) for code in _MODIFIER_KEYCODES)
 
 
 def wait_for_modifiers_released(timeout: float = 1.0) -> bool:

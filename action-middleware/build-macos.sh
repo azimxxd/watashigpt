@@ -11,8 +11,17 @@ else
     .venv/bin/python -m pip install -r requirements.txt -r macos/requirements-build.txt
 fi
 .venv/bin/python macos/make_icon.py build/icon
+if [ -n "${ACTIONFLOW_CODESIGN_IDENTITY:-}" ]; then
+    if ! security find-identity -v -p codesigning | grep -Fq "\"$ACTIONFLOW_CODESIGN_IDENTITY\""; then
+        echo "No valid code-signing identity named $ACTIONFLOW_CODESIGN_IDENTITY was found." >&2
+        exit 1
+    fi
+else
+    echo "Warning: ad-hoc signing changes the app's macOS permission identity on every build." >&2
+    echo "Set ACTIONFLOW_CODESIGN_IDENTITY to a stable certificate name for repeat builds." >&2
+fi
 .venv/bin/python -m PyInstaller --noconfirm --clean macos/ActionFlow.spec
 printf '\nBuilt: %s/dist/ActionFlow.app\nDrag it into Applications and double-click it.\n' "$PWD"
-printf 'NOTE: a rebuilt app has a new code signature. After replacing ActionFlow.app,\n'
-printf 'remove it and add it again under Privacy & Security > Accessibility (and Input\n'
-printf 'Monitoring), or run:  tccutil reset Accessibility com.watashigpt.actionflow\n'
+if [ -z "${ACTIONFLOW_CODESIGN_IDENTITY:-}" ]; then
+    printf 'NOTE: ad-hoc builds need Accessibility and Input Monitoring regranted after each replacement.\n'
+fi
