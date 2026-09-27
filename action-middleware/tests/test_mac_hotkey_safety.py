@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import main
 from actionflow import platform_mac as mac
@@ -93,3 +95,40 @@ def test_open_copied_text_never_captures_or_targets_another_app(monkeypatch):
     main._open_copied_text()
     assert calls == [('Example copied text', None)]
     assert not main._job_lock.locked()
+
+
+def test_keys_down_reads_session_key_state(monkeypatch):
+    q = SimpleNamespace(
+        kCGEventSourceStateCombinedSessionState='session',
+        CGEventSourceKeyState=lambda state, code: code == 36,
+    )
+    monkeypatch.setitem(sys.modules, 'Quartz', q)
+    assert mac.keys_down([36])
+    assert not mac.keys_down([76])
+
+
+def test_wait_for_keys_released_pumps_until_released(monkeypatch):
+    held = [True, True, False]
+    monkeypatch.setattr(mac, 'keys_down', lambda keycodes: held.pop(0))
+    pumps = []
+    assert mac.wait_for_keys_released([36], pump=lambda t: pumps.append(t))
+    assert len(pumps) == 2
+
+
+def test_wait_for_keys_released_times_out(monkeypatch):
+    monkeypatch.setattr(mac, 'keys_down', lambda keycodes: True)
+    assert not mac.wait_for_keys_released([36], timeout=0.05)
+
+
+def test_palette_holds_key_window_until_accept_key_released(monkeypatch):
+    mac_ui = pytest.importorskip('actionflow.mac_ui')
+    waits = []
+    monkeypatch.setattr(mac_ui.platform_mac, 'ACCEPT_KEYS', (36, 76))
+    monkeypatch.setattr(mac_ui.platform_mac, 'wait_for_keys_released',
+                        lambda keys, timeout, pump: waits.append(keys) or True)
+    pumps = []
+    monkeypatch.setattr(mac_ui, 'pump', lambda t=0.0: pumps.append(t))
+    mac_ui._hold_key_window_until_accept_released()
+    assert waits == [(36, 76)]
+    assert len(pumps) == 1  # trailing pump consumes the keyUp itself
+

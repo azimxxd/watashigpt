@@ -253,6 +253,36 @@ def wait_for_modifiers_released(timeout: float = 1.0) -> bool:
         return True
 
 
+# Main Return and numeric-pad Enter: the keys that accept a palette result,
+# and the only ones that send a message if leaked into a chat app.
+ACCEPT_KEYS = (KEYCODES["return"], 76)
+
+
+def keys_down(keycodes) -> bool:
+    """True while any of the given physical keys is currently held."""
+    try:
+        import Quartz
+    except ImportError:
+        return False
+    state = Quartz.kCGEventSourceStateCombinedSessionState
+    return any(Quartz.CGEventSourceKeyState(state, int(code)) for code in keycodes)
+
+
+def wait_for_keys_released(keycodes, timeout: float = 0.8, pump=None) -> bool:
+    """Wait until none of the keys is held. Keeps servicing events via `pump`
+    so the key-ups and auto-repeats are consumed by this app instead of the
+    application underneath. Returns False on timeout."""
+    deadline = time.time() + timeout
+    while keys_down(keycodes):
+        if time.time() >= deadline:
+            return False
+        if pump is not None:
+            pump(0.02)
+        else:
+            time.sleep(0.02)
+    return True
+
+
 def send_key_combo(keycode: int, flags: int = FLAG_CMD) -> bool:
     """Post a key press with the given modifiers to the focused app."""
     try:

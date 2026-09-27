@@ -27,7 +27,7 @@ import queue
 import threading
 import time
 
-from actionflow import product, preferences, connection, llm
+from actionflow import product, preferences, connection, llm, platform_mac
 
 import objc
 from importlib import import_module
@@ -145,6 +145,17 @@ def pump(timeout: float = 0.0) -> None:
         app.sendEvent_(event)
         until = NSDate.distantPast()
     app.updateWindows()
+
+
+def _hold_key_window_until_accept_released(timeout: float = 0.8) -> None:
+    """After an accepted result, keep the finalized panel as the key window
+    until the accepting Return/Enter is physically released. The panel is
+    non-activating, so the source app is still active underneath and would
+    receive the trailing keyUp and auto-repeats — a leaked Return sends the
+    old draft in chat apps like Telegram."""
+    if platform_mac.wait_for_keys_released(platform_mac.ACCEPT_KEYS,
+                                           timeout=timeout, pump=pump):
+        pump(0.05)  # consume the keyUp itself while this app still owns focus
 
 
 # ============================================================
@@ -883,6 +894,10 @@ class CommandPalette:
         if event.window() is not None and event.window() != self.panel:
             return event
         code = event.keyCode()
+        if self.done:
+            # Closing after accept: swallow the held Return/Enter so repeats
+            # cannot re-trigger anything; other keys pass through.
+            return None if code in (_KEY_RETURN, _KEY_ENTER) else event
         mods = event.modifierFlags()
         cmd = bool(mods & _MOD_CMD)
         field_text = str(self.field.stringValue() or "")
@@ -992,6 +1007,8 @@ class CommandPalette:
             while not self.done:
                 pump(0.02)
                 self._drain_ui_queue()
+            if self.outcome is not None:
+                _hold_key_window_until_accept_released()
         finally:
             NSEvent.removeMonitor_(monitor)
             self.panel.orderOut_(None)
